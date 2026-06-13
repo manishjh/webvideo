@@ -1,0 +1,238 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebVideo Contract Harness</title>
+    <style>
+      :root {
+        --bg: #f2efe8;
+        --panel: #fffdfa;
+        --ink: #162236;
+        --accent: #cb5c2e;
+        --line: #d9d2c6;
+      }
+
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        background: linear-gradient(180deg, #ece7db 0%, #f8f5ef 100%);
+        color: var(--ink);
+      }
+
+      main {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 32px 20px 48px;
+      }
+
+      h1,
+      h2 {
+        margin: 0 0 12px;
+      }
+
+      .hero {
+        padding: 24px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+        box-shadow: 0 18px 50px rgba(22, 34, 54, 0.08);
+      }
+
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+        gap: 12px;
+        margin: 18px 0 0;
+      }
+
+      .stat {
+        padding: 16px;
+        border: 1px solid var(--line);
+        background: #fff;
+      }
+
+      .stat strong {
+        display: block;
+        font-size: 2rem;
+        color: var(--accent);
+      }
+
+      section {
+        margin-top: 24px;
+        padding: 20px;
+        border: 1px solid var(--line);
+        background: var(--panel);
+      }
+
+      table {
+        width: 100%;
+        border-collapse: collapse;
+      }
+
+      th,
+      td {
+        text-align: left;
+        border-top: 1px solid var(--line);
+        padding: 10px 8px;
+        vertical-align: top;
+      }
+
+      th {
+        border-top: none;
+      }
+
+      .player-shell {
+        display: grid;
+        gap: 16px;
+      }
+
+      .player-surface {
+        border: 1px solid var(--line);
+        background:
+          radial-gradient(circle at top left, rgba(203, 92, 46, 0.18), transparent 42%),
+          linear-gradient(135deg, #102033 0%, #1f3d52 100%);
+        padding: 16px;
+      }
+
+      .player-surface canvas {
+        display: block;
+        width: 100%;
+        height: auto;
+        aspect-ratio: 16 / 9;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        box-shadow: 0 16px 36px rgba(16, 32, 51, 0.28);
+      }
+    </style>
+    <script type="module" src="/src/testing/contractHarness.ts"></script>
+  </head>
+  <body>
+    <main>
+      <section class="hero">
+        <h1 data-testid="page-title">WebVideo Contract Harness</h1>
+        <p>
+          This page renders the current frontend contract, flow, and end-to-end scenario
+          manifests that the test suite locks before real implementation begins.
+        </p>
+        <div class="stats">
+          <div class="stat">
+            <span>Flows</span>
+            <strong data-testid="flow-count">0</strong>
+          </div>
+          <div class="stat">
+            <span>Behaviors</span>
+            <strong data-testid="behavior-count">0</strong>
+          </div>
+          <div class="stat">
+            <span>E2E Scenarios</span>
+            <strong data-testid="scenario-count">0</strong>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <h2>Frontend Flows</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Flow ID</th>
+              <th>Summary</th>
+              <th>Steps</th>
+            </tr>
+          </thead>
+          <tbody data-testid="flow-rows"></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Frontend Behaviors</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Behavior ID</th>
+              <th>Summary</th>
+              <th>Required Outcomes</th>
+            </tr>
+          </thead>
+          <tbody data-testid="behavior-rows"></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>E2E Scenarios</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>Scenario ID</th>
+              <th>Summary</th>
+              <th>RTSP Scenario</th>
+              <th>Assertions</th>
+            </tr>
+          </thead>
+          <tbody data-testid="scenario-rows"></tbody>
+        </table>
+      </section>
+
+      <section>
+        <h2>Simulated Player Flow</h2>
+        <p>
+          This deterministic run executes the current in-memory frontend pipeline so Playwright
+          can validate actual service behavior, visible frame output, and frame-to-frame
+          progression.
+        </p>
+        <div class="player-shell">
+          <div class="player-surface">
+            <canvas id="contract-canvas" data-testid="contract-canvas" width="1280" height="720" hidden></canvas>
+          </div>
+          <table>
+            <tbody>
+              <tr>
+                <th>Status</th>
+                <td data-testid="sim-status">booting</td>
+              </tr>
+              <tr>
+                <th>Session</th>
+                <td data-testid="sim-session-id">pending</td>
+              </tr>
+              <tr>
+                <th>Video Messages</th>
+                <td data-testid="sim-video-messages">0</td>
+              </tr>
+              <tr>
+                <th>Metadata Records</th>
+                <td data-testid="sim-metadata-records">0</td>
+              </tr>
+              <tr>
+                <th>Decision</th>
+                <td data-testid="sim-decision">pending</td>
+              </tr>
+              <tr>
+                <th>Rendered Count</th>
+                <td data-testid="sim-rendered-count">0</td>
+              </tr>
+              <tr>
+                <th>Rendered Sequence</th>
+                <td data-testid="sim-rendered-sequence">0</td>
+              </tr>
+              <tr>
+                <th>Sequence Trace</th>
+                <td data-testid="sim-sequence-trace">pending</td>
+              </tr>
+              <tr>
+                <th>Overlay Count</th>
+                <td data-testid="sim-overlay-count">0</td>
+              </tr>
+              <tr>
+                <th>Telemetry Count</th>
+                <td data-testid="sim-telemetry-count">0</td>
+              </tr>
+              <tr>
+                <th>Telemetry Stages</th>
+                <td data-testid="sim-telemetry-stages">pending</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>

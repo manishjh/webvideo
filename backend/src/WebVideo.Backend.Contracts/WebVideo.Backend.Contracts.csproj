@@ -1,0 +1,7 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>WebVideo.Backend.Contracts</AssemblyName>
+    <RootNamespace>WebVideo.Backend.Contracts</RootNamespace>
+  </PropertyGroup>
+</Project>
+

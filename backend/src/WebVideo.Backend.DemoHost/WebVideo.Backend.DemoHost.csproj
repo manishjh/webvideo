@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+  <PropertyGroup>
+    <AssemblyName>WebVideo.Backend.DemoHost</AssemblyName>
+    <RootNamespace>WebVideo.Backend.DemoHost</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WebVideo.Backend.Contracts\WebVideo.Backend.Contracts.csproj" />
+    <ProjectReference Include="..\WebVideo.Backend.TestKit\WebVideo.Backend.TestKit.csproj" />
+  </ItemGroup>
+</Project>
