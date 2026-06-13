@@ -2,53 +2,60 @@
 
 ## 1. Suggested Repository Structure
 
-For a Rust backend and TypeScript frontend:
+Current repository structure:
 
 ```text
 backend/
-  crates/
-    transport/
-    media_pipeline/
-    metadata_protocol/
-    session_control/
-    observability/
+  src/
+    WebVideo.Backend.Contracts/
+    WebVideo.Backend.TestKit/
+    WebVideo.Backend.DemoHost/
+  tests/
+    WebVideo.Backend.Contracts.Tests/
+    WebVideo.Backend.Specifications.Tests/
+    WebVideo.Backend.DemoHost.Tests/
 frontend/
   src/
-    transport/
-    protocol/
-    decoder/
-    scheduler/
-    renderer/
-    overlays/
-    metrics/
-    ui/
+    contracts/
+    testing/
+  tests/
+    unit/
+    contracts/
+    e2e/
 docs/
+scripts/
 ```
 
-If C# is preferred for control plane and APIs:
+Current baseline:
 
-- keep transport/media hot path in Rust
-- expose control and orchestration services in C#
+- `.NET 10` backend contracts and deterministic in-memory coordinators
+- ASP.NET demo host for synthetic browser stream payloads
+- TypeScript browser contracts and deterministic player services
+- Vitest and Playwright suites for contract and browser-flow coverage
+- future service splits are documented separately in [Future Options](./future-options.md)
 
 ## 2. Phase Plan
 
-### Phase 0: Prove browser path
+### Phase 0: Contract scaffold and visible demo
 
 Goal:
 
-- confirm WebTransport -> WebCodecs -> WebGPU works on target browsers/devices
+- lock service and player shapes before production media I/O
 
 Tasks:
 
-- send synthetic encoded video chunks from backend
-- decode and render a test stream
-- measure receive, decode, and present timing
-- validate GPU compositing path
+- define backend contracts for ingest, archive, proxy, browser sessions, fanout, metadata, and telemetry
+- implement deterministic in-memory backend coordinators
+- define TypeScript browser contracts for transport, decode, schedule, render, and telemetry
+- implement deterministic in-memory player services
+- serve synthetic stream payloads from the demo host
+- render a visible browser demo page and contract harness
 
 Exit criteria:
 
-- stable playback of low-latency stream
-- baseline metrics visible in browser
+- backend tests pass
+- frontend unit and contract tests pass
+- Playwright validates the contract harness and live demo
 
 ### Phase 1: Define protocol and timing model
 
@@ -68,7 +75,25 @@ Exit criteria:
 
 - protocol document and reference parser on both backend and frontend
 
-### Phase 2: Build live path
+### Phase 2: Build browser transport prototype
+
+Goal:
+
+- confirm WebTransport -> WebCodecs -> WebGPU works on target browsers/devices
+
+Tasks:
+
+- send synthetic encoded video chunks from backend
+- frontend reassembly and decode
+- measure receive, decode, and present timing
+- WebGPU video presentation
+
+Exit criteria:
+
+- stable low-latency synthetic playback
+- baseline metrics visible in browser
+
+### Phase 3: Build live camera path
 
 Goal:
 
@@ -76,18 +101,19 @@ Goal:
 
 Tasks:
 
-- source ingest
-- low-latency encode
-- paced QUIC/WebTransport send
+- RTSP source ingest
+- RTP depacketization into normalized encoded access units
+- no-transcode archive/proxy compatibility where possible
+- paced WebTransport send
 - frontend reassembly and decode
 - minimal scheduler with late-frame dropping
-- WebGPU video presentation
 
 Exit criteria:
 
 - live stream reaches latency target on development network
+- queue depth and drop metrics are visible
 
-### Phase 3: Add metadata overlays
+### Phase 4: Add metadata overlays
 
 Goal:
 
@@ -105,7 +131,7 @@ Exit criteria:
 
 - overlays remain visually aligned under jitter and moderate loss
 
-### Phase 4: Add playback
+### Phase 5: Add playback
 
 Goal:
 
@@ -123,7 +149,7 @@ Exit criteria:
 
 - seekable playback with same render/overlay architecture
 
-### Phase 5: Hardening
+### Phase 6: Hardening
 
 Goal:
 
@@ -158,8 +184,8 @@ Exit criteria:
 
 ### Live video path
 
-1. Source frames enter encoder.
-2. Encoder emits keyframes and delta frames.
+1. Source frames enter encoder or normalized ingest path.
+2. Encoder or depacketizer emits keyframes and delta frames.
 3. Backend wraps encoded frame into chunk message.
 4. Backend timestamps and paces send.
 5. Browser receives bytes and parses chunk messages.
@@ -259,21 +285,22 @@ Mitigation:
 
 ## 6. Recommended Milestone Order
 
-1. browser prototype with synthetic chunks
-2. protocol freeze
-3. live end-to-end
-4. metrics and debug overlay
-5. metadata overlays
-6. playback
-7. optimization and hardening
+1. contract scaffold and visible synthetic demo
+2. protocol and timing freeze
+3. browser transport prototype
+4. live end-to-end
+5. metrics and debug overlay
+6. metadata overlays
+7. playback
+8. optimization and hardening
 
 ## 7. Deliverables
 
 - protocol spec
-- reference Rust sender
-- TypeScript browser receiver
+- `.NET 10` backend contracts and coordinators
+- backend demo host and synthetic stream catalog
+- TypeScript browser contracts and receiver
 - WebGPU renderer
 - overlay renderer
 - observability dashboard
 - browser compatibility report
-

@@ -87,45 +87,15 @@ Instead:
 - store one encoded payload per access unit
 - let client sessions hold references until sent
 
-## 5. When Rust Egress Helps
-
-Rust fanout/QUIC handlers help when:
-
-- concurrent viewers become large
-- QUIC/session handling becomes a hot path
-- GC or allocation behavior in the egress layer becomes noisy
-- you want tighter control over pacing and memory layout
-
-Rust does not remove the per-client bandwidth cost.
-Rust helps reduce:
-
-- per-client CPU cost
-- per-client memory overhead
-- jitter introduced by the egress runtime
-
-That means Rust is useful as an egress optimization layer, not as a way to "recover multicast".
-
-## 6. Best Mixed-Language Scaling Topology
-
-If you add Rust later, the best shape is usually:
-
-1. C# owns ingest, archive, and stream normalization.
-2. C# publishes normalized access units to one or more local egress workers.
-3. Rust workers own WebTransport/QUIC client sessions.
-4. Clients are assigned to egress workers by stream ID and capacity.
-
-The branch point remains after depacketization.
-
-## 7. Kubernetes Placement Strategy
+## 5. Service Placement Strategy
 
 ### Best latency shape
 
-- C# ingest and Rust egress in the same pod
-- communicate over Unix domain socket or shared memory style buffer
+- ingest, fanout buffer, and browser egress in the same process or pod
 
 Pros:
 
-- minimal handoff latency
+- minimal internal handoff latency
 - no extra node hop
 - simplest timing behavior
 
@@ -135,8 +105,8 @@ Cons:
 
 ### Best operational shape
 
-- C# ingest as one service
-- Rust egress as a separate deployable service
+- ingest and normalization as one service
+- browser egress as a separate deployable service
 - keep them on the same node when possible
 
 Pros:
@@ -158,7 +128,7 @@ Cons:
 
 This avoids duplicating inter-service fanout unnecessarily.
 
-## 8. Latency of C# -> Rust Binary Handoff
+## 6. Latency of Internal Binary Handoff
 
 Assuming:
 
@@ -173,7 +143,7 @@ Typical added latency should be roughly:
 | Handoff path | Expected added latency |
 |---|---:|
 | same process | effectively negligible |
-| same pod via Unix socket / shared memory style IPC | ~0.05 to 0.5 ms |
+| same pod via Unix socket / shared-memory-style IPC | ~0.05 to 0.5 ms |
 | same node via loopback TCP | ~0.1 to 1 ms |
 | different pods on same node | ~0.2 to 1.5 ms |
 | cross-node in cluster | ~0.5 to 5 ms |
@@ -182,7 +152,7 @@ These are not guarantees. They are practical planning ranges.
 
 The main point:
 
-- same-pod or same-node binary handoff is usually not your dominant latency term
+- same-pod or same-node binary handoff is usually not the dominant latency term
 - cross-node fanout starts to matter more
 
 Compared with:
@@ -192,9 +162,9 @@ Compared with:
 - browser decode
 - browser render scheduling
 
-the local C# -> Rust handoff is often a second-order concern if designed correctly.
+the local backend-to-egress handoff is often a second-order concern if designed correctly.
 
-## 9. What Actually Drives Server Load
+## 7. What Actually Drives Server Load
 
 For no-transcode delivery, server load is usually driven by:
 
@@ -220,7 +190,7 @@ Raw payload egress is about:
 
 That is why scaling decisions must center on egress, not just ingest.
 
-## 10. Routing Strategy
+## 8. Routing Strategy
 
 For live streaming, route viewers by `stream_id`, not randomly.
 
@@ -236,7 +206,7 @@ Recommended policy:
 - capacity threshold per egress shard
 - spill over to a second shard only when necessary
 
-## 11. What to Build First
+## 9. What to Build First
 
 ### Phase 1
 
@@ -254,18 +224,17 @@ Measure:
 
 ### Phase 2
 
-- keep C# ingest
-- replace only browser egress with Rust on the same node
-- measure whether Rust materially improves session density or jitter
+- split browser egress into a separate local process only if measurements show the in-process path is the bottleneck
+- measure whether the split improves session density, deployment isolation, or tail latency enough to justify the extra boundary
 
 ### Phase 3
 
 - add stream-aware routing and horizontal egress scale in Kubernetes
 - keep each stream single-owner on ingest
 
-## 12. Recommendation
+## 10. Recommendation
 
-If you are starting full C#, do not design around "one Rust QUIC handler per client" or "duplicate the stream to many workers" immediately.
+Do not design around one media worker per client or duplicate the stream to many workers immediately.
 
 Start with:
 
@@ -273,12 +242,12 @@ Start with:
 - one shared normalized live buffer per stream
 - many client sessions hanging off that buffer
 
-Only introduce Rust egress when measurements show:
+Only split egress when measurements show:
 
-- C# QUIC/session density is the bottleneck
+- QUIC/session density is the bottleneck
 - or GC/allocation jitter is affecting tail latency
 
-If you do introduce Rust egress, keep the handoff:
+If you introduce a separate egress service, keep the handoff:
 
 - binary
 - local
@@ -286,4 +255,3 @@ If you do introduce Rust egress, keep the handoff:
 - same node if possible
 
 That should add around sub-millisecond to low-single-digit milliseconds, not tens of milliseconds, if the topology is disciplined.
-

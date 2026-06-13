@@ -56,17 +56,19 @@ When the system is overloaded, it must choose a deterministic fallback strategy:
 Responsibilities:
 
 - ingest source video
-- encode to a browser-decodable codec
+- preserve or normalize encoded media without decode/re-encode where possible
+- encode to a browser-decodable codec when required
 - packetize elementary stream access units or chunked segments
 - transmit over WebTransport/QUIC
 - transmit metadata on a synchronized path
 - expose session control for live and playback
 - maintain observability metrics
 
-Recommended language split:
+Current baseline:
 
-- Rust for transport, packetization, pacing, timestamping, and session control
-- Rust or C# for control plane, API, orchestration, asset management, and playback indexing
+- `.NET 10` backend contracts define ingest, archive, proxy, browser session, fanout, metadata, and telemetry behavior.
+- deterministic in-memory backend coordinators lock the service lifecycle and expected flow semantics before the full media implementation.
+- the demo host serves synthetic browser stream payloads over HTTP so the frontend can exercise visible playback while WebTransport/WebCodecs work is still pending.
 
 ### Frontend
 
@@ -218,43 +220,7 @@ Shared abstraction:
 3. Start media stream reader and metadata stream reader.
 4. Reassemble encoded video chunks.
 5. Push chunks to `VideoDecoder`.
-6. Put decoded `VideoFrame`s into a very small presentation queue.
-7. Render video and overlay layers in WebGPU.
-8. Present based on a monotonic presentation clock.
-
-## 8. Key Challenges
-
-### Browser APIs are low-level but not fully real-time
-
-WebTransport, WebCodecs, and WebGPU are efficient, but the browser still controls scheduling, memory pressure, and process isolation. You can approach native behavior, but not fully own the machine.
-
-### Timestamp discipline is hard
-
-Small errors in timestamp generation, drift correction, or queue policy create visible jitter quickly.
-
-### Backpressure can appear in multiple layers
-
-Potential bottlenecks include:
-
-- encoder output bursts
-- QUIC congestion control
-- browser stream reader cadence
-- decoder saturation
-- GPU upload/render stalls
-
-### Color formats and zero-copy are constrained
-
-You do not always get a perfect zero-copy path from decoder to GPU. Behavior varies by browser, platform, and decoded pixel format.
-
-### Metadata alignment needs strict semantics
-
-Overlays become visibly wrong if metadata semantics are vague. You need clear rules for event validity windows, interpolation, expiry, and confidence.
-
-## 9. Success Criteria
-
-- Live glass-to-glass latency target: as low as practical, ideally within roughly 50-150 ms depending on network, encode settings, and browser/device behavior
-- Stable frame pacing with bounded jitter
-- Metadata overlays visually aligned with video
-- Clear observability on every queue and timing stage
-- Shared architecture for live and playback
-
+6. Schedule decoded frames against the media clock.
+7. Select metadata for the presented timestamp.
+8. Composite video and overlays.
+9. Emit timing and queue metrics.

@@ -11,6 +11,7 @@ Documents:
 - [Scaling and Fanout](./scaling-and-fanout.md)
 - [Implementation Plan](./implementation-plan.md)
 - [Architecture Diagrams](./architecture-diagrams.md)
+- [Future Options](./future-options.md)
 - [Synthetic RTSP Runbook](./implementation-notes/synthetic-rtsp-runbook.md)
 
 System goals:
