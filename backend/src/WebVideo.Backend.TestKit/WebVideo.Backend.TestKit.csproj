@@ -1,0 +1,11 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <AssemblyName>WebVideo.Backend.TestKit</AssemblyName>
+    <RootNamespace>WebVideo.Backend.TestKit</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\WebVideo.Backend.Contracts\WebVideo.Backend.Contracts.csproj" />
+  </ItemGroup>
+</Project>
+
