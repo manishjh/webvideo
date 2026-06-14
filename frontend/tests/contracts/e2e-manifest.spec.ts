@@ -8,9 +8,11 @@ import {
 describe("frontend e2e manifest coverage", () => {
   it("covers the expected browser-facing end-to-end scenarios", () => {
     expect(requiredE2eScenarioIds).toEqual([
+      "high-resolution-4k-channel-is-declared",
       "metadata-overlay-aligns-to-frame-pts",
       "player-recovers-from-stream-discontinuity",
-      "synthetic-rtsp-source-publishes-test-pattern",
+      "rtsp-h264-source-feeds-browser-session",
+      "tile-wall-renders-independent-channels",
       "viewer-joins-at-keyframe-boundary",
       "viewer-starts-live-stream",
     ]);
@@ -31,7 +33,11 @@ describe("frontend e2e manifest coverage", () => {
 
   it("documents the synthetic RTSP scenarios needed by browser validation", () => {
     const referencedScenarios = new Set(e2eScenarioCatalog.map((scenario) => scenario.syntheticRtspScenarioId));
-    expect(referencedScenarios).toEqual(new Set(["tcp-h264-smoke", "udp-h264-smoke"]));
+    expect(referencedScenarios).toEqual(new Set([
+      "cctv-entrance-720p",
+      "cctv-floor-1080p",
+      "cctv-lobby-720p",
+      "cctv-parking-4k",
+    ]));
   });
 });
-

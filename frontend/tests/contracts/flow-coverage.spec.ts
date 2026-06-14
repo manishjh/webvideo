@@ -49,7 +49,7 @@ describe("frontend flow coverage", () => {
         for (const method of step.methods) {
           expect(method.owner in serviceRegistry).toBe(true);
 
-          const service = serviceRegistry[method.owner as keyof typeof serviceRegistry] as Record<string, unknown>;
+          const service = serviceRegistry[method.owner as keyof typeof serviceRegistry] as unknown as Record<string, unknown>;
           expect(typeof service[method.methodName]).toBe("function");
         }
       }
@@ -63,6 +63,7 @@ describe("frontend flow coverage", () => {
       .sort((left, right) => left.localeCompare(right));
 
     expect(behaviorIds).toEqual([
+      "browser-session-uses-rtsp-captured-payloads",
       "frontend-telemetry-is-queryable",
       "metadata-overlays-align-to-presentation-time",
       "player-enforces-bounded-latency",
@@ -82,4 +83,3 @@ describe("frontend flow coverage", () => {
     }
   });
 });
-

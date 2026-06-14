@@ -8,27 +8,17 @@ import {
   WebPlayerBootstrap,
   WebTransportIngestClient,
 } from "../contracts/services";
+import {
+  describeCapabilities,
+  normalizeVideoMessages,
+  openChannelSession,
+} from "./browserDemoApi";
 import type {
-  MetadataTransportMessage,
+  BrowserTransportMode,
+  DecodeBackend,
+  RenderBackend,
   TimedMetadataBatch,
-  VideoCodecConfiguration,
-  VideoTransportMessage,
 } from "../contracts/models";
-
-interface BrowserDemoApiResponse {
-  streamId: string;
-  displayName: string;
-  scenarioId: string;
-  sourceRtspUrl: string;
-  sourceSummary: string;
-  targetLatencyMs: number;
-  frameIntervalMs: number;
-  webTransportUrl: string;
-  metadataChannelRequired: boolean;
-  codec: VideoCodecConfiguration & { profile?: string; frameRate?: number };
-  videoMessages: Array<Omit<VideoTransportMessage, "payload"> & { payload: number[] }>;
-  metadataMessages: MetadataTransportMessage[];
-}
 
 declare global {
   interface Window {
@@ -36,7 +26,18 @@ declare global {
       status: string;
       renderedSequences: number[];
       overlayCounts: number[];
+      channelId?: string;
       streamId?: string;
+      sinkId?: string;
+      requestedTransport?: BrowserTransportMode;
+      activeTransport?: BrowserTransportMode;
+      webTransportReady?: boolean;
+      webTransportBytesReceived?: number;
+      webTransportMessagesReceived?: number;
+      decodeBackend?: DecodeBackend;
+      renderBackend?: RenderBackend;
+      sourceMode?: string;
+      sourceVerified?: boolean;
       error?: string;
     };
   }
@@ -49,43 +50,42 @@ function bind(testId: string, value: string): void {
   }
 }
 
-function getRequestedStreamId(): string {
+function getRequestedChannelId(): string {
   const params = new URLSearchParams(window.location.search);
-  return params.get("stream")?.trim() || "camera-001";
+  return params.get("channel")?.trim() || params.get("stream")?.trim() || "channel-001";
 }
 
-async function loadStreamPayload(streamId: string): Promise<BrowserDemoApiResponse> {
-  const response = await fetch(`/api/demo/streams/${encodeURIComponent(streamId)}`);
-  if (!response.ok) {
-    throw new Error(`Backend returned ${response.status} for stream '${streamId}'.`);
-  }
-
-  return await response.json() as BrowserDemoApiResponse;
-}
-
-function normalizeVideoMessages(messages: BrowserDemoApiResponse["videoMessages"]): VideoTransportMessage[] {
-  return messages.map((message) => ({
-    ...message,
-    payload: new Uint8Array(message.payload),
-  }));
+function getRequestedFrameCount(): number | undefined {
+  const params = new URLSearchParams(window.location.search);
+  const parsed = Number.parseInt(params.get("frames") ?? "", 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
 async function runLiveDemo(): Promise<void> {
-  const streamId = getRequestedStreamId();
-  const apiEndpoint = `/api/demo/streams/${encodeURIComponent(streamId)}`;
+  const channelId = getRequestedChannelId();
+  const frameCount = getRequestedFrameCount();
+  const apiEndpoint = `/api/demo/channels/${encodeURIComponent(channelId)}/sessions`;
   bind("demo-api-endpoint", apiEndpoint);
-  bind("demo-status", "loading");
-  bind("demo-stream-id", streamId);
+  bind("demo-status", "requesting-channel");
+  bind("demo-channel-id", channelId);
+  bind("demo-stream-id", "pending");
   bind("demo-error", "none");
+  bind("demo-capabilities", describeCapabilities());
 
   window.__webvideoLiveDemoState = {
-    status: "loading",
+    status: "requesting-channel",
     renderedSequences: [],
     overlayCounts: [],
-    streamId,
+    channelId,
   };
 
-  const payload = await loadStreamPayload(streamId);
+  const payload = await openChannelSession(channelId, {
+    viewerId: "browser-demo-viewer",
+    authToken: "demo-token",
+    targetLatencyMs: 150,
+    enableMetadata: true,
+    frameCount,
+  });
   const videoMessages = normalizeVideoMessages(payload.videoMessages);
   const metadataMessages = payload.metadataMessages;
 
@@ -101,10 +101,19 @@ async function runLiveDemo(): Promise<void> {
   const renderer = new WebGpuRenderer();
   const telemetry = new PlayerTelemetryCollector();
 
+  bind("demo-channel-id", payload.channelId);
+  bind("demo-stream-id", payload.streamId);
   bind("demo-display-name", payload.displayName);
   bind("demo-source-rtsp", payload.sourceRtspUrl);
+  bind("demo-quic-url", payload.webTransportUrl);
+  bind("demo-sink-id", payload.sink.sinkId);
+  bind("demo-transport-mode", `${payload.requestedTransport} -> ${payload.activeTransport}`);
+  bind("demo-source-mode", `${payload.sourceMode} (${payload.accessUnitFormat})`);
+  bind("demo-source-verified", payload.sourceVerified ? "yes" : "no");
+  bind("demo-source-diagnostics", payload.sourceDiagnostics);
 
   const session = await bootstrap.initializeSession({
+    channelId: payload.channelId,
     streamId: payload.streamId,
     viewerId: "browser-demo-viewer",
     targetLatencyMs: payload.targetLatencyMs,
@@ -112,10 +121,25 @@ async function runLiveDemo(): Promise<void> {
   });
 
   const connection = await transport.connect({
+    channelId: payload.channelId,
     streamId: payload.streamId,
     webTransportUrl: payload.webTransportUrl,
     authToken: "demo-token",
     metadataChannelRequired: payload.metadataChannelRequired,
+    requestedTransport: payload.requestedTransport,
+    allowHttpFallback: true,
+    serverCertificateHash: payload.webTransportCertificateHash,
+    frameCount: payload.requestedFrameCount,
+  });
+
+  bind("demo-transport-mode", `${connection.requestedTransport} -> ${connection.activeTransport}`);
+  bind("demo-webtransport-bytes", String(connection.webTransportBytesReceived));
+  bind("demo-webtransport-messages", String(connection.webTransportMessagesReceived));
+  await telemetry.recordStageEvent({
+    streamId: payload.streamId,
+    stageName: "transport.connect",
+    latencyMs: connection.webTransportReady ? 1.0 : 0.1,
+    queueDepth: 0,
   });
 
   const transportVideo = await transport.readVideoMessages(connection);
@@ -148,6 +172,7 @@ async function runLiveDemo(): Promise<void> {
   });
 
   const frames = await decoder.flush();
+  const decodeBackend = frames[0]?.decodeBackend ?? "synthetic-frame-plan";
   await telemetry.recordStageEvent({
     streamId: payload.streamId,
     stageName: "transport.read",
@@ -157,6 +182,20 @@ async function runLiveDemo(): Promise<void> {
 
   bind("demo-status", "streaming");
   window.__webvideoLiveDemoState.status = "streaming";
+  window.__webvideoLiveDemoState.channelId = payload.channelId;
+  window.__webvideoLiveDemoState.streamId = payload.streamId;
+  window.__webvideoLiveDemoState.sinkId = payload.sink.sinkId;
+  window.__webvideoLiveDemoState.requestedTransport = connection.requestedTransport;
+  window.__webvideoLiveDemoState.activeTransport = connection.activeTransport;
+  window.__webvideoLiveDemoState.webTransportReady = connection.webTransportReady;
+  window.__webvideoLiveDemoState.webTransportBytesReceived = connection.webTransportBytesReceived;
+  window.__webvideoLiveDemoState.webTransportMessagesReceived = connection.webTransportMessagesReceived;
+  window.__webvideoLiveDemoState.decodeBackend = decodeBackend;
+  window.__webvideoLiveDemoState.renderBackend = "canvas2d-fallback";
+  window.__webvideoLiveDemoState.sourceMode = payload.sourceMode;
+  window.__webvideoLiveDemoState.sourceVerified = payload.sourceVerified;
+  bind("demo-decode-backend", decodeBackend);
+  bind("demo-render-backend", "pending");
 
   for (const frame of frames) {
     await scheduler.handleClockUpdate({
@@ -181,10 +220,12 @@ async function runLiveDemo(): Promise<void> {
 
     window.__webvideoLiveDemoState.renderedSequences.push(renderResult.renderedSequenceNumber);
     window.__webvideoLiveDemoState.overlayCounts.push(renderResult.overlayPrimitiveCount);
+    window.__webvideoLiveDemoState.renderBackend = renderResult.renderBackend;
 
     bind("demo-rendered-count", String(window.__webvideoLiveDemoState.renderedSequences.length));
     bind("demo-last-sequence", String(renderResult.renderedSequenceNumber));
     bind("demo-overlay-count", String(renderResult.overlayPrimitiveCount));
+    bind("demo-render-backend", renderResult.renderBackend);
     bind("demo-sequence-trace", window.__webvideoLiveDemoState.renderedSequences.join(", "));
 
     await telemetry.recordStageEvent({
@@ -218,7 +259,7 @@ async function bootLiveDemo(): Promise<void> {
       renderedSequences: [],
       overlayCounts: [],
       error: message,
-      streamId: getRequestedStreamId(),
+      channelId: getRequestedChannelId(),
     };
   }
 }

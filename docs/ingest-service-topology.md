@@ -4,16 +4,20 @@
 
 Current state:
 
-- this repository contains a contract-first `.NET 10` backend scaffold
+- this repository contains a contract-first `.NET 10` backend prototype
 - backend contracts cover ingest, archive, proxy, browser sessions, fanout, metadata, and telemetry
-- in-memory coordinator implementations and tests lock expected behavior before production media I/O is added
-- the demo host serves synthetic browser stream payloads over HTTP
+- in-memory coordinator implementations and tests lock expected behavior alongside the local browser media path
+- the demo host maps client-provided channel IDs to predefined backend-selected streams, captures local RTSP H.264 access units when enabled, and serves browser sessions over WebTransport/QUIC
+- the local browser path now includes bounded live demo playback, a bounded multi-channel tile wall, continuous React VMS playback, opt-in long-running VMS soaks, and opt-in 4K/mixed-resolution stress paths
+- the current continuous path uses a compact MoQ-shaped object envelope, but is not yet full MOQT/MSF compatible
 
 Target requirement:
 
 - add a browser-oriented path for low-latency live playback and later metadata overlays
 - preserve the option to archive and proxy camera streams without unnecessary decode/re-encode
 - keep the branch point and timing model explicit enough to test
+- graduate from predefined demo channels to arbitrary RTSP camera configuration and continuous stream duration
+- make mixed 4K/1080p/720p viewing stable across multi-minute runs before treating it as production-ready
 
 Current decision:
 
@@ -163,10 +167,13 @@ Build backend browser egress that:
 - repackages to the browser wire protocol
 - serves WebTransport
 - exposes sender-side metrics
+- supports independent per-tile browser sessions for the same page
 
 Success criteria:
 
 - end-to-end browser playback with low queue depth
+- continuous arbitrary-duration sessions do not grow queues under steady-state load
+- source-to-render latency, server queue depth, backend drops, client drops, sequence gaps, and frame hitches explain failures without relying only on browser e2e video inspection
 
 ### Phase D: Add metadata path
 

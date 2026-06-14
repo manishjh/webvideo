@@ -132,7 +132,10 @@ public sealed class ContractSurfaceTests
         var proxyCoordinator = new LegacyRtspProxyCoordinator();
         var sessionCoordinator = new WebTransportSessionCoordinator();
         var proxyOptions = new ProxySessionOptions("viewer-vlc", true, TimeSpan.FromMinutes(5));
-        var browserRequest = new BrowserSessionRequest(streamId, "viewer-browser", new Uri("https://localhost:9443/live"), "token", TimeSpan.FromMilliseconds(150), true);
+        var browserRequest = new BrowserSessionRequest(streamId, "viewer-browser", new Uri("https://localhost:9443/live/channel-001"), "token", TimeSpan.FromMilliseconds(150), true)
+        {
+            ChannelId = new ChannelId("channel-001")
+        };
         var accessUnit = new EncodedAccessUnit(streamId, 5, 2_000_000, 2_000_000, false, false, new byte[] { 9 });
         var metadata = new MetadataBatch(
             streamId,
@@ -157,6 +160,8 @@ public sealed class ContractSurfaceTests
 
         var browserSnapshot = sessionCoordinator.GetSnapshotForTesting(browserHandle.SessionId);
         Assert.True(browserSnapshot.IsClosed);
+        Assert.Equal(new ChannelId("channel-001"), browserSnapshot.Request.ChannelId);
+        Assert.Equal(new ChannelId("channel-001"), browserSnapshot.Handle.ChannelId);
         Assert.Equal(SessionCloseReason.ServerDrain, browserSnapshot.CloseReason);
         Assert.Single(browserSnapshot.SentVideo);
         Assert.Single(browserSnapshot.SentMetadata);

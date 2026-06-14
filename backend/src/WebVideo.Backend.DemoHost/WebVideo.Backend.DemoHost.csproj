@@ -2,6 +2,7 @@
   <PropertyGroup>
     <AssemblyName>WebVideo.Backend.DemoHost</AssemblyName>
     <RootNamespace>WebVideo.Backend.DemoHost</RootNamespace>
+    <EnablePreviewFeatures>true</EnablePreviewFeatures>
   </PropertyGroup>
 
   <ItemGroup>

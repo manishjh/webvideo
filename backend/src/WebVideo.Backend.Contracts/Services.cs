@@ -458,7 +458,10 @@ public sealed class WebTransportSessionCoordinator
         var handle = new BrowserSessionHandle(
             new BrowserSessionId($"browser-{Interlocked.Increment(ref _sessionSequence):D4}"),
             request.StreamId,
-            request.ViewerId);
+            request.ViewerId)
+        {
+            ChannelId = request.ChannelId
+        };
 
         lock (_gate)
         {

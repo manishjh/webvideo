@@ -3,6 +3,7 @@
     <AssemblyName>WebVideo.Backend.DemoHost.Tests</AssemblyName>
     <RootNamespace>WebVideo.Backend.DemoHost.Tests</RootNamespace>
     <IsPackable>false</IsPackable>
+    <EnablePreviewFeatures>true</EnablePreviewFeatures>
   </PropertyGroup>
 
   <ItemGroup>

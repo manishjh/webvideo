@@ -124,7 +124,7 @@ Recommended starting limits:
 
 ### Render path
 
-Preferred approach:
+Primary hardware path:
 
 - import `VideoFrame` into GPU path directly where browser support allows
 - composite video plane plus overlay primitives in a single render pass
@@ -135,6 +135,15 @@ Render architecture:
 - one full-screen quad for video
 - one or more overlay passes or instanced draws for boxes, lines, text anchors, masks
 - optional final color/tone conversion pass only if required
+
+Fallback policy:
+
+- require hardware WebGPU for the production fast path
+- detect and reject SwiftShader/software WebGPU adapters for live video
+- use the explicit Canvas2D renderer when Chrome only exposes a software adapter
+- expose the active render path and GPU adapter in the VMS UI and Playwright diagnostics
+
+The Canvas2D path is a compatibility fallback, not the performance target. In local testing, Chrome's Linux SwiftShader WebGPU path was slower and more jitter-prone than the Canvas2D fallback.
 
 ### Scheduling
 
@@ -186,7 +195,9 @@ In a browser, close to native means:
 - Avoid crossing worker/main-thread boundaries more than necessary.
 - Move parsing and scheduling to a dedicated worker when possible.
 - Keep UI framework code out of the media hot path.
-- Use WebGPU for all compositing, not 2D canvas fallback, except as debug tooling.
+- Use hardware WebGPU for the fast path.
+- Treat Canvas2D as an intentional compatibility fallback for software-adapter cases.
+- Do not treat SwiftShader/software WebGPU as a production rendering path.
 - Keep overlay primitives GPU-friendly: instanced boxes, lines, glyph atlases, masks.
 - Instrument every queue so latency inflation is visible immediately.
 
@@ -215,6 +226,13 @@ Collect at minimum:
 - present time
 - queue depths at each stage
 - dropped frame counts by reason
+- source FPS and render FPS
+- frame interval p95/p99
+- frame hitch and severe hitch counts
+- skipped sequence ranges and skipped frame counts
+- backend subscriber stale-frame drops
+- client dependency drops
+- active render path and GPU adapter details
 - metadata delay and expiry counts
 
 ## 8. Failure and Degradation Policies
@@ -223,12 +241,15 @@ Collect at minimum:
 
 - drop late metadata events after validity window
 - drop stale decoded frames if presentation deadline passed
+- count skipped sequence ranges separately from explicit dependency drops
+- prefer dropping stale live frames over preserving old frames and inflating source-to-render latency
 - request/keyframe recovery on decode corruption
 - reduce overlay complexity under GPU pressure
+
+The current local mixed 4K/1080p/720p run is a diagnostic stress path. It proves the hardware WebGPU path can be selected, but it also exposes browser-side hitches, skipped sequence ranges, and backend stale-frame drops under load. Do not treat that profile as product-grade until its multi-minute FPS, hitch, and source-to-render budgets are stable.
 
 ### Playback
 
 - increase buffer depth before dropping
 - allow more accurate sync recovery
 - favor completeness over minimal latency
-

@@ -39,7 +39,10 @@ public sealed record BrowserSessionRequest(
     Uri WebTransportEndpoint,
     string AuthToken,
     TimeSpan MaxLatencyBudget,
-    bool EnableMetadata);
+    bool EnableMetadata)
+{
+    public ChannelId ChannelId { get; init; } = new(StreamId.Value);
+}
 
 public sealed record BrowserSubscriberDescriptor(
     string SubscriberId,
@@ -117,12 +120,22 @@ public sealed record ArchiveWriterHandle(
 public sealed record BrowserSessionHandle(
     BrowserSessionId SessionId,
     StreamId StreamId,
-    string ViewerId);
+    string ViewerId)
+{
+    public ChannelId ChannelId { get; init; } = new(StreamId.Value);
+}
 
 public sealed record StreamSubscriptionHandle(
     SubscriptionId SubscriptionId,
     StreamId StreamId,
     string SubscriberId);
+
+public sealed record BrowserStreamSinkHandle(
+    BrowserSinkId SinkId,
+    ChannelId ChannelId,
+    StreamId StreamId,
+    BrowserSessionHandle BrowserSession,
+    StreamSubscriptionHandle Subscription);
 
 public sealed record IngestStatusSnapshot(
     StreamId StreamId,
