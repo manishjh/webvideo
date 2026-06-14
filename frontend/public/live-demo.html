@@ -105,8 +105,8 @@
       <section class="hero">
         <h1 data-testid="page-title">WebVideo Live Demo</h1>
         <p>
-          This page fetches a deterministic stream description from the backend and renders it
-          through the in-memory browser player pipeline.
+          This page asks the backend for a browser stream by channel id, receives the selected
+          stream sink, and renders RTSP-captured H.264 through WebTransport, WebCodecs, and WebGPU.
         </p>
       </section>
 
@@ -138,14 +138,38 @@
 
         <section>
           <dl>
+            <dt>Channel</dt>
+            <dd data-testid="demo-channel-id">pending</dd>
             <dt>Stream</dt>
             <dd data-testid="demo-stream-id">pending</dd>
             <dt>Display Name</dt>
             <dd data-testid="demo-display-name">pending</dd>
             <dt>Source RTSP</dt>
             <dd class="mono" data-testid="demo-source-rtsp">pending</dd>
+            <dt>Source Mode</dt>
+            <dd data-testid="demo-source-mode">pending</dd>
+            <dt>Source Verified</dt>
+            <dd data-testid="demo-source-verified">pending</dd>
+            <dt>Source Detail</dt>
+            <dd data-testid="demo-source-diagnostics">pending</dd>
             <dt>Backend API</dt>
             <dd class="mono" data-testid="demo-api-endpoint">pending</dd>
+            <dt>QUIC URL</dt>
+            <dd class="mono" data-testid="demo-quic-url">pending</dd>
+            <dt>Sink</dt>
+            <dd class="mono" data-testid="demo-sink-id">pending</dd>
+            <dt>Transport</dt>
+            <dd data-testid="demo-transport-mode">pending</dd>
+            <dt>WebTransport Bytes</dt>
+            <dd data-testid="demo-webtransport-bytes">0</dd>
+            <dt>WebTransport Messages</dt>
+            <dd data-testid="demo-webtransport-messages">0</dd>
+            <dt>Decode Backend</dt>
+            <dd data-testid="demo-decode-backend">pending</dd>
+            <dt>Render Backend</dt>
+            <dd data-testid="demo-render-backend">pending</dd>
+            <dt>Browser APIs</dt>
+            <dd data-testid="demo-capabilities">pending</dd>
             <dt>Telemetry</dt>
             <dd data-testid="demo-telemetry-stages">pending</dd>
             <dt>Sequence Trace</dt>

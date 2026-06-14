@@ -230,6 +230,18 @@ export const frontendBehaviorCatalog: BehaviorSpecificationPlan[] = [
     coveredFlowIds: ["player-session-bootstrap"],
   },
   {
+    specificationId: "browser-session-uses-rtsp-captured-payloads",
+    summary: "A browser-owned channel session exposes a backend sink and RTSP-captured H.264 payloads before decode.",
+    requiredOutcomes: ["client-channel-id", "backend-sink-created", "rtsp-source-verified", "annexb-payloads-present", "http-fallback-declared"],
+    requiredMethods: [
+      method("WebPlayerBootstrap", "initializeSession", "PlayerSessionRequest", "AbortSignal"),
+      method("WebTransportIngestClient", "connect", "TransportEndpointDescriptor", "AbortSignal"),
+      method("WebTransportIngestClient", "readVideoMessages", "TransportConnectionHandle", "AbortSignal"),
+      method("EncodedChunkAssembler", "applyTransportMessage", "VideoTransportMessage"),
+    ],
+    coveredFlowIds: ["player-session-bootstrap", "transport-read-and-assembly"],
+  },
+  {
     specificationId: "video-chunks-are-assembled-before-decode",
     summary: "Transport messages are assembled and normalized before they reach WebCodecs.",
     requiredOutcomes: ["incremental-video-read", "encoded-chunk-assembly", "discontinuity-reset"],
@@ -293,35 +305,49 @@ export const e2eScenarioCatalog: E2eScenarioPlan[] = [
     summary: "A viewer opens the contract harness and sees the live session bootstrap flow represented.",
     linkedBehaviorIds: ["viewer-starts-live-session"],
     requiredAssertions: ["bootstrap flow present", "transport flow present", "renderer flow present"],
-    syntheticRtspScenarioId: "udp-h264-smoke",
+    syntheticRtspScenarioId: "cctv-lobby-720p",
   },
   {
     scenarioId: "viewer-joins-at-keyframe-boundary",
     summary: "The harness documents that join behavior is keyframe-safe and uses the shared live buffer path.",
     linkedBehaviorIds: ["video-chunks-are-assembled-before-decode", "player-enforces-bounded-latency"],
     requiredAssertions: ["assembler flow present", "scheduler flow present", "late-frame policy present"],
-    syntheticRtspScenarioId: "udp-h264-smoke",
+    syntheticRtspScenarioId: "cctv-lobby-720p",
   },
   {
     scenarioId: "metadata-overlay-aligns-to-frame-pts",
     summary: "The harness documents metadata alignment against the presentation timeline.",
     linkedBehaviorIds: ["metadata-overlays-align-to-presentation-time"],
     requiredAssertions: ["metadata flow present", "active metadata query present", "overlay alignment outcome present"],
-    syntheticRtspScenarioId: "udp-h264-smoke",
+    syntheticRtspScenarioId: "cctv-lobby-720p",
   },
   {
     scenarioId: "player-recovers-from-stream-discontinuity",
     summary: "The harness documents the reset and cleanup path used after discontinuity.",
     linkedBehaviorIds: ["player-recovers-from-discontinuity"],
     requiredAssertions: ["clock recovery flow present", "timeline clear present", "renderer dispose present"],
-    syntheticRtspScenarioId: "tcp-h264-smoke",
+    syntheticRtspScenarioId: "cctv-entrance-720p",
   },
   {
-    scenarioId: "synthetic-rtsp-source-publishes-test-pattern",
-    summary: "The harness documents the synthetic RTSP source required for smoke and e2e validation.",
-    linkedBehaviorIds: ["viewer-starts-live-session", "metadata-overlays-align-to-presentation-time"],
-    requiredAssertions: ["synthetic RTSP scenario listed", "UDP smoke stream listed", "TCP smoke stream listed"],
-    syntheticRtspScenarioId: "tcp-h264-smoke",
+    scenarioId: "rtsp-h264-source-feeds-browser-session",
+    summary: "The harness requests a browser channel session backed by MediaMTX and FFmpeg-captured Annex B H.264 payloads.",
+    linkedBehaviorIds: ["browser-session-uses-rtsp-captured-payloads", "metadata-overlays-align-to-presentation-time"],
+    requiredAssertions: ["channel session POST observed", "RTSP capture source verified", "Annex B payload bytes present"],
+    syntheticRtspScenarioId: "cctv-lobby-720p",
+  },
+  {
+    scenarioId: "tile-wall-renders-independent-channels",
+    summary: "The tile wall opens separate browser channel sessions and renders multiple RTSP-backed streams on one page.",
+    linkedBehaviorIds: ["viewer-starts-live-session", "browser-session-uses-rtsp-captured-payloads"],
+    requiredAssertions: ["multiple channel session POSTs observed", "independent sinks created", "all tiles render WebGPU frames"],
+    syntheticRtspScenarioId: "cctv-floor-1080p",
+  },
+  {
+    scenarioId: "high-resolution-4k-channel-is-declared",
+    summary: "The browser catalog exposes a 4K channel shape for stress testing high-resolution decode and render.",
+    linkedBehaviorIds: ["viewer-starts-live-session"],
+    requiredAssertions: ["4K channel present", "3840x2160 codec dimensions present", "single-frame 4K probe supported"],
+    syntheticRtspScenarioId: "cctv-parking-4k",
   },
 ];
 
@@ -332,4 +358,3 @@ export const requiredFrontendFlowIds = frontendFlowCatalog
 export const requiredE2eScenarioIds = e2eScenarioCatalog
   .map((scenario) => scenario.scenarioId)
   .sort((left, right) => left.localeCompare(right));
-

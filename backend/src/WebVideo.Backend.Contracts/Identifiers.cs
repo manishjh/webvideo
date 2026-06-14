@@ -2,6 +2,10 @@ namespace WebVideo.Backend.Contracts;
 
 public readonly record struct StreamId(string Value);
 
+public readonly record struct ChannelId(string Value);
+
+public readonly record struct BrowserSinkId(string Value);
+
 public readonly record struct IngestSessionId(string Value);
 
 public readonly record struct BrowserSessionId(string Value);

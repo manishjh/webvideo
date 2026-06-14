@@ -1,13 +1,23 @@
 export type StreamId = string;
+export type ChannelId = string;
+
+export type BrowserTransportMode = "webtransport-quic" | "http-seeded-fallback";
 
 export interface TransportEndpointDescriptor {
+  channelId: ChannelId;
   streamId: StreamId;
   webTransportUrl: string;
   authToken: string;
   metadataChannelRequired: boolean;
+  requestedTransport: BrowserTransportMode;
+  allowHttpFallback: boolean;
+  serverCertificateHash?: string;
+  frameCount?: number;
+  streamMode?: "bounded" | "continuous" | "continuous-binary" | "continuous-moq";
 }
 
 export interface PlayerSessionRequest {
+  channelId: ChannelId;
   streamId: StreamId;
   viewerId: string;
   targetLatencyMs: number;
@@ -16,13 +26,20 @@ export interface PlayerSessionRequest {
 
 export interface PlayerSessionHandle {
   sessionId: string;
+  channelId: ChannelId;
   streamId: StreamId;
   viewerId: string;
 }
 
 export interface TransportConnectionHandle {
   connectionId: string;
+  channelId: ChannelId;
   streamId: StreamId;
+  requestedTransport: BrowserTransportMode;
+  activeTransport: BrowserTransportMode;
+  webTransportReady: boolean;
+  webTransportBytesReceived: number;
+  webTransportMessagesReceived: number;
 }
 
 export interface VideoTransportMessage {
@@ -30,6 +47,13 @@ export interface VideoTransportMessage {
   sequenceNumber: number;
   presentationTimestampUs: number;
   decodeTimestampUs?: number;
+  sourceTimestampUnixTimeMs?: number;
+  serverTimestampUnixTimeMs?: number;
+  moqTrackAlias?: number;
+  moqGroupId?: number;
+  moqObjectId?: number;
+  moqSubgroupId?: number;
+  moqPublisherPriority?: number;
   keyFrame: boolean;
   codecConfigVersion: string;
   payload: Uint8Array;
@@ -57,11 +81,14 @@ export interface StreamDiscontinuity {
 }
 
 export interface VideoCodecConfiguration {
-  codec: "avc1" | "hvc1" | "av01";
+  codec: string;
   codedWidth: number;
   codedHeight: number;
   description?: Uint8Array;
 }
+
+export type DecodeBackend = "webcodecs" | "synthetic-frame-plan";
+export type RenderBackend = "webgpu" | "canvas2d-fallback";
 
 export interface DecodedFramePlan {
   streamId: StreamId;
@@ -69,6 +96,8 @@ export interface DecodedFramePlan {
   presentationTimestampUs: number;
   width: number;
   height: number;
+  decodeBackend: DecodeBackend;
+  videoFrame?: unknown;
 }
 
 export interface TimedMetadataRecord {
@@ -126,6 +155,13 @@ export interface RenderFrameResult {
   sessionId: string;
   renderedSequenceNumber: number;
   overlayPrimitiveCount: number;
+  renderBackend: RenderBackend;
+  gpuPresentation?: string;
+  gpuUploadSource?: string;
+  gpuAdapterVendor?: string;
+  gpuAdapterArchitecture?: string;
+  gpuReadbackError?: string;
+  webGpuDisabledReason?: string;
 }
 
 export interface StageTimingEvent {
@@ -177,4 +213,3 @@ export interface E2eScenarioPlan {
   requiredAssertions: string[];
   syntheticRtspScenarioId: string;
 }
-

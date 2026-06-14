@@ -111,7 +111,7 @@
         <h1 data-testid="page-title">WebVideo Contract Harness</h1>
         <p>
           This page renders the current frontend contract, flow, and end-to-end scenario
-          manifests that the test suite locks before real implementation begins.
+          manifests plus the RTSP-backed browser pipeline that the test suite locks.
         </p>
         <div class="stats">
           <div class="stat">
@@ -173,11 +173,10 @@
       </section>
 
       <section>
-        <h2>Simulated Player Flow</h2>
+        <h2>RTSP-Backed Player Flow</h2>
         <p>
-          This deterministic run executes the current in-memory frontend pipeline so Playwright
-          can validate actual service behavior, visible frame output, and frame-to-frame
-          progression.
+          This deterministic run asks the backend for a channel session, then drives the browser
+          pipeline with captured media payloads returned over the selected sink.
         </p>
         <div class="player-shell">
           <div class="player-surface">
@@ -192,6 +191,62 @@
               <tr>
                 <th>Session</th>
                 <td data-testid="sim-session-id">pending</td>
+              </tr>
+              <tr>
+                <th>Channel</th>
+                <td data-testid="sim-channel-id">pending</td>
+              </tr>
+              <tr>
+                <th>Stream</th>
+                <td data-testid="sim-stream-id">pending</td>
+              </tr>
+              <tr>
+                <th>Sink</th>
+                <td data-testid="sim-sink-id">pending</td>
+              </tr>
+              <tr>
+                <th>Transport</th>
+                <td data-testid="sim-transport-mode">pending</td>
+              </tr>
+              <tr>
+                <th>WebTransport Bytes</th>
+                <td data-testid="sim-webtransport-bytes">0</td>
+              </tr>
+              <tr>
+                <th>WebTransport Messages</th>
+                <td data-testid="sim-webtransport-messages">0</td>
+              </tr>
+              <tr>
+                <th>Decode Backend</th>
+                <td data-testid="sim-decode-backend">pending</td>
+              </tr>
+              <tr>
+                <th>Render Backend</th>
+                <td data-testid="sim-render-backend">pending</td>
+              </tr>
+              <tr>
+                <th>Source Mode</th>
+                <td data-testid="sim-source-mode">pending</td>
+              </tr>
+              <tr>
+                <th>Source Verified</th>
+                <td data-testid="sim-source-verified">pending</td>
+              </tr>
+              <tr>
+                <th>Source Diagnostics</th>
+                <td data-testid="sim-source-diagnostics">pending</td>
+              </tr>
+              <tr>
+                <th>Payload Bytes</th>
+                <td data-testid="sim-payload-bytes">0</td>
+              </tr>
+              <tr>
+                <th>Access Unit Format</th>
+                <td data-testid="sim-access-unit-format">pending</td>
+              </tr>
+              <tr>
+                <th>Browser Capabilities</th>
+                <td data-testid="sim-capabilities">pending</td>
               </tr>
               <tr>
                 <th>Video Messages</th>
@@ -228,6 +283,10 @@
               <tr>
                 <th>Telemetry Stages</th>
                 <td data-testid="sim-telemetry-stages">pending</td>
+              </tr>
+              <tr>
+                <th>Error</th>
+                <td data-testid="sim-error">none</td>
               </tr>
             </tbody>
           </table>

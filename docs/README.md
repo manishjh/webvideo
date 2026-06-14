@@ -12,7 +12,8 @@ Documents:
 - [Implementation Plan](./implementation-plan.md)
 - [Architecture Diagrams](./architecture-diagrams.md)
 - [Future Options](./future-options.md)
-- [Synthetic RTSP Runbook](./implementation-notes/synthetic-rtsp-runbook.md)
+- [Local RTSP Runbook](./implementation-notes/synthetic-rtsp-runbook.md)
+- [VMS Benchmark Snapshot](./implementation-notes/vms-benchmark.md)
 
 System goals:
 
@@ -21,3 +22,10 @@ System goals:
 - Clean metadata path for overlays, events, and analytics.
 - Explainable and maintainable architecture.
 - Efficient use of QUIC, WebTransport, WebCodecs, and WebGPU.
+
+Current validation entry points:
+
+- `./start.sh` for manual local RTSP, WebTransport, WebCodecs, and render validation
+- `scripts/test-all.sh` for the central automated suite
+- `WEBVIDEO_TEST_PROFILE=hardware-long scripts/test-all.sh` for headed hardware WebGPU VMS soak coverage
+- `WEBVIDEO_TEST_PROFILE=hardware-mixed-4k-long scripts/test-all.sh` for the current mixed 4K/1080p/720p stress diagnostic

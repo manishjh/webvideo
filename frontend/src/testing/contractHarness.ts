@@ -13,10 +13,17 @@ import {
   frontendBehaviorCatalog,
   frontendFlowCatalog,
 } from "../contracts/flows";
+import {
+  describeCapabilities,
+  normalizeVideoMessages,
+  openChannelSession,
+} from "./browserDemoApi";
 import type {
+  BrowserTransportMode,
+  DecodeBackend,
   MetadataTransportMessage,
+  RenderBackend,
   TimedMetadataBatch,
-  VideoTransportMessage,
 } from "../contracts/models";
 
 declare global {
@@ -28,6 +35,21 @@ declare global {
       canvasLastSequence?: string;
       telemetryStages: string[];
       sessionId?: string;
+      channelId?: string;
+      streamId?: string;
+      sinkId?: string;
+      requestedTransport?: BrowserTransportMode;
+      activeTransport?: BrowserTransportMode;
+      webTransportReady?: boolean;
+      webTransportBytesReceived?: number;
+      webTransportMessagesReceived?: number;
+      decodeBackend?: DecodeBackend;
+      renderBackend?: RenderBackend;
+      sourceMode?: string;
+      sourceVerified?: boolean;
+      accessUnitFormat?: string;
+      payloadBytes?: number;
+      error?: string;
     };
   }
 }
@@ -36,6 +58,13 @@ function appendCell(row: HTMLTableRowElement, value: string): void {
   const cell = document.createElement("td");
   cell.textContent = value;
   row.appendChild(cell);
+}
+
+function bindText(testId: string, value: string): void {
+  const element = document.querySelector<HTMLElement>(`[data-testid='${testId}']`);
+  if (element) {
+    element.textContent = value;
+  }
 }
 
 function renderFlowTable(): void {
@@ -105,44 +134,41 @@ function renderCounts(): void {
   }
 }
 
+function shouldRunSimulatedPlayerFlow(): boolean {
+  const params = new URLSearchParams(window.location.search);
+  return params.get("runPlayer") !== "0";
+}
+
 async function runSimulatedPlayerFlow(): Promise<void> {
-  const baseTimestampUs = 2_000_000;
-  const frameDurationUs = 33_333;
-  const videoMessages: VideoTransportMessage[] = Array.from({ length: 8 }, (_, index) => ({
-    streamId: "camera-001",
-    sequenceNumber: 101 + index,
-    presentationTimestampUs: baseTimestampUs + index * frameDurationUs,
-    decodeTimestampUs: baseTimestampUs + index * frameDurationUs,
-    keyFrame: index === 0,
-    codecConfigVersion: "cfg-001",
-    payload: new Uint8Array([index + 1, (index + 3) * 2]),
-  }));
-  const metadataMessages: MetadataTransportMessage[] = videoMessages.map((message, index) => ({
-    streamId: message.streamId,
-    batchStartTimestampUs: message.presentationTimestampUs,
-    batchEndTimestampUs: message.presentationTimestampUs + frameDurationUs,
-    records: [
-      {
-        eventId: `evt-${index + 1}`,
-        eventType: "box2d",
-        startTimestampUs: message.presentationTimestampUs,
-        endTimestampUs: message.presentationTimestampUs + frameDurationUs,
-        coordinateSpace: "normalized-video",
-        tags: {
-          label: index % 2 === 0 ? "ball" : "player",
-          x: `${0.1 + index * 0.07}`,
-          y: `${0.12 + (index % 3) * 0.12}`,
-          w: "0.14",
-          h: "0.18",
-        },
-      },
-    ],
-  }));
+  const channelId = "channel-001";
+
+  bindText("sim-status", "requesting-channel");
+  bindText("sim-channel-id", channelId);
+  bindText("sim-capabilities", describeCapabilities());
+  bindText("sim-error", "none");
+
+  window.__webvideoHarnessState = {
+    renderedSequences: [],
+    overlayCounts: [],
+    status: "requesting-channel",
+    telemetryStages: [],
+    channelId,
+  };
+
+  const payload = await openChannelSession(channelId, {
+    viewerId: "harness-viewer",
+    authToken: "demo-token",
+    targetLatencyMs: 150,
+    enableMetadata: true,
+  });
+  const videoMessages = normalizeVideoMessages(payload.videoMessages);
+  const metadataMessages: MetadataTransportMessage[] = payload.metadataMessages;
+  const payloadBytes = videoMessages.reduce((total, message) => total + message.payload.byteLength, 0);
 
   const bootstrap = new WebPlayerBootstrap();
   const transport = new WebTransportIngestClient({
-    videoMessagesByStream: { "camera-001": videoMessages },
-    metadataMessagesByStream: { "camera-001": metadataMessages },
+    videoMessagesByStream: { [payload.streamId]: videoMessages },
+    metadataMessagesByStream: { [payload.streamId]: metadataMessages },
   });
   const assembler = new EncodedChunkAssembler();
   const decoder = new VideoDecodeCoordinator();
@@ -152,16 +178,22 @@ async function runSimulatedPlayerFlow(): Promise<void> {
   const telemetry = new PlayerTelemetryCollector();
 
   const session = await bootstrap.initializeSession({
-    streamId: "camera-001",
+    channelId: payload.channelId,
+    streamId: payload.streamId,
     viewerId: "harness-viewer",
-    targetLatencyMs: 150,
+    targetLatencyMs: payload.targetLatencyMs,
     enableMetadata: true,
   });
   const connection = await transport.connect({
-    streamId: "camera-001",
-    webTransportUrl: "https://localhost:9443/live/camera-001",
-    authToken: "token",
-    metadataChannelRequired: true,
+    channelId: payload.channelId,
+    streamId: payload.streamId,
+    webTransportUrl: payload.webTransportUrl,
+    authToken: "demo-token",
+    metadataChannelRequired: payload.metadataChannelRequired,
+    requestedTransport: payload.requestedTransport,
+    allowHttpFallback: true,
+    serverCertificateHash: payload.webTransportCertificateHash,
+    frameCount: payload.requestedFrameCount,
   });
 
   const receivedVideoMessages = await transport.readVideoMessages(connection);
@@ -171,27 +203,18 @@ async function runSimulatedPlayerFlow(): Promise<void> {
     chunks.push(...await assembler.applyTransportMessage(message));
   }
 
-  await decoder.configureDecoder({
-    codec: "avc1",
-    codedWidth: 1280,
-    codedHeight: 720,
-  });
+  await decoder.configureDecoder(payload.codec);
   for (const chunk of chunks) {
     await decoder.enqueueChunk(chunk);
   }
   const frames = await decoder.flush();
+  const decodeBackend = frames[0]?.decodeBackend ?? "synthetic-frame-plan";
   await renderer.configureSurface({
     canvasId: "contract-canvas",
-    canvasWidth: 1280,
-    canvasHeight: 720,
+    canvasWidth: payload.codec.codedWidth,
+    canvasHeight: payload.codec.codedHeight,
     outputColorSpace: "srgb",
   });
-  const bind = (testId: string, value: string): void => {
-    const element = document.querySelector<HTMLElement>(`[data-testid='${testId}']`);
-    if (element) {
-      element.textContent = value;
-    }
-  };
 
   const delay = (durationMs: number): Promise<void> =>
     new Promise((resolve) => {
@@ -203,18 +226,52 @@ async function runSimulatedPlayerFlow(): Promise<void> {
     overlayCounts: [],
     status: "streaming",
     telemetryStages: [],
+    channelId: payload.channelId,
+    streamId: payload.streamId,
+    sinkId: payload.sink.sinkId,
+    requestedTransport: connection.requestedTransport,
+    activeTransport: connection.activeTransport,
+    webTransportReady: connection.webTransportReady,
+    webTransportBytesReceived: connection.webTransportBytesReceived,
+    webTransportMessagesReceived: connection.webTransportMessagesReceived,
+    decodeBackend,
+    renderBackend: "canvas2d-fallback",
+    sourceMode: payload.sourceMode,
+    sourceVerified: payload.sourceVerified,
+    accessUnitFormat: payload.accessUnitFormat,
+    payloadBytes,
   };
 
-  bind("sim-status", "streaming");
-  bind("sim-session-id", session.sessionId);
-  bind("sim-video-messages", String(receivedVideoMessages.length));
-  bind("sim-metadata-records", String(receivedMetadataMessages.reduce((total, batch) => total + batch.records.length, 0)));
-  bind("sim-rendered-count", "0");
-  bind("sim-telemetry-count", "0");
-  bind("sim-sequence-trace", "pending");
+  bindText("sim-status", "streaming");
+  bindText("sim-session-id", session.sessionId);
+  bindText("sim-channel-id", payload.channelId);
+  bindText("sim-stream-id", payload.streamId);
+  bindText("sim-sink-id", payload.sink.sinkId);
+  bindText("sim-transport-mode", `${connection.requestedTransport} -> ${connection.activeTransport}`);
+  bindText("sim-webtransport-bytes", String(connection.webTransportBytesReceived));
+  bindText("sim-webtransport-messages", String(connection.webTransportMessagesReceived));
+  bindText("sim-decode-backend", decodeBackend);
+  bindText("sim-render-backend", "pending");
+  bindText("sim-source-mode", `${payload.sourceMode} (${payload.accessUnitFormat})`);
+  bindText("sim-source-verified", payload.sourceVerified ? "yes" : "no");
+  bindText("sim-source-diagnostics", payload.sourceDiagnostics);
+  bindText("sim-payload-bytes", String(payloadBytes));
+  bindText("sim-access-unit-format", payload.accessUnitFormat);
+  bindText("sim-video-messages", String(receivedVideoMessages.length));
+  bindText("sim-metadata-records", String(receivedMetadataMessages.reduce((total, batch) => total + batch.records.length, 0)));
+  bindText("sim-rendered-count", "0");
+  bindText("sim-telemetry-count", "0");
+  bindText("sim-sequence-trace", "pending");
 
   await telemetry.recordStageEvent({
-    streamId: "camera-001",
+    streamId: payload.streamId,
+    stageName: "transport.connect",
+    latencyMs: connection.webTransportReady ? 1.0 : 0.1,
+    queueDepth: 0,
+  });
+
+  await telemetry.recordStageEvent({
+    streamId: payload.streamId,
     stageName: "transport.read",
     latencyMs: 1.1,
     queueDepth: receivedVideoMessages.length,
@@ -263,22 +320,24 @@ async function runSimulatedPlayerFlow(): Promise<void> {
     window.__webvideoHarnessState.overlayCounts.push(renderResult.overlayPrimitiveCount);
     window.__webvideoHarnessState.canvasLastSequence = canvas?.dataset.lastSequence;
     window.__webvideoHarnessState.sessionId = session.sessionId;
+    window.__webvideoHarnessState.renderBackend = renderResult.renderBackend;
 
-    bind("sim-rendered-sequence", String(renderResult.renderedSequenceNumber));
-    bind("sim-overlay-count", String(renderResult.overlayPrimitiveCount));
-    bind("sim-decision", decision.shouldRender ? "render" : "hold");
-    bind("sim-rendered-count", String(window.__webvideoHarnessState.renderedSequences.length));
-    bind("sim-sequence-trace", window.__webvideoHarnessState.renderedSequences.join(", "));
+    bindText("sim-rendered-sequence", String(renderResult.renderedSequenceNumber));
+    bindText("sim-render-backend", renderResult.renderBackend);
+    bindText("sim-overlay-count", String(renderResult.overlayPrimitiveCount));
+    bindText("sim-decision", decision.shouldRender ? "render" : "hold");
+    bindText("sim-rendered-count", String(window.__webvideoHarnessState.renderedSequences.length));
+    bindText("sim-sequence-trace", window.__webvideoHarnessState.renderedSequences.join(", "));
 
-    await delay(60);
+    await delay(payload.frameIntervalMs);
   }
 
-  const telemetrySnapshot = await telemetry.createSnapshot("camera-001");
+  const telemetrySnapshot = await telemetry.createSnapshot(payload.streamId);
   window.__webvideoHarnessState.status = "completed";
   window.__webvideoHarnessState.telemetryStages = telemetrySnapshot.stages.map((stage) => stage.stageName);
-  bind("sim-status", "completed");
-  bind("sim-telemetry-stages", telemetrySnapshot.stages.map((stage) => stage.stageName).join(", "));
-  bind("sim-telemetry-count", String(telemetrySnapshot.stages.length));
+  bindText("sim-status", "completed");
+  bindText("sim-telemetry-stages", telemetrySnapshot.stages.map((stage) => stage.stageName).join(", "));
+  bindText("sim-telemetry-count", String(telemetrySnapshot.stages.length));
 
   await bootstrap.disposeSession(session);
 }
@@ -288,7 +347,34 @@ async function bootHarness(): Promise<void> {
   renderFlowTable();
   renderBehaviorTable();
   renderScenarioTable();
-  await runSimulatedPlayerFlow();
+
+  if (!shouldRunSimulatedPlayerFlow()) {
+    bindText("sim-status", "idle");
+    window.__webvideoHarnessState = {
+      renderedSequences: [],
+      overlayCounts: [],
+      status: "idle",
+      telemetryStages: [],
+      channelId: "channel-001",
+    };
+    return;
+  }
+
+  try {
+    await runSimulatedPlayerFlow();
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    bindText("sim-status", "error");
+    bindText("sim-error", message);
+    window.__webvideoHarnessState = {
+      renderedSequences: [],
+      overlayCounts: [],
+      status: "error",
+      telemetryStages: [],
+      channelId: "channel-001",
+      error: message,
+    };
+  }
 }
 
 if (document.readyState === "loading") {

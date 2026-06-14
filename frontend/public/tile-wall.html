@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebVideo Tile Wall</title>
+    <style>
+      :root {
+        --bg: #eef1f4;
+        --panel: #ffffff;
+        --ink: #172235;
+        --muted: #5b6573;
+        --line: #d6dce4;
+      }
+
+      body {
+        margin: 0;
+        font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+        color: var(--ink);
+        background: var(--bg);
+      }
+
+      main {
+        max-width: 1520px;
+        margin: 0 auto;
+        padding: 24px;
+      }
+
+      header {
+        display: flex;
+        align-items: baseline;
+        justify-content: space-between;
+        gap: 20px;
+        margin-bottom: 18px;
+      }
+
+      h1 {
+        margin: 0;
+        font-size: 1.6rem;
+      }
+
+      .summary {
+        color: var(--muted);
+        font-family: "IBM Plex Mono", monospace;
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(360px, 1fr));
+        gap: 16px;
+      }
+
+      .tile {
+        min-width: 0;
+        background: var(--panel);
+        border: 1px solid var(--line);
+      }
+
+      .tile header {
+        margin: 0;
+        padding: 12px 14px;
+        border-bottom: 1px solid var(--line);
+      }
+
+      .tile h2 {
+        margin: 0;
+        font-size: 1rem;
+      }
+
+      .tile .meta {
+        color: var(--muted);
+        font-family: "IBM Plex Mono", monospace;
+        font-size: 0.82rem;
+      }
+
+      .surface {
+        background: #101820;
+      }
+
+      canvas {
+        display: block;
+        width: 100%;
+        height: auto;
+        aspect-ratio: 16 / 9;
+      }
+
+      dl {
+        display: grid;
+        grid-template-columns: 116px 1fr;
+        gap: 6px 10px;
+        margin: 0;
+        padding: 12px 14px 14px;
+        font-size: 0.86rem;
+      }
+
+      dt {
+        color: var(--muted);
+      }
+
+      dd {
+        margin: 0;
+        min-width: 0;
+        word-break: break-word;
+      }
+    </style>
+    <script type="module" src="/src/testing/tileWall.ts"></script>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1 data-testid="tile-wall-title">WebVideo Tile Wall</h1>
+        <div class="summary" data-testid="tile-wall-summary">booting</div>
+      </header>
+      <section id="tile-grid" class="grid" data-testid="tile-grid"></section>
+    </main>
+  </body>
+</html>

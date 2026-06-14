@@ -1,80 +1,71 @@
 import { expect, test } from "@playwright/test";
 
-const demoApiPayload = {
-  streamId: "camera-001",
-  displayName: "Synthetic Camera 001",
-  scenarioId: "udp-h264-smoke",
-  sourceRtspUrl: "rtsp://127.0.0.1:8554/live/udp-h264-smoke",
-  sourceSummary: "Synthetic H.264 smoke stream over ForceUdp.",
-  targetLatencyMs: 150,
-  frameIntervalMs: 1,
-  webTransportUrl: "https://localhost:9443/live/camera-001",
-  metadataChannelRequired: true,
-  codec: {
-    codec: "avc1",
-    codedWidth: 1280,
-    codedHeight: 720,
-  },
-  videoMessages: Array.from({ length: 4 }, (_, index) => ({
-    streamId: "camera-001",
-    sequenceNumber: 101 + index,
-    presentationTimestampUs: 2_000_000 + index * 33_333,
-    decodeTimestampUs: 2_000_000 + index * 33_333,
-    keyFrame: index === 0,
-    codecConfigVersion: "cfg-demo-v1",
-    payload: [index + 1, (index + 3) * 2],
-  })),
-  metadataMessages: Array.from({ length: 4 }, (_, index) => ({
-    streamId: "camera-001",
-    batchStartTimestampUs: 2_000_000 + index * 33_333,
-    batchEndTimestampUs: 2_000_000 + (index + 1) * 33_333,
-    records: [
-      {
-        eventId: `evt-${index + 1}`,
-        eventType: "box2d",
-        startTimestampUs: 2_000_000 + index * 33_333,
-        endTimestampUs: 2_000_000 + (index + 1) * 33_333,
-        coordinateSpace: "normalized-video",
-        tags: {
-          label: index % 2 === 0 ? "ball" : "player",
-          x: `${0.1 + index * 0.07}`,
-          y: `${0.12 + (index % 3) * 0.12}`,
-          w: "0.14",
-          h: "0.18",
-        },
-      },
-    ],
-  })),
-};
+const requireHardwareWebGpu = process.env.WEBVIDEO_REQUIRE_HARDWARE_WEBGPU === "1";
 
 test.describe("live demo page", () => {
-  test("fetches a backend stream payload and renders visible playback", async ({ page }) => {
-    await page.route("**/api/demo/streams/camera-001", async (route) => {
-      await route.fulfill({
-        status: 200,
-        contentType: "application/json",
-        body: JSON.stringify(demoApiPayload),
-      });
-    });
+  test("opens a client-initiated channel session and renders visible playback", async ({ page }) => {
+    const sessionRequestPromise = page.waitForRequest((request) => (
+      request.method() === "POST"
+      && request.url().includes("/api/demo/channels/channel-001/sessions")
+    ));
+    const sessionResponsePromise = page.waitForResponse((response) => (
+      response.request().method() === "POST"
+      && response.url().includes("/api/demo/channels/channel-001/sessions")
+    ));
 
-    await page.goto("/live-demo.html");
+    await page.goto("/live-demo.html?channel=channel-001");
+    const sessionRequest = await sessionRequestPromise;
+    const sessionResponse = await sessionResponsePromise;
+    const sessionPayload = await sessionResponse.json();
     await page.waitForFunction(() => window.__webvideoLiveDemoState?.status === "completed");
+
+    expect(sessionRequest.postDataJSON()).toMatchObject({
+      viewerId: "browser-demo-viewer",
+      targetLatencyMs: 150,
+      enableMetadata: true,
+    });
+    expect(sessionPayload).toMatchObject({
+      sourceMode: "rtsp-h264-capture",
+      sourceVerified: true,
+      accessUnitFormat: "annexb-h264",
+    });
+    expect(sessionPayload.videoMessages).toHaveLength(8);
+    expect(typeof sessionPayload.videoMessages[0].payload).toBe("string");
+    expect(sessionPayload.videoMessages[0].payload.length).toBeGreaterThan(1_000);
 
     await expect(page.getByTestId("page-title")).toHaveText("WebVideo Live Demo");
     await expect(page.getByTestId("demo-status")).toHaveText("completed");
+    await expect(page.getByTestId("demo-channel-id")).toHaveText("channel-001");
     await expect(page.getByTestId("demo-stream-id")).toHaveText("camera-001");
-    await expect(page.getByTestId("demo-display-name")).toHaveText("Synthetic Camera 001");
-    await expect(page.getByTestId("demo-rendered-count")).toHaveText("4");
-    await expect(page.getByTestId("demo-last-sequence")).toHaveText("104");
+    await expect(page.getByTestId("demo-display-name")).toHaveText("CCTV Lobby 720p");
+    await expect(page.getByTestId("demo-source-rtsp")).toHaveText("rtsp://127.0.0.1:8554/live/cctv-lobby-720p");
+    await expect(page.getByTestId("demo-quic-url")).toHaveText("https://127.0.0.1:9443/live/channel-001");
+    await expect(page.getByTestId("demo-sink-id")).toContainText("sink-");
+    await expect(page.getByTestId("demo-transport-mode")).toHaveText("webtransport-quic -> webtransport-quic");
+    await expect(page.getByTestId("demo-webtransport-bytes")).not.toHaveText("0");
+    await expect(page.getByTestId("demo-webtransport-messages")).toHaveText("16");
+    await expect(page.getByTestId("demo-decode-backend")).toHaveText("webcodecs");
+    await expect(page.getByTestId("demo-render-backend")).toHaveText(requireHardwareWebGpu ? "webgpu" : /webgpu|canvas2d-fallback/);
+    await expect(page.getByTestId("demo-source-mode")).toHaveText("rtsp-h264-capture (annexb-h264)");
+    await expect(page.getByTestId("demo-source-verified")).toHaveText("yes");
+    await expect(page.getByTestId("demo-source-diagnostics")).toContainText("captured 8 Annex B H.264 access units");
+    await expect(page.getByTestId("demo-rendered-count")).toHaveText("8");
+    await expect(page.getByTestId("demo-last-sequence")).toHaveText("108");
     await expect(page.getByTestId("demo-overlay-count")).toHaveText("1");
-    await expect(page.getByTestId("demo-sequence-trace")).toHaveText("101, 102, 103, 104");
+    await expect(page.getByTestId("demo-sequence-trace")).toHaveText("101, 102, 103, 104, 105, 106, 107, 108");
 
     const canvas = page.getByTestId("live-demo-canvas");
     await expect(canvas).toBeVisible();
 
     const sample = await page.evaluate(() => {
       const canvas = document.querySelector<HTMLCanvasElement>("#live-demo-canvas");
-      const context = canvas?.getContext("2d");
+      const probe = document.createElement("canvas");
+      probe.width = canvas?.width ?? 0;
+      probe.height = canvas?.height ?? 0;
+      const context = probe.getContext("2d");
+      if (canvas && context) {
+        context.drawImage(canvas, 0, 0);
+      }
       const pixel = context ? Array.from(context.getImageData(320, 180, 1, 1).data) : [];
 
       return {
@@ -82,15 +73,55 @@ test.describe("live demo page", () => {
         hidden: canvas?.hidden ?? true,
         lastSequence: canvas?.dataset.lastSequence ?? "",
         overlayCount: canvas?.dataset.overlayCount ?? "",
+        renderBackend: canvas?.dataset.renderBackend ?? "",
+        gpuUploadSource: canvas?.dataset.gpuUploadSource ?? "",
+        gpuPresentation: canvas?.dataset.gpuPresentation ?? "",
+        gpuAdapterVendor: canvas?.dataset.gpuAdapterVendor ?? "",
+        gpuAdapterArchitecture: canvas?.dataset.gpuAdapterArchitecture ?? "",
+        webGpuStep: canvas?.dataset.webGpuStep ?? "",
+        webGpuError: canvas?.dataset.webGpuError ?? "",
+        gpuSample: (canvas?.dataset.gpuSampleRgba ?? "").split(",").map(Number),
+        state: window.__webvideoLiveDemoState,
         pixel,
       };
     });
 
     expect(sample.width).toBe(1280);
     expect(sample.hidden).toBe(false);
-    expect(sample.lastSequence).toBe("104");
+    expect(sample.lastSequence).toBe("108");
     expect(sample.overlayCount).toBe("1");
-    expect(sample.pixel).toHaveLength(4);
-    expect(sample.pixel[3]).toBeGreaterThan(0);
+    if (requireHardwareWebGpu) {
+      expect(sample.renderBackend).toBe("webgpu");
+      expect(sample.gpuPresentation).toBe("webgpu-canvas");
+      expect(sample.gpuUploadSource).toBe("external-texture");
+      expect(sample.webGpuStep).toBe("rendered");
+      expect(sample.gpuSample).toHaveLength(4);
+      expect(sample.gpuSample[3]).toBeGreaterThan(0);
+      expect(sample.gpuSample.slice(0, 3).some((channel) => channel > 0)).toBe(true);
+    } else {
+      expect(["webgpu", "canvas2d-fallback"]).toContain(sample.renderBackend);
+    }
+    expect(sample.webGpuError).toBe("");
+    expect(sample.state).toMatchObject({
+      channelId: "channel-001",
+      streamId: "camera-001",
+      requestedTransport: "webtransport-quic",
+      activeTransport: "webtransport-quic",
+      webTransportReady: true,
+      decodeBackend: "webcodecs",
+      sourceMode: "rtsp-h264-capture",
+      sourceVerified: true,
+    });
+    if (requireHardwareWebGpu) {
+      expect(sample.state?.renderBackend).toBe("webgpu");
+    } else {
+      expect(["webgpu", "canvas2d-fallback"]).toContain(sample.state?.renderBackend);
+    }
+    expect(sample.state?.webTransportBytesReceived).toBeGreaterThan(8_000);
+    expect(sample.state?.webTransportMessagesReceived).toBe(16);
+    expect(sample.state?.sinkId).toMatch(/^sink-/);
+    if (!requireHardwareWebGpu) {
+      expect(sample.pixel[3]).toBeGreaterThan(0);
+    }
   });
 });

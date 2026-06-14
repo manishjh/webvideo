@@ -80,6 +80,8 @@ The ring buffer should:
 - let a new viewer join at the next keyframe
 - expose backpressure and drop metrics
 
+The current local VMS prototype uses a six-frame per-subscriber live queue and drops stale encoded frames instead of buffering seconds of old video. Under mixed 4K/1080p/720p load, backend stale-frame drops can climb while the browser also reports client dependency drops, sequence gaps, and frame hitches. Keep those counters separate; a single "dropped frames" number is not enough to identify whether the server queue, browser decoder, render scheduler, or UI thread is the active bottleneck.
+
 Do not create one full copy of every frame per client.
 
 Instead:

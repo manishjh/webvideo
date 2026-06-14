@@ -18,6 +18,7 @@ frontend/
   src/
     contracts/
     testing/
+    vms/
   tests/
     unit/
     contracts/
@@ -29,9 +30,9 @@ scripts/
 Current baseline:
 
 - `.NET 10` backend contracts and deterministic in-memory coordinators
-- ASP.NET demo host for synthetic browser stream payloads
-- TypeScript browser contracts and deterministic player services
-- Vitest and Playwright suites for contract and browser-flow coverage
+- ASP.NET demo host for RTSP-backed browser stream payloads and local WebTransport/QUIC
+- TypeScript browser contracts plus WebTransport, WebCodecs, scheduler, hardware WebGPU render services, and Canvas2D fallback for software-adapter cases
+- Vitest and Playwright suites for contract, live demo, tile wall, VMS continuous playback, opt-in 60 second soak, opt-in mixed 4K/1080p/720p soak, and opt-in 4K browser-flow coverage
 - future service splits are documented separately in [Future Options](./future-options.md)
 
 ## 2. Phase Plan
@@ -49,13 +50,19 @@ Tasks:
 - define TypeScript browser contracts for transport, decode, schedule, render, and telemetry
 - implement deterministic in-memory player services
 - serve synthetic stream payloads from the demo host
+- route client-provided channel IDs to backend-selected streams and browser sink/session records
+- capture real H.264 Annex B access units from the local RTSP source when `start.sh` enables RTSP capture
 - render a visible browser demo page and contract harness
+- render a visible multi-channel tile wall with one client-initiated channel session per tile
+- render a React VMS client with long-lived WebTransport streams, add/remove channel tiles, and per-tile health metrics
+- expose an opt-in 4K channel smoke for high-resolution browser validation
 
 Exit criteria:
 
 - backend tests pass
 - frontend unit and contract tests pass
-- Playwright validates the contract harness and live demo
+- Playwright validates the contract harness, live demo, tile wall, VMS continuous playback, and opt-in long-running VMS soak
+- opt-in 4K Playwright validates one 3840x2160 browser session when `WEBVIDEO_E2E_4K=1 START_4K_RTSP=1`
 
 ### Phase 1: Define protocol and timing model
 
@@ -79,25 +86,34 @@ Exit criteria:
 
 Goal:
 
-- confirm WebTransport -> WebCodecs -> WebGPU works on target browsers/devices
+- confirm WebTransport -> WebCodecs -> WebGPU works on target browsers/devices; the local Playwright harness currently verifies this loop against `start.sh`
 
 Tasks:
 
-- send synthetic encoded video chunks from backend
-- frontend reassembly and decode
-- measure receive, decode, and present timing
-- WebGPU video presentation
+- send RTSP-captured H.264 access units from backend-selected channel sessions
+- frontend WebTransport read, reassembly, and WebCodecs decode
+- independent browser-initiated sessions for multiple channel tiles on one page
+- measure receive, decode, render, and visible presentation timing
+- hardware WebGPU validation with Linux Vulkan/ANGLE flags, WebGPU external textures from WebCodecs `VideoFrame`, and WebGPU canvas presentation
+- software WebGPU adapter detection that avoids slow SwiftShader rendering and uses Canvas2D fallback instead
+- opt-in 4K source and browser smoke path
+- per-tile VMS diagnostics for render FPS, source FPS, latency summaries, backend queue/drop counters, client drops, skipped sequence frames, frame hitches, and frame interval p95
+- opt-in mixed-resolution VMS soak for `channel-4k`, `channel-003`, and `channel-001`
 
 Exit criteria:
 
-- stable low-latency synthetic playback
+- stable low-latency local playback
 - baseline metrics visible in browser
+- default headless Playwright passes
+- `WEBVIDEO_TEST_PROFILE=hardware-long scripts/test-all.sh` passes for the 60 second hardware VMS soak
+- `WEBVIDEO_E2E_4K=1 START_4K_RTSP=1 scripts/test-frontend-e2e.sh` passes for the high-resolution smoke
+- `WEBVIDEO_PLAYWRIGHT_CHROME_WEBGPU=1 scripts/test-frontend-e2e.sh` passes on a Vulkan-capable Chrome install
 
 ### Phase 3: Build live camera path
 
 Goal:
 
-- first live end-to-end pipeline
+- harden the continuous live camera session path and move from predefined demo channels to operator-configurable cameras
 
 Tasks:
 
@@ -105,13 +121,17 @@ Tasks:
 - RTP depacketization into normalized encoded access units
 - no-transcode archive/proxy compatibility where possible
 - paced WebTransport send
-- frontend reassembly and decode
+- frontend continuous read, reassembly, and decode
 - minimal scheduler with late-frame dropping
+- dynamic channel registry or camera configuration API for arbitrary RTSP sources
+- continuous session lifecycle, backpressure, reconnect, and keyframe recovery
+- hot-path optimization for mixed 4K/1080p/720p viewing, including main-thread work reduction, decode/render backpressure control, and explicit live frame shedding
 
 Exit criteria:
 
-- live stream reaches latency target on development network
-- queue depth and drop metrics are visible
+- arbitrary-duration live stream reaches latency target on development network
+- queue depth, drops, sequence gaps, frame hitches, and latency metrics are visible and tied to failure reasons
+- mixed 4K/1080p/720p playback stays within agreed FPS, hitch, and source-to-render budgets for a multi-minute run
 
 ### Phase 4: Add metadata overlays
 
@@ -172,15 +192,16 @@ Exit criteria:
 
 ### Session startup
 
-1. Client requests live or playback session over HTTPS.
-2. Server returns:
+1. Client requests a live or playback session over HTTPS with a browser-provided channel ID.
+2. Server resolves the channel ID to the backend stream and creates a browser sink/session.
+3. Server returns:
    - auth/session token
    - WebTransport endpoint
-   - stream IDs or logical channel descriptors
+   - selected stream ID and logical channel descriptor
    - codec config
    - timeline epoch and timebase
-3. Client opens WebTransport.
-4. Client starts video and metadata readers.
+4. Client opens WebTransport when available, or the deterministic local fallback during scaffolded testing.
+5. Client starts video and metadata readers.
 
 ### Live video path
 
@@ -229,6 +250,12 @@ Reason:
 - reduces UI interference
 - lowers GC pressure in render path
 
+Current status:
+
+- VMS media work still runs largely on the main browser thread.
+- The 180 second mixed 4K/1080p/720p stress run shows visible hitches, skipped sequence ranges, backend stale-frame drops, and source-to-render spikes even on the hardware WebGPU path.
+- Moving transport parsing, decode coordination, and scheduling away from React/main-thread work is a near-term optimization target.
+
 ### Decision: metadata format
 
 Recommendation:
@@ -264,6 +291,15 @@ Mitigation:
 
 - treat zero-copy as an optimization, not a requirement
 - benchmark fallback texture upload path
+- disable software WebGPU adapters for live video; SwiftShader can be much slower than Canvas2D fallback
+
+### Mixed-resolution overload risk
+
+Mitigation:
+
+- keep the `hardware-mixed-4k-long` profile as a diagnostic stress path
+- expose client drops, sequence gaps, frame hitches, and backend stale-frame drops in the VMS UI
+- optimize scheduling and queue policy before treating `4K + 1080p + 720p` as a product-grade target
 
 ### Timestamp drift risk
 
@@ -301,6 +337,7 @@ Mitigation:
 - backend demo host and synthetic stream catalog
 - TypeScript browser contracts and receiver
 - WebGPU renderer
+- Canvas2D fallback policy for software WebGPU adapters
 - overlay renderer
 - observability dashboard
 - browser compatibility report

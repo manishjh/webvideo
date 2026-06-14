@@ -2,34 +2,85 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-NODE_BIN_DIR="$ROOT_DIR/.tools/node/bin"
-LIB_DIR_A="$ROOT_DIR/.tools/browser-libs/root/usr/lib/x86_64-linux-gnu"
-LIB_DIR_B="$ROOT_DIR/.tools/browser-libs/root/lib/x86_64-linux-gnu"
 
-export PATH="$NODE_BIN_DIR:$PATH"
-export LD_LIBRARY_PATH="$LIB_DIR_A:$LIB_DIR_B${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+if [[ -x "$ROOT_DIR/.tools/node/bin/npm" ]]; then
+  NPM_BIN="$ROOT_DIR/.tools/node/bin/npm"
+  export PATH="$ROOT_DIR/.tools/node/bin:$PATH"
+else
+  NPM_BIN="npm"
+fi
+
+SERVER_PID=""
+
+cleanup() {
+  local exit_code=$?
+  trap - EXIT INT TERM
+
+  if [[ -n "$SERVER_PID" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    for _ in $(seq 1 20); do
+      if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+        break
+      fi
+
+      sleep 0.5
+    done
+
+    if kill -0 "$SERVER_PID" 2>/dev/null; then
+      kill -KILL "$SERVER_PID" 2>/dev/null || true
+    fi
+
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+
+  exit "$exit_code"
+}
+
+wait_for_http() {
+  local url=$1
+  local label=$2
+
+  for _ in $(seq 1 120); do
+    if python3 - "$url" >/dev/null 2>&1 <<'PY'
+import sys
+import urllib.request
+
+url = sys.argv[1]
+with urllib.request.urlopen(url, timeout=1) as response:
+    if 200 <= response.status < 400:
+        raise SystemExit(0)
+
+raise SystemExit(1)
+PY
+    then
+      return 0
+    fi
+
+    sleep 1
+  done
+
+  echo "Timed out waiting for $label at $url" >&2
+  return 1
+}
+
+trap cleanup EXIT INT TERM
+
+if [[ "${WEBVIDEO_PLAYWRIGHT_START_SERVER:-1}" != "0" && "${WEBVIDEO_PLAYWRIGHT_START_SERVER:-1}" != "false" ]]; then
+  export WEBVIDEO_PLAYWRIGHT_EXTERNAL_SERVER=1
+  (
+    cd "$ROOT_DIR"
+    START_RTSP="${START_RTSP:-1}" \
+      WEBVIDEO_SAMPLE_FOOTAGE="${WEBVIDEO_SAMPLE_FOOTAGE:-1}" \
+      START_4K_RTSP="${START_4K_RTSP:-${WEBVIDEO_E2E_4K:-0}}" \
+      ./start.sh
+  ) &
+  SERVER_PID=$!
+
+  wait_for_http "http://127.0.0.1:${BACKEND_PORT:-8080}/healthz" "backend"
+  wait_for_http "http://127.0.0.1:${FRONTEND_PORT:-4173}/live-demo.html?channel=channel-001" "frontend"
+else
+  export WEBVIDEO_PLAYWRIGHT_EXTERNAL_SERVER=1
+fi
 
 cd "$ROOT_DIR/frontend"
-"$NODE_BIN_DIR/npm" run test:serve >/tmp/webvideo-vite.log 2>&1 &
-SERVER_PID=$!
-trap 'kill "$SERVER_PID" >/dev/null 2>&1 || true' EXIT
-
-python3 - <<'PY'
-import socket
-import time
-
-deadline = time.time() + 15
-while time.time() < deadline:
-    sock = socket.socket()
-    try:
-        sock.connect(("127.0.0.1", 4173))
-        sock.close()
-        break
-    except OSError:
-        time.sleep(0.25)
-else:
-    raise SystemExit("Timed out waiting for the Vite test server on 127.0.0.1:4173.")
-PY
-
-"$NODE_BIN_DIR/npm" run test:e2e
-
+"$NPM_BIN" exec -- playwright test "$@"
