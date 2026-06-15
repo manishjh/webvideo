@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   EncodedChunkAssembler,
   OverlayTimelineStore,
@@ -7,6 +7,7 @@ import {
   type StreamingTransportFrame,
   VideoDecodeCoordinator,
   WebGpuRenderer,
+  WebGpuMatrixTileRenderer,
   WebPlayerBootstrap,
   WebTransportIngestClient,
 } from "../../src/contracts/services";
@@ -55,6 +56,10 @@ function createEndpoint(): TransportEndpointDescriptor {
     metadataChannelRequired: true,
     requestedTransport: "webtransport-quic",
     allowHttpFallback: true,
+    targetLatencyMs: 150,
+    desiredEgressFrameRate: 24,
+    desiredMaxCodedWidth: 1920,
+    desiredMaxCodedHeight: 1080,
   };
 }
 
@@ -416,6 +421,8 @@ function createCanvasStub(): {
 
 function installWebCodecsStub(options: {
   isConfigSupported?: (configuration: Record<string, unknown>) => boolean;
+  asyncErrorMessage?: string;
+  closeThrows?: boolean;
 } = {}): {
   restore: () => void;
   decodedChunks: Array<{ type: string; timestamp: number; byteLength: number }>;
@@ -458,14 +465,16 @@ function installWebCodecsStub(options: {
 
   class FakeVideoDecoder {
     private readonly output: (frame: FakeVideoFrame) => void;
+    private readonly error: (error: Error) => void;
 
     public static isConfigSupported(configuration: Record<string, unknown>): Promise<{ supported: boolean }> {
       configurations.push(configuration);
       return Promise.resolve({ supported: options.isConfigSupported?.(configuration) ?? true });
     }
 
-    public constructor(init: { output: (frame: FakeVideoFrame) => void }) {
+    public constructor(init: { output: (frame: FakeVideoFrame) => void; error: (error: Error) => void }) {
       this.output = init.output;
+      this.error = init.error;
     }
 
     public configure(): void {
@@ -478,6 +487,11 @@ function installWebCodecsStub(options: {
         timestamp: chunk.timestamp,
         byteLength: chunk.data.byteLength,
       });
+      if (options.asyncErrorMessage) {
+        this.error(new Error(options.asyncErrorMessage));
+        return;
+      }
+
       this.output(new FakeVideoFrame(chunk.timestamp));
     }
 
@@ -487,7 +501,9 @@ function installWebCodecsStub(options: {
     }
 
     public close(): void {
-      // No-op for the fake decoder.
+      if (options.closeThrows) {
+        throw new Error("Cannot call 'close' on a closed codec.");
+      }
     }
   }
 
@@ -527,6 +543,7 @@ function installWebGpuStub(options: {
   adapterInfo?: { vendor?: string; architecture?: string };
   importExternalTexture?: boolean;
   rejectReadback?: boolean;
+  requestAdapterNeverResolves?: boolean;
 } = {}): {
   restore: () => void;
   operations: string[];
@@ -588,14 +605,23 @@ function installWebGpuStub(options: {
     createCommandEncoder(): unknown {
       operations.push("createCommandEncoder");
       return {
-        beginRenderPass(): unknown {
+        beginRenderPass(descriptor?: { colorAttachments?: Array<{ loadOp?: string }> }): unknown {
           operations.push("beginRenderPass");
+          if (descriptor?.colorAttachments?.[0]?.loadOp) {
+            operations.push(`loadOp:${descriptor.colorAttachments[0].loadOp}`);
+          }
           return {
             setPipeline(): void {
               operations.push("setPipeline");
             },
             setBindGroup(): void {
               operations.push("setBindGroup");
+            },
+            setViewport(): void {
+              operations.push("setViewport");
+            },
+            setScissorRect(): void {
+              operations.push("setScissorRect");
             },
             draw(): void {
               operations.push("draw");
@@ -630,9 +656,6 @@ function installWebGpuStub(options: {
       copyExternalImageToTexture(): void {
         operations.push("copyExternalImageToTexture");
       },
-      writeTexture(): void {
-        operations.push("writeTexture");
-      },
       submit(): void {
         operations.push("submit");
       },
@@ -654,6 +677,10 @@ function installWebGpuStub(options: {
         },
         requestAdapter(): Promise<{ requestDevice: () => Promise<typeof fakeDevice> }> {
           operations.push("requestAdapter");
+          if (options.requestAdapterNeverResolves) {
+            return new Promise(() => undefined);
+          }
+
           return Promise.resolve({
             info: options.adapterInfo,
             requestDevice(): Promise<typeof fakeDevice> {
@@ -727,6 +754,8 @@ describe("frontend service contracts", () => {
     expect(decoder.configureDecoder.length).toBe(1);
     expect(decoder.enqueueChunk.length).toBe(1);
     expect(decoder.flush.length).toBe(0);
+    expect(decoder.drainDecodedFrames.length).toBe(0);
+    expect(decoder.liveBacklogFrameCount.length).toBe(0);
     expect(decoder.dispose.length).toBe(0);
     expect(metadata.ingestBatch.length).toBe(1);
     expect(metadata.queryActiveMetadata.length).toBe(2);
@@ -845,6 +874,10 @@ describe("frontend service contracts", () => {
       expect(urls).toEqual(["https://localhost:9443/live/channel-001"]);
       expect(writes.join("")).toContain("\"channelId\":\"channel-001\"");
       expect(writes.join("")).toContain("\"streamId\":\"camera-001\"");
+      expect(writes.join("")).toContain("\"targetLatencyMs\"");
+      expect(writes.join("")).toContain("\"desiredEgressFrameRate\":24");
+      expect(writes.join("")).toContain("\"desiredMaxCodedWidth\":1920");
+      expect(writes.join("")).toContain("\"desiredMaxCodedHeight\":1080");
       expect(connection.activeTransport).toBe("webtransport-quic");
       expect(connection.webTransportReady).toBe(true);
       expect(connection.webTransportBytesReceived).toBeGreaterThan(0);
@@ -914,6 +947,9 @@ describe("frontend service contracts", () => {
       const transport = new WebTransportIngestClient();
       const connection = await transport.connectStreaming({
         ...createEndpoint(),
+        chaosDisconnectAfterFrames: 30,
+        chaosFrameDelayMs: 15,
+        chaosDropEveryNFrames: 7,
         streamMode: "continuous",
       });
       const frames = [];
@@ -927,6 +963,13 @@ describe("frontend service contracts", () => {
       expect(connection.webTransportBytesReceived).toBeGreaterThan(0);
       expect(connection.webTransportMessagesReceived).toBe(2);
       expect(writes.join("")).toContain("\"streamMode\":\"continuous\"");
+      expect(writes.join("")).toContain("\"targetLatencyMs\"");
+      expect(writes.join("")).toContain("\"desiredEgressFrameRate\":24");
+      expect(writes.join("")).toContain("\"desiredMaxCodedWidth\":1920");
+      expect(writes.join("")).toContain("\"desiredMaxCodedHeight\":1080");
+      expect(writes.join("")).toContain("\"chaosDisconnectAfterFrames\":30");
+      expect(writes.join("")).toContain("\"chaosFrameDelayMs\":15");
+      expect(writes.join("")).toContain("\"chaosDropEveryNFrames\":7");
       expect(frames.map((frame) => frame.kind)).toEqual(["video", "metadata", "end"]);
       expect(frames[0]?.bytesReceived).toBeGreaterThan(0);
       expect(frames[0]?.messagesReceived).toBe(1);
@@ -956,6 +999,10 @@ describe("frontend service contracts", () => {
       expect(connection.webTransportBytesReceived).toBeGreaterThan(0);
       expect(connection.webTransportMessagesReceived).toBe(1);
       expect(writes.join("")).toContain("\"streamMode\":\"continuous-moq\"");
+      expect(writes.join("")).toContain("\"targetLatencyMs\"");
+      expect(writes.join("")).toContain("\"desiredEgressFrameRate\":24");
+      expect(writes.join("")).toContain("\"desiredMaxCodedWidth\":1920");
+      expect(writes.join("")).toContain("\"desiredMaxCodedHeight\":1080");
       expect(frames).toHaveLength(1);
       expect(frames[0]?.kind).toBe("video");
       if (frames[0]?.kind !== "video") {
@@ -1040,6 +1087,36 @@ describe("frontend service contracts", () => {
       expect(frames[1].message.sequenceNumber).toBe(102);
       expect(frames[1].message.keyFrame).toBe(false);
       expect(frames[1].message.moqObjectId).toBe(1);
+    } finally {
+      restore();
+    }
+  });
+
+  it("cooperatively drains large MoQ bursts without dropping parsed objects", async () => {
+    const messages = Array.from({ length: 34 }, (_, index) => ({
+      ...createVideoMessage(),
+      sequenceNumber: 201 + index,
+      keyFrame: index === 0,
+      payload: new Uint8Array([index + 1]),
+    }));
+    const combined = concatBytes(...messages.map((message, index) => createMoqVideoObjectFrame(message, 96, index)));
+    const { restore } = installWebTransportStub([combined]);
+
+    try {
+      const transport = new WebTransportIngestClient();
+      const connection = await transport.connectStreaming(createEndpoint());
+      const frames = await drainStreamingFrames(transport, connection);
+
+      expect(frames).toHaveLength(messages.length);
+      expect(connection.webTransportMessagesReceived).toBe(messages.length);
+      expect(frames.map((frame) => frame.kind)).toEqual(messages.map(() => "video"));
+      const lastFrame = frames.at(-1);
+      expect(lastFrame?.kind).toBe("video");
+      if (lastFrame?.kind !== "video") {
+        throw new Error("Expected last burst frame to be video.");
+      }
+
+      expect(lastFrame.message.sequenceNumber).toBe(234);
     } finally {
       restore();
     }
@@ -1255,7 +1332,7 @@ describe("frontend service contracts", () => {
         ...createChunk(),
         payload: new Uint8Array([0, 0, 0, 1, 9, 16]),
       });
-      const [keyFrame] = await decoder.flush(false);
+      const [keyFrame] = decoder.drainDecodedFrames();
 
       await decoder.enqueueChunk({
         ...createChunk(),
@@ -1264,12 +1341,54 @@ describe("frontend service contracts", () => {
         presentationTimestampUs: 2_033_333,
         payload: new Uint8Array([0, 0, 0, 1, 1, 16]),
       });
-      const [deltaFrame] = await decoder.flush(false);
+      const [deltaFrame] = decoder.drainDecodedFrames();
 
       expect(flushCalls()).toBe(0);
       expect(decodedChunks.map((chunk) => chunk.type)).toEqual(["key", "delta"]);
       expect(keyFrame?.decodeBackend).toBe("webcodecs");
       expect(deltaFrame?.decodeBackend).toBe("webcodecs");
+    } finally {
+      restore();
+    }
+  });
+
+  it("surfaces async WebCodecs decode errors during live drain", async () => {
+    const { restore } = installWebCodecsStub({ asyncErrorMessage: "decoder exploded" });
+    const decoder = new VideoDecodeCoordinator();
+
+    try {
+      await decoder.configureDecoder({
+        codec: "avc1.42C01F",
+        codedWidth: 1280,
+        codedHeight: 720,
+      });
+      await decoder.enqueueChunk({
+        ...createChunk(),
+        payload: new Uint8Array([0, 0, 0, 1, 9, 16]),
+      });
+
+      expect(() => decoder.drainDecodedFrames()).toThrow("decoder exploded");
+    } finally {
+      restore();
+    }
+  });
+
+  it("ignores VideoDecoder close errors after Chrome has already closed the codec", async () => {
+    const { restore } = installWebCodecsStub({ closeThrows: true });
+    const decoder = new VideoDecodeCoordinator();
+
+    try {
+      await decoder.configureDecoder({
+        codec: "avc1.42C01F",
+        codedWidth: 1280,
+        codedHeight: 720,
+      });
+      await decoder.enqueueChunk({
+        ...createChunk(),
+        payload: new Uint8Array([0, 0, 0, 1, 9, 16]),
+      });
+
+      expect(() => decoder.dispose()).not.toThrow();
     } finally {
       restore();
     }
@@ -1364,6 +1483,7 @@ describe("frontend service contracts", () => {
         renderedSequenceNumber: 101,
         overlayPrimitiveCount: 1,
         renderBackend: "canvas2d-fallback",
+        webGpuDisabledReason: "no-webgpu",
       });
 
       expect(canvas.width).toBe(1280);
@@ -1385,7 +1505,7 @@ describe("frontend service contracts", () => {
     }
   });
 
-  it("renders decoded frames through WebGPU offscreen when canvas presentation is unavailable", async () => {
+  it("falls back to Canvas2D when WebGPU canvas presentation is unavailable", async () => {
     const renderer = new WebGpuRenderer();
     const { operations: gpuOperations, restore: restoreGpu } = installWebGpuStub({
       adapterInfo: { vendor: "nvidia", architecture: "turing" },
@@ -1408,16 +1528,41 @@ describe("frontend service contracts", () => {
         },
       });
 
-      await waitForGpuSample(canvas);
-      expect(result.renderBackend).toBe("webgpu");
-      expect(canvas.dataset.renderBackend).toBe("webgpu");
-      expect(canvas.dataset.gpuPresentation).toBe("canvas2d-visible-copy");
-      expect(canvas.dataset.gpuSampleRgba).toBe("24,48,96,255");
+      expect(result.renderBackend).toBe("canvas2d-fallback");
+      expect(canvas.dataset.renderBackend).toBe("canvas2d-fallback");
+      expect(canvas.dataset.webGpuDisabledReason).toBe("no-webgpu-canvas");
       expect(canvasOperations).toContain("getContext:2d");
-      expect(gpuOperations).toContain("copyExternalImageToTexture");
-      expect(gpuOperations).toContain("copyTextureToBuffer");
-      expect(gpuOperations).toContain("draw");
+      expect(gpuOperations).toEqual(["requestAdapter"]);
     } finally {
+      restoreDocument();
+      restoreGpu();
+    }
+  });
+
+  it("fails WebGPU adapter startup fast instead of hanging playback setup", async () => {
+    vi.useFakeTimers();
+    const renderer = new WebGpuRenderer();
+    const { canvas } = createCanvasStub();
+    const { operations: gpuOperations, restore: restoreGpu } = installWebGpuStub({
+      requestAdapterNeverResolves: true,
+    });
+    const restoreDocument = installDocumentStub({
+      getElementById: (id: string) => (id === "player-canvas" ? canvas : null),
+    } as Document);
+
+    try {
+      const configurePromise = renderer.configureSurface(createSurfaceConfiguration());
+
+      await vi.advanceTimersByTimeAsync(2_999);
+      expect(canvas.dataset.webGpuDisabledReason).toBeUndefined();
+
+      await vi.advanceTimersByTimeAsync(1);
+      await configurePromise;
+
+      expect(canvas.dataset.webGpuDisabledReason).toBe("webgpu-request-adapter-timeout");
+      expect(gpuOperations).toEqual(["requestAdapter"]);
+    } finally {
+      vi.useRealTimers();
       restoreDocument();
       restoreGpu();
     }
@@ -1425,6 +1570,7 @@ describe("frontend service contracts", () => {
 
   it("presents decoded frames directly through a WebGPU canvas on hardware adapters", async () => {
     const renderer = new WebGpuRenderer();
+    const videoFrameDescriptor = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
     const { operations: gpuOperations, restore: restoreGpu } = installWebGpuStub({
       adapterInfo: { vendor: "nvidia", architecture: "turing" },
     });
@@ -1447,10 +1593,20 @@ describe("frontend service contracts", () => {
       canvasOperations.push(`getContext:${contextId}`);
       return contextId === "webgpu" ? webGpuContext : null;
     }) as HTMLCanvasElement["getContext"];
-    const { canvas: uploadCanvas } = createCanvasStub();
+    class FakeVideoFrame {
+      public readonly displayWidth = 1280;
+      public readonly displayHeight = 720;
+      public close(): void {
+        // The renderer owns frame close through the common frame lifecycle.
+      }
+    }
+    Object.defineProperty(globalThis, "VideoFrame", {
+      configurable: true,
+      writable: true,
+      value: FakeVideoFrame,
+    });
     const restoreDocument = installDocumentStub({
       getElementById: (id: string) => (id === "player-canvas" ? canvas : null),
-      createElement: (tagName: string) => (tagName === "canvas" ? uploadCanvas : null),
     } as unknown as Document);
 
     try {
@@ -1460,7 +1616,7 @@ describe("frontend service contracts", () => {
         frame: {
           ...createFrame(),
           decodeBackend: "webcodecs",
-          videoFrame: { displayWidth: 1280, displayHeight: 720 },
+          videoFrame: new FakeVideoFrame(),
         },
       });
 
@@ -1477,10 +1633,32 @@ describe("frontend service contracts", () => {
       expect(gpuOperations).toContain("context.getCurrentTexture");
       expect(gpuOperations).toContain("copyTextureToTexture");
       expect(gpuOperations).toContain("copyTextureToBuffer");
+      expect(gpuOperations).toContain("copyExternalImageToTexture");
+      expect(gpuOperations).not.toContain("writeTexture");
       expect(gpuOperations).toContain("draw");
+
+      const copiesAfterDiagnosticSample = gpuOperations.filter((operation) => operation === "copyTextureToTexture").length;
+      await renderer.renderFrame({
+        ...createRenderRequest(),
+        frame: {
+          ...createFrame(),
+            sequenceNumber: 102,
+            presentationTimestampUs: 2_033_333,
+            decodeBackend: "webcodecs",
+            videoFrame: new FakeVideoFrame(),
+          },
+        });
+
+      expect(gpuOperations.filter((operation) => operation === "copyTextureToTexture")).toHaveLength(copiesAfterDiagnosticSample);
+      expect(gpuOperations.filter((operation) => operation === "draw")).toHaveLength(2);
     } finally {
       restoreDocument();
       restoreGpu();
+      if (videoFrameDescriptor) {
+        Object.defineProperty(globalThis, "VideoFrame", videoFrameDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "VideoFrame");
+      }
     }
   });
 
@@ -1559,17 +1737,468 @@ describe("frontend service contracts", () => {
     }
   });
 
+  it("shares one WebGPU device and pipeline set across tile renderers", async () => {
+    const firstRenderer = new WebGpuRenderer();
+    const secondRenderer = new WebGpuRenderer();
+    const videoFrameDescriptor = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+    const { operations: gpuOperations, restore: restoreGpu } = installWebGpuStub({
+      adapterInfo: { vendor: "nvidia", architecture: "turing" },
+      importExternalTexture: true,
+    });
+    const firstCanvas = createCanvasStub().canvas;
+    const secondCanvas = createCanvasStub().canvas;
+    const createContext = () => ({
+      configure(): void {
+        gpuOperations.push("context.configure");
+      },
+      getCurrentTexture(): unknown {
+        gpuOperations.push("context.getCurrentTexture");
+        return {
+          createView(): unknown {
+            gpuOperations.push("swapchain.createView");
+            return {};
+          },
+        };
+      },
+    });
+    firstCanvas.getContext = ((contextId: string): unknown => contextId === "webgpu" ? createContext() : null) as HTMLCanvasElement["getContext"];
+    secondCanvas.getContext = ((contextId: string): unknown => contextId === "webgpu" ? createContext() : null) as HTMLCanvasElement["getContext"];
+
+    class FakeVideoFrame {
+      public readonly displayWidth = 1280;
+      public readonly displayHeight = 720;
+      public close(): void {
+        // The renderer owns frame close through the common frame lifecycle.
+      }
+    }
+
+    Object.defineProperty(globalThis, "VideoFrame", {
+      configurable: true,
+      writable: true,
+      value: FakeVideoFrame,
+    });
+    const restoreDocument = installDocumentStub({
+      getElementById: (id: string) => {
+        if (id === "first-canvas") {
+          return firstCanvas;
+        }
+
+        if (id === "second-canvas") {
+          return secondCanvas;
+        }
+
+        return null;
+      },
+    } as unknown as Document);
+
+    try {
+      await firstRenderer.configureSurface({ ...createSurfaceConfiguration(), canvasId: "first-canvas" });
+      await secondRenderer.configureSurface({ ...createSurfaceConfiguration(), canvasId: "second-canvas" });
+
+      await firstRenderer.renderFrame({
+        ...createRenderRequest(),
+        frame: {
+          ...createFrame(),
+          decodeBackend: "webcodecs",
+          videoFrame: new FakeVideoFrame(),
+        },
+      });
+      await secondRenderer.renderFrame({
+        ...createRenderRequest(),
+        frame: {
+          ...createFrame(),
+          sequenceNumber: 102,
+          presentationTimestampUs: 2_033_333,
+          decodeBackend: "webcodecs",
+          videoFrame: new FakeVideoFrame(),
+        },
+      });
+
+      expect(gpuOperations.filter((operation) => operation === "requestAdapter")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "requestDevice")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "createRenderPipeline")).toHaveLength(2);
+      expect(gpuOperations.filter((operation) => operation === "context.configure")).toHaveLength(2);
+      expect(gpuOperations.filter((operation) => operation === "draw")).toHaveLength(2);
+      expect(firstCanvas.dataset.gpuUploadSource).toBe("external-texture");
+      expect(secondCanvas.dataset.gpuUploadSource).toBe("external-texture");
+    } finally {
+      restoreDocument();
+      restoreGpu();
+      if (videoFrameDescriptor) {
+        Object.defineProperty(globalThis, "VideoFrame", videoFrameDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "VideoFrame");
+      }
+    }
+  });
+
+  it("batches VMS tile renders through one matrix WebGPU canvas", async () => {
+    const matrixCanvasId = "matrix-canvas-unit";
+    const firstRenderer = new WebGpuMatrixTileRenderer(matrixCanvasId);
+    const secondRenderer = new WebGpuMatrixTileRenderer(matrixCanvasId);
+    const videoFrameDescriptor = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+    const pixelRatioDescriptor = Object.getOwnPropertyDescriptor(globalThis, "devicePixelRatio");
+    const closedFrames: string[] = [];
+    const { operations: gpuOperations, restore: restoreGpu } = installWebGpuStub({
+      adapterInfo: { vendor: "nvidia", architecture: "turing" },
+      importExternalTexture: true,
+    });
+    const matrixCanvas = createCanvasStub().canvas;
+    const firstCanvas = createCanvasStub().canvas;
+    const secondCanvas = createCanvasStub().canvas;
+    const webGpuContext = {
+      configure(): void {
+        gpuOperations.push("matrix.context.configure");
+      },
+      getCurrentTexture(): unknown {
+        gpuOperations.push("matrix.context.getCurrentTexture");
+        return {
+          createView(): unknown {
+            gpuOperations.push("matrix.swapchain.createView");
+            return {};
+          },
+        };
+      },
+    };
+
+    matrixCanvas.getContext = ((contextId: string): unknown => {
+      gpuOperations.push(`matrix.getContext:${contextId}`);
+      return contextId === "webgpu" ? webGpuContext : null;
+    }) as HTMLCanvasElement["getContext"];
+    Object.assign(matrixCanvas, {
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 450 }),
+    });
+    Object.assign(firstCanvas, {
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 400, height: 225 }),
+    });
+    Object.assign(secondCanvas, {
+      getBoundingClientRect: () => ({ left: 400, top: 0, width: 400, height: 225 }),
+    });
+
+    class FakeVideoFrame {
+      public readonly displayWidth = 1280;
+      public readonly displayHeight = 720;
+      public constructor(private readonly label: string) {
+      }
+
+      public close(): void {
+        closedFrames.push(this.label);
+      }
+    }
+
+    Object.defineProperty(globalThis, "VideoFrame", {
+      configurable: true,
+      writable: true,
+      value: FakeVideoFrame,
+    });
+    Object.defineProperty(globalThis, "devicePixelRatio", {
+      configurable: true,
+      value: 1,
+    });
+    const restoreDocument = installDocumentStub({
+      getElementById: (id: string) => {
+        if (id === matrixCanvasId) {
+          return matrixCanvas;
+        }
+
+        if (id === "first-canvas") {
+          return firstCanvas;
+        }
+
+        if (id === "second-canvas") {
+          return secondCanvas;
+        }
+
+        return null;
+      },
+    } as unknown as Document);
+
+    try {
+      await firstRenderer.configureSurface({ ...createSurfaceConfiguration(), canvasId: "first-canvas" });
+      await secondRenderer.configureSurface({ ...createSurfaceConfiguration(), canvasId: "second-canvas" });
+
+      const [firstResult, secondResult] = await Promise.all([
+        firstRenderer.renderFrame({
+          ...createRenderRequest(),
+          frame: {
+            ...createFrame(),
+            decodeBackend: "webcodecs",
+            videoFrame: new FakeVideoFrame("first"),
+          },
+        }),
+        secondRenderer.renderFrame({
+          ...createRenderRequest(),
+          frame: {
+            ...createFrame(),
+            sequenceNumber: 102,
+            presentationTimestampUs: 2_033_333,
+            decodeBackend: "webcodecs",
+            videoFrame: new FakeVideoFrame("second"),
+          },
+        }),
+      ]);
+
+      await waitForGpuSample(firstCanvas);
+      await waitForGpuSample(secondCanvas);
+      expect(firstResult.renderBackend).toBe("webgpu");
+      expect(secondResult.renderBackend).toBe("webgpu");
+      expect(firstCanvas.dataset.gpuPresentation).toBe("webgpu-canvas");
+      expect(secondCanvas.dataset.gpuPresentation).toBe("webgpu-canvas");
+      expect(firstCanvas.dataset.gpuUploadSource).toBe("external-texture");
+      expect(secondCanvas.dataset.gpuUploadSource).toBe("external-texture");
+      expect(firstCanvas.dataset.gpuSampleRgba).toBe("1,1,1,255");
+      expect(secondCanvas.dataset.gpuSampleRgba).toBe("1,1,1,255");
+      expect(gpuOperations.filter((operation) => operation === "matrix.getContext:webgpu")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "matrix.context.getCurrentTexture")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "beginRenderPass")).toHaveLength(1);
+      expect(gpuOperations).toContain("loadOp:clear");
+      expect(gpuOperations.filter((operation) => operation === "copyTextureToTexture")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "setViewport")).toHaveLength(2);
+      expect(gpuOperations.filter((operation) => operation === "setScissorRect")).toHaveLength(2);
+      expect(gpuOperations.filter((operation) => operation === "importExternalTexture")).toHaveLength(2);
+      expect(gpuOperations.filter((operation) => operation === "copyExternalImageToTexture")).toHaveLength(0);
+      expect(gpuOperations.filter((operation) => operation === "draw")).toHaveLength(2);
+      expect(closedFrames).toEqual([]);
+
+      const thirdResult = await secondRenderer.renderFrame({
+        ...createRenderRequest(),
+        frame: {
+          ...createFrame(),
+          sequenceNumber: 103,
+          presentationTimestampUs: 2_066_666,
+          decodeBackend: "webcodecs",
+          videoFrame: new FakeVideoFrame("second-later"),
+        },
+      });
+
+      expect(thirdResult.renderBackend).toBe("webgpu");
+      expect(gpuOperations.filter((operation) => operation === "beginRenderPass")).toHaveLength(2);
+      expect(gpuOperations.filter((operation) => operation === "loadOp:clear")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "loadOp:load")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "matrix.context.getCurrentTexture")).toHaveLength(2);
+      expect(gpuOperations.filter((operation) => operation === "copyTextureToTexture")).toHaveLength(2);
+      expect(gpuOperations.filter((operation) => operation === "importExternalTexture")).toHaveLength(3);
+      expect(gpuOperations.filter((operation) => operation === "copyExternalImageToTexture")).toHaveLength(0);
+      expect(gpuOperations.filter((operation) => operation === "createBindGroup")).toHaveLength(3);
+      expect(gpuOperations.filter((operation) => operation === "draw")).toHaveLength(3);
+      expect(closedFrames).toEqual(["second"]);
+
+      await firstRenderer.dispose();
+      await secondRenderer.dispose();
+      expect(closedFrames).toEqual(["second", "first", "second-later"]);
+    } finally {
+      restoreDocument();
+      restoreGpu();
+      if (videoFrameDescriptor) {
+        Object.defineProperty(globalThis, "VideoFrame", videoFrameDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "VideoFrame");
+      }
+
+      if (pixelRatioDescriptor) {
+        Object.defineProperty(globalThis, "devicePixelRatio", pixelRatioDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "devicePixelRatio");
+      }
+    }
+  });
+
+  it("renders duplicate matrix views of the same VideoFrame without cloning", async () => {
+    const matrixCanvasId = "matrix-canvas-duplicate-unit";
+    const firstRenderer = new WebGpuMatrixTileRenderer(matrixCanvasId);
+    const secondRenderer = new WebGpuMatrixTileRenderer(matrixCanvasId);
+    const videoFrameDescriptor = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+    const pixelRatioDescriptor = Object.getOwnPropertyDescriptor(globalThis, "devicePixelRatio");
+    const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const closedFrames: string[] = [];
+    const { operations: gpuOperations, restore: restoreGpu } = installWebGpuStub({
+      adapterInfo: { vendor: "nvidia", architecture: "turing" },
+      importExternalTexture: true,
+    });
+    const matrixCanvas = createCanvasStub().canvas;
+    const firstCanvas = createCanvasStub().canvas;
+    const secondCanvas = createCanvasStub().canvas;
+    const webGpuContext = {
+      configure(): void {
+        gpuOperations.push("matrix.context.configure");
+      },
+      getCurrentTexture(): unknown {
+        gpuOperations.push("matrix.context.getCurrentTexture");
+        return {
+          createView(): unknown {
+            gpuOperations.push("matrix.swapchain.createView");
+            return {};
+          },
+        };
+      },
+    };
+
+    matrixCanvas.getContext = ((contextId: string): unknown => {
+      gpuOperations.push(`matrix.getContext:${contextId}`);
+      return contextId === "webgpu" ? webGpuContext : null;
+    }) as HTMLCanvasElement["getContext"];
+    Object.assign(matrixCanvas, {
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 450 }),
+    });
+    Object.assign(firstCanvas, {
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 400, height: 225 }),
+    });
+    Object.assign(secondCanvas, {
+      getBoundingClientRect: () => ({ left: 400, top: 0, width: 400, height: 225 }),
+    });
+
+    class FakeVideoFrame {
+      public readonly displayWidth = 3840;
+      public readonly displayHeight = 2160;
+      public constructor(private readonly label: string) {
+      }
+
+      public clone(): FakeVideoFrame {
+        throw new Error("duplicate matrix views should not clone shared VideoFrames");
+      }
+
+      public close(): void {
+        closedFrames.push(this.label);
+      }
+    }
+
+    Object.defineProperty(globalThis, "VideoFrame", {
+      configurable: true,
+      writable: true,
+      value: FakeVideoFrame,
+    });
+    Object.defineProperty(globalThis, "devicePixelRatio", {
+      configurable: true,
+      value: 1,
+    });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: {
+          search: "?matrixTexture=external",
+        },
+        addEventListener: () => undefined,
+      },
+    });
+    const restoreDocument = installDocumentStub({
+      getElementById: (id: string) => {
+        if (id === matrixCanvasId) {
+          return matrixCanvas;
+        }
+
+        if (id === "duplicate-first-canvas") {
+          return firstCanvas;
+        }
+
+        if (id === "duplicate-second-canvas") {
+          return secondCanvas;
+        }
+
+        return null;
+      },
+    } as unknown as Document);
+
+    try {
+      await firstRenderer.configureSurface({ ...createSurfaceConfiguration(), canvasId: "duplicate-first-canvas" });
+      await secondRenderer.configureSurface({ ...createSurfaceConfiguration(), canvasId: "duplicate-second-canvas" });
+
+      const sharedFrame = new FakeVideoFrame("shared");
+      const sharedDecodedFrame = {
+        ...createFrame(),
+        decodeBackend: "webcodecs" as const,
+        videoFrame: sharedFrame,
+      };
+      const sharedRequest = {
+        ...createRenderRequest(),
+        sessionId: "duplicate-shared",
+        frame: sharedDecodedFrame,
+      };
+      const [firstResult, secondResult] = await Promise.all([
+        firstRenderer.renderFrame(sharedRequest),
+        secondRenderer.renderFrame(sharedRequest),
+      ]);
+
+      await waitForGpuSample(firstCanvas);
+      await waitForGpuSample(secondCanvas);
+      expect(firstResult.renderBackend).toBe("webgpu");
+      expect(secondResult.renderBackend).toBe("webgpu");
+      expect(gpuOperations.filter((operation) => operation === "matrix.context.getCurrentTexture")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "beginRenderPass")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "importExternalTexture")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "copyTextureToTexture")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "copyExternalImageToTexture")).toHaveLength(0);
+      expect(gpuOperations.filter((operation) => operation === "writeBuffer")).toHaveLength(2);
+      expect(gpuOperations.filter((operation) => operation === "createBindGroup")).toHaveLength(2);
+      expect(gpuOperations.filter((operation) => operation === "draw")).toHaveLength(2);
+      expect(closedFrames).toEqual([]);
+
+      await firstRenderer.dispose();
+      await secondRenderer.dispose();
+      expect(closedFrames).toEqual(["shared"]);
+    } finally {
+      await firstRenderer.dispose();
+      await secondRenderer.dispose();
+      restoreDocument();
+      restoreGpu();
+      if (videoFrameDescriptor) {
+        Object.defineProperty(globalThis, "VideoFrame", videoFrameDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "VideoFrame");
+      }
+
+      if (pixelRatioDescriptor) {
+        Object.defineProperty(globalThis, "devicePixelRatio", pixelRatioDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "devicePixelRatio");
+      }
+
+      if (windowDescriptor) {
+        Object.defineProperty(globalThis, "window", windowDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "window");
+      }
+    }
+  });
+
   it("does not retry WebGPU diagnostic readback every frame after a readback failure", async () => {
     const renderer = new WebGpuRenderer();
+    const videoFrameDescriptor = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
     const { operations: gpuOperations, restore: restoreGpu } = installWebGpuStub({
       adapterInfo: { vendor: "nvidia", architecture: "turing" },
       rejectReadback: true,
     });
     const { canvas } = createCanvasStub();
-    const { canvas: uploadCanvas } = createCanvasStub();
+    const webGpuContext = {
+      configure(): void {
+        gpuOperations.push("context.configure");
+      },
+      getCurrentTexture(): unknown {
+        gpuOperations.push("context.getCurrentTexture");
+        return {
+          createView(): unknown {
+            gpuOperations.push("swapchain.createView");
+            return {};
+          },
+        };
+      },
+    };
+    canvas.getContext = ((contextId: string): unknown => {
+      return contextId === "webgpu" ? webGpuContext : null;
+    }) as HTMLCanvasElement["getContext"];
+    class FakeVideoFrame {
+      public readonly displayWidth = 1280;
+      public readonly displayHeight = 720;
+      public close(): void {
+        // The renderer owns frame close through the common frame lifecycle.
+      }
+    }
+    Object.defineProperty(globalThis, "VideoFrame", {
+      configurable: true,
+      writable: true,
+      value: FakeVideoFrame,
+    });
     const restoreDocument = installDocumentStub({
       getElementById: (id: string) => (id === "player-canvas" ? canvas : null),
-      createElement: (tagName: string) => (tagName === "canvas" ? uploadCanvas : null),
     } as unknown as Document);
 
     try {
@@ -1579,7 +2208,7 @@ describe("frontend service contracts", () => {
         frame: {
           ...createFrame(),
           decodeBackend: "webcodecs",
-          videoFrame: { displayWidth: 1280, displayHeight: 720 },
+          videoFrame: new FakeVideoFrame(),
         },
       });
       await waitForGpuReadbackError(canvas);
@@ -1591,7 +2220,7 @@ describe("frontend service contracts", () => {
           sequenceNumber: 102,
           presentationTimestampUs: 2_033_000,
           decodeBackend: "webcodecs",
-          videoFrame: { displayWidth: 1280, displayHeight: 720 },
+          videoFrame: new FakeVideoFrame(),
         },
       });
 
@@ -1603,6 +2232,11 @@ describe("frontend service contracts", () => {
     } finally {
       restoreDocument();
       restoreGpu();
+      if (videoFrameDescriptor) {
+        Object.defineProperty(globalThis, "VideoFrame", videoFrameDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "VideoFrame");
+      }
     }
   });
 
@@ -1612,6 +2246,25 @@ describe("frontend service contracts", () => {
       adapterInfo: { vendor: "google", architecture: "swiftshader" },
     });
     const { canvas, operations: canvasOperations } = createCanvasStub();
+    const originalGetContext = canvas.getContext.bind(canvas);
+    const webGpuContext = {
+      configure(): void {
+        gpuOperations.push("context.configure");
+      },
+      getCurrentTexture(): unknown {
+        gpuOperations.push("context.getCurrentTexture");
+        return {
+          createView(): unknown {
+            gpuOperations.push("swapchain.createView");
+            return {};
+          },
+        };
+      },
+    };
+    canvas.getContext = ((contextId: string): unknown => {
+      canvasOperations.push(`getContext:${contextId}`);
+      return contextId === "webgpu" ? webGpuContext : originalGetContext(contextId as never);
+    }) as HTMLCanvasElement["getContext"];
     const restoreDocument = installDocumentStub({
       getElementById: (id: string) => (id === "player-canvas" ? canvas : null),
     } as Document);

@@ -349,6 +349,13 @@ export const e2eScenarioCatalog: E2eScenarioPlan[] = [
     requiredAssertions: ["4K channel present", "3840x2160 codec dimensions present", "single-frame 4K probe supported"],
     syntheticRtspScenarioId: "cctv-parking-4k",
   },
+  {
+    scenarioId: "high-stress-4k60-crowd-channel-is-declared",
+    summary: "The browser catalog exposes a crowd-heavy 4K60 channel shape for decode and render stress testing.",
+    linkedBehaviorIds: ["viewer-starts-live-session"],
+    requiredAssertions: ["4K60 channel present", "3840x2160 codec dimensions present", "60 fps source rate present"],
+    syntheticRtspScenarioId: "cctv-road-crowd-4k60",
+  },
 ];
 
 export const requiredFrontendFlowIds = frontendFlowCatalog

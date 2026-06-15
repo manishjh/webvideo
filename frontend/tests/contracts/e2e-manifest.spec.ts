@@ -9,6 +9,7 @@ describe("frontend e2e manifest coverage", () => {
   it("covers the expected browser-facing end-to-end scenarios", () => {
     expect(requiredE2eScenarioIds).toEqual([
       "high-resolution-4k-channel-is-declared",
+      "high-stress-4k60-crowd-channel-is-declared",
       "metadata-overlay-aligns-to-frame-pts",
       "player-recovers-from-stream-discontinuity",
       "rtsp-h264-source-feeds-browser-session",
@@ -38,6 +39,7 @@ describe("frontend e2e manifest coverage", () => {
       "cctv-floor-1080p",
       "cctv-lobby-720p",
       "cctv-parking-4k",
+      "cctv-road-crowd-4k60",
     ]));
   });
 });

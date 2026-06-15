@@ -24,7 +24,10 @@ public sealed record BrowserDemoSessionOpenRequest(
     string? AuthToken,
     int? TargetLatencyMs,
     bool? EnableMetadata,
-    int? FrameCount = null);
+    int? FrameCount = null,
+    double? DesiredEgressFrameRate = null,
+    int? DesiredMaxCodedWidth = null,
+    int? DesiredMaxCodedHeight = null);
 
 public sealed record BrowserDemoSinkDescriptor(
     string SinkId,
@@ -133,7 +136,13 @@ public sealed class BrowserDemoStreamCatalog
             CodedWidth: 1280,
             CodedHeight: 720,
             Profile: "baseline",
-            FrameRate: 30.0),
+            FrameRate: 30.0,
+            SourceVariants:
+            [
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-lobby-720p15", 15.0),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-lobby-720p5", 5.0),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-lobby-720p2", 2.0)
+            ]),
         new(
             ChannelId: "channel-002",
             StreamId: "camera-002",
@@ -144,7 +153,13 @@ public sealed class BrowserDemoStreamCatalog
             CodedWidth: 1280,
             CodedHeight: 720,
             Profile: "baseline",
-            FrameRate: 30.0),
+            FrameRate: 30.0,
+            SourceVariants:
+            [
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-entrance-720p15", 15.0),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-entrance-720p5", 5.0),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-entrance-720p2", 2.0)
+            ]),
         new(
             ChannelId: "channel-003",
             StreamId: "camera-003",
@@ -155,7 +170,13 @@ public sealed class BrowserDemoStreamCatalog
             CodedWidth: 1920,
             CodedHeight: 1080,
             Profile: "baseline",
-            FrameRate: 30.0),
+            FrameRate: 30.0,
+            SourceVariants:
+            [
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-floor-1080p15", 15.0),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-floor-1080p5", 5.0),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-floor-1080p2", 2.0)
+            ]),
         new(
             ChannelId: "channel-4k",
             StreamId: "camera-4k",
@@ -166,7 +187,34 @@ public sealed class BrowserDemoStreamCatalog
             CodedWidth: 3840,
             CodedHeight: 2160,
             Profile: "baseline",
-            FrameRate: 15.0)
+            FrameRate: 15.0,
+            SourceVariants:
+            [
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-parking-1080p15", 15.0, 1920, 1080),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-parking-720p15", 15.0, 1280, 720),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-parking-720p5", 5.0, 1280, 720),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-parking-720p2", 2.0, 1280, 720)
+            ]),
+        new(
+            ChannelId: "channel-4k-crowd",
+            StreamId: "camera-4k-crowd",
+            DisplayName: "CCTV Road Crowd 4K60",
+            ScenarioId: "cctv-road-crowd-4k60",
+            SourceRtspUrl: "rtsp://127.0.0.1:8554/live/cctv-road-crowd-4k60",
+            SourceSummary: "Crowd-heavy road junction 4K60 feed for browser decode and render stress testing.",
+            CodedWidth: 3840,
+            CodedHeight: 2160,
+            Profile: "baseline",
+            FrameRate: 60.0,
+            SourceVariants:
+            [
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-road-crowd-1080p60", 60.0, 1920, 1080),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-road-crowd-1080p24", 24.0, 1920, 1080),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-road-crowd-720p60", 60.0, 1280, 720),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-road-crowd-720p15", 15.0, 1280, 720),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-road-crowd-720p5", 5.0, 1280, 720),
+                new BrowserDemoSourceVariant("rtsp://127.0.0.1:8554/live/cctv-road-crowd-720p2", 2.0, 1280, 720)
+            ])
         ];
 
         return definitions.Select(ApplyEnvironmentOverrides).ToArray();
@@ -199,6 +247,13 @@ public sealed class BrowserDemoStreamCatalog
     }
 
     public BrowserDemoChannelSummary GetChannel(string channelId)
+        => GetChannel(channelId, desiredEgressFrameRate: null);
+
+    public BrowserDemoChannelSummary GetChannel(
+        string channelId,
+        double? desiredEgressFrameRate,
+        int? desiredMaxCodedWidth = null,
+        int? desiredMaxCodedHeight = null)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(channelId);
         var definition = _definitions.SingleOrDefault(candidate => string.Equals(candidate.ChannelId, channelId, StringComparison.Ordinal));
@@ -207,14 +262,15 @@ public sealed class BrowserDemoStreamCatalog
             throw new KeyNotFoundException($"Unknown demo channel '{channelId}'.");
         }
 
+        var source = SelectSourceVariant(definition, desiredEgressFrameRate, desiredMaxCodedWidth, desiredMaxCodedHeight);
         return new BrowserDemoChannelSummary(
             definition.ChannelId,
             definition.StreamId,
             definition.DisplayName,
             definition.ScenarioId,
-            definition.SourceRtspUrl,
+            source.SourceRtspUrl,
             definition.SourceSummary,
-            CreateCodecDescriptor(definition));
+            CreateCodecDescriptor(definition, source));
     }
 
     public BrowserDemoStreamResponse CreateStream(string streamId, int frameCount = 8)
@@ -258,7 +314,12 @@ public sealed class BrowserDemoStreamCatalog
         CancellationToken cancellationToken)
     {
         const long baseTimestampUs = 2_000_000;
-        var frameDurationUs = (long)Math.Round(1_000_000.0 / definition.FrameRate);
+        var source = SelectSourceVariant(
+            definition,
+            request.DesiredEgressFrameRate,
+            request.DesiredMaxCodedWidth,
+            request.DesiredMaxCodedHeight);
+        var frameDurationUs = (long)Math.Round(1_000_000.0 / source.FrameRate);
         var requestedFrameCount = request.FrameCount.GetValueOrDefault(frameCount);
         ArgumentOutOfRangeException.ThrowIfNegativeOrZero(requestedFrameCount);
         var streamId = new StreamId(definition.StreamId);
@@ -269,7 +330,7 @@ public sealed class BrowserDemoStreamCatalog
         var enableMetadata = request.EnableMetadata.GetValueOrDefault(true);
         var webTransportUrl = $"https://127.0.0.1:9443/live/{Uri.EscapeDataString(channelId.Value)}";
 
-        var codec = CreateCodecDescriptor(definition);
+        var codec = CreateCodecDescriptor(definition, source);
 
         var browserRequest = new BrowserSessionRequest(
             streamId,
@@ -310,7 +371,7 @@ public sealed class BrowserDemoStreamCatalog
             {
                 videoMessages = (await _rtspCapture.CaptureAsync(
                     definition.StreamId,
-                    definition.SourceRtspUrl,
+                    source.SourceRtspUrl,
                     requestedFrameCount,
                     baseTimestampUs,
                     frameDurationUs,
@@ -399,14 +460,14 @@ public sealed class BrowserDemoStreamCatalog
             StreamId: definition.StreamId,
             DisplayName: definition.DisplayName,
             ScenarioId: definition.ScenarioId,
-            SourceRtspUrl: definition.SourceRtspUrl,
+            SourceRtspUrl: source.SourceRtspUrl,
             SourceSummary: definition.SourceSummary,
             SourceMode: sourceMode,
             SourceVerified: sourceVerified,
             AccessUnitFormat: sourceVerified ? "annexb-h264" : "synthetic-bytes",
             SourceDiagnostics: sourceDiagnostics,
             TargetLatencyMs: (int)targetLatency.TotalMilliseconds,
-            FrameIntervalMs: (int)Math.Round(1000.0 / definition.FrameRate),
+            FrameIntervalMs: (int)Math.Round(1000.0 / source.FrameRate),
             WebTransportUrl: webTransportUrl,
             RequestedTransport: RequestedTransport,
             ActiveTransport: ActiveTransport,
@@ -430,12 +491,23 @@ public sealed class BrowserDemoStreamCatalog
         => new("browser-demo-viewer", "demo-token", 150, true);
 
     private static BrowserDemoCodecDescriptor CreateCodecDescriptor(BrowserDemoStreamDefinition definition)
+        => CreateCodecDescriptor(definition, definition.FrameRate);
+
+    private static BrowserDemoCodecDescriptor CreateCodecDescriptor(BrowserDemoStreamDefinition definition, double frameRate)
         => new(
             Codec: "avc1.42C01F",
             CodedWidth: definition.CodedWidth,
             CodedHeight: definition.CodedHeight,
             Profile: definition.Profile,
-            FrameRate: definition.FrameRate);
+            FrameRate: frameRate);
+
+    private static BrowserDemoCodecDescriptor CreateCodecDescriptor(BrowserDemoStreamDefinition definition, BrowserDemoSourceVariant source)
+        => new(
+            Codec: "avc1.42C01F",
+            CodedWidth: source.CodedWidth ?? definition.CodedWidth,
+            CodedHeight: source.CodedHeight ?? definition.CodedHeight,
+            Profile: definition.Profile,
+            FrameRate: source.FrameRate);
 
     private static BrowserDemoVideoMessage[] CreateSyntheticVideoMessages(
         string streamId,
@@ -498,6 +570,76 @@ public sealed class BrowserDemoStreamCatalog
             ? value
             : fallback;
 
+    private static BrowserDemoSourceVariant SelectSourceVariant(
+        BrowserDemoStreamDefinition definition,
+        double? desiredEgressFrameRate,
+        int? desiredMaxCodedWidth = null,
+        int? desiredMaxCodedHeight = null)
+    {
+        var primary = new BrowserDemoSourceVariant(
+            definition.SourceRtspUrl,
+            definition.FrameRate,
+            definition.CodedWidth,
+            definition.CodedHeight);
+        if (definition.SourceVariants is not { Count: > 0 })
+        {
+            return primary;
+        }
+
+        var candidates = definition.SourceVariants.Prepend(primary).ToArray();
+        if (desiredEgressFrameRate is > 0)
+        {
+            var frameRateTolerance = desiredEgressFrameRate.Value * 1.05;
+            var frameRateCandidates = candidates
+                .Where(source => source.FrameRate <= frameRateTolerance)
+                .ToArray();
+            if (frameRateCandidates.Length > 0)
+            {
+                candidates = frameRateCandidates;
+            }
+        }
+
+        if (desiredMaxCodedWidth is > 0 || desiredMaxCodedHeight is > 0)
+        {
+            var maxWidth = desiredMaxCodedWidth.GetValueOrDefault(int.MaxValue);
+            var maxHeight = desiredMaxCodedHeight.GetValueOrDefault(int.MaxValue);
+            var widthTolerance = maxWidth == int.MaxValue ? int.MaxValue : (int)Math.Ceiling(maxWidth * 1.05);
+            var heightTolerance = maxHeight == int.MaxValue ? int.MaxValue : (int)Math.Ceiling(maxHeight * 1.05);
+            var sizeCandidates = candidates
+                .Where(source => (source.CodedWidth ?? definition.CodedWidth) <= widthTolerance
+                    && (source.CodedHeight ?? definition.CodedHeight) <= heightTolerance)
+                .ToArray();
+
+            if (sizeCandidates.Length > 0)
+            {
+                return sizeCandidates
+                    .OrderByDescending(source => source.FrameRate)
+                    .ThenByDescending(source => source.PixelCount(definition))
+                    .First();
+            }
+
+            return candidates
+                .OrderBy(source => source.PixelCount(definition))
+                .ThenByDescending(source => source.FrameRate)
+                .First();
+        }
+
+        return candidates
+            .OrderByDescending(source => source.FrameRate)
+            .ThenByDescending(source => source.PixelCount(definition))
+            .First();
+    }
+
+    private sealed record BrowserDemoSourceVariant(
+        string SourceRtspUrl,
+        double FrameRate,
+        int? CodedWidth = null,
+        int? CodedHeight = null)
+    {
+        public long PixelCount(BrowserDemoStreamDefinition definition)
+            => (long)(CodedWidth ?? definition.CodedWidth) * (CodedHeight ?? definition.CodedHeight);
+    }
+
     private sealed record BrowserDemoStreamDefinition(
         string ChannelId,
         string StreamId,
@@ -508,5 +650,6 @@ public sealed class BrowserDemoStreamCatalog
         int CodedWidth,
         int CodedHeight,
         string Profile,
-        double FrameRate);
+        double FrameRate,
+        IReadOnlyList<BrowserDemoSourceVariant>? SourceVariants = null);
 }

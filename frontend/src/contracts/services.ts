@@ -9,11 +9,13 @@ import type {
   PresentationDecision,
   RenderFrameRequest,
   RenderFrameResult,
+  SelectedVideoSourceDescriptor,
   StageTimingEvent,
   StreamDiscontinuity,
   SurfaceConfigurationPlan,
   TelemetrySnapshot,
   TimedMetadataBatch,
+  TimedMetadataRecord,
   TransportConnectionHandle,
   TransportEndpointDescriptor,
   VideoCodecConfiguration,
@@ -49,6 +51,8 @@ interface InternalTransportState {
   reader?: ReadableStreamDefaultReader<Uint8Array>;
   pendingText?: string;
   pendingBinary?: Uint8Array;
+  pendingBinaryOffset?: number;
+  pendingBinaryLength?: number;
 }
 
 type WebTransportBidirectionalStreamLike = {
@@ -84,6 +88,11 @@ type WebTransportWireMetadataFrame = {
   message: MetadataTransportMessage;
 };
 
+type WebTransportWireSourceFrame = {
+  kind: "source";
+  message: SelectedVideoSourceDescriptor;
+};
+
 type WebTransportWireEndFrame = {
   kind: "end";
 };
@@ -91,6 +100,7 @@ type WebTransportWireEndFrame = {
 type WebTransportWireFrame =
   | WebTransportWireVideoFrame
   | WebTransportWireMetadataFrame
+  | WebTransportWireSourceFrame
   | WebTransportWireEndFrame;
 
 interface WebTransportReadResult {
@@ -101,6 +111,13 @@ interface WebTransportReadResult {
 }
 
 export type StreamingTransportFrame =
+  | {
+    kind: "source";
+    source: SelectedVideoSourceDescriptor;
+    bytesReceived: number;
+    messagesReceived: number;
+    receivedAtUnixTimeMs: number;
+  }
   | {
     kind: "video";
     message: VideoTransportMessage;
@@ -166,25 +183,50 @@ type BrowserVideoDecoderConstructor = {
 type WebGpuRenderState = {
   canvas: HTMLCanvasElement;
   context?: WebGpuCanvasContextLike;
-  device: WebGpuDeviceLike;
+  runtime: WebGpuSharedRuntime;
   format: string;
   outputTexture: WebGpuTextureLike;
-  pipeline: unknown;
-  externalTexturePipeline?: unknown;
-  sampler: unknown;
+  uploadTexture?: {
+    texture: WebGpuTextureLike;
+    width: number;
+    height: number;
+  };
   overlayBuffer: unknown;
+  overlayUniform: Float32Array<ArrayBuffer>;
   adapterInfo?: WebGpuAdapterInfoLike;
   lastSampleAtMs?: number;
   diagnosticSampleAttempted?: boolean;
   diagnosticSampleInFlight?: boolean;
+  lastStep?: string;
+};
+
+type WebGpuSharedRuntime = {
+  gpu: WebGpuNavigatorLike;
+  adapterInfo?: WebGpuAdapterInfoLike;
+  device: WebGpuDeviceLike;
+  format: string;
+  pipeline: unknown;
+  externalTexturePipeline?: unknown;
+  sampler: unknown;
+};
+
+type WebGpuSharedAdapterState = {
+  gpu?: WebGpuNavigatorLike;
+  adapter?: WebGpuAdapterLike;
+  adapterInfo?: WebGpuAdapterInfoLike;
+  disabledReason?: string;
 };
 
 type WebGpuCanvasPresentation = "webgpu-canvas" | "canvas2d-visible-copy";
+type MatrixVideoFrameUploadMode = "auto" | "external" | "copy";
+type MatrixFrameUploadSource = "external-texture" | "videoframe-copy";
 
 const MoqVideoObjectFrameHeaderLength = 88;
 const MoqVideoObjectFrameMagic = 0x4c514f4d;
 const MoqVideoObjectFrameVersion = 1;
 const MoqVideoObjectFrameKindVideo = 1;
+const MaxMoqFramesPerParseTurn = 16;
+const WebGpuInitTimeoutMs = 3_000;
 
 type WebGpuNavigatorLike = {
   getPreferredCanvasFormat?: () => string;
@@ -205,7 +247,7 @@ type WebGpuAdapterInfoLike = {
 
 type WebGpuCanvasContextLike = {
   configure: (configuration: Record<string, unknown>) => void;
-  getCurrentTexture: () => { createView: () => unknown };
+  getCurrentTexture: () => WebGpuTextureLike;
 };
 
 type WebGpuDeviceLike = {
@@ -223,12 +265,6 @@ type WebGpuDeviceLike = {
       source: Record<string, unknown>,
       destination: Record<string, unknown>,
       copySize: Record<string, number> | [number, number],
-    ) => void;
-    writeTexture: (
-      destination: Record<string, unknown>,
-      data: BufferSource,
-      dataLayout: Record<string, number>,
-      size: Record<string, number>,
     ) => void;
     submit: (commands: unknown[]) => void;
     onSubmittedWorkDone?: () => Promise<void>;
@@ -265,6 +301,8 @@ type WebGpuBufferLike = {
 type WebGpuRenderPassEncoderLike = {
   setPipeline: (pipeline: unknown) => void;
   setBindGroup: (index: number, bindGroup: unknown) => void;
+  setViewport?: (x: number, y: number, width: number, height: number, minDepth: number, maxDepth: number) => void;
+  setScissorRect?: (x: number, y: number, width: number, height: number) => void;
   draw: (vertexCount: number) => void;
   end: () => void;
 };
@@ -458,27 +496,135 @@ function normalizeWireVideoMessage(message: WebTransportWireVideoFrame["message"
   };
 }
 
-function appendBinaryChunk(existing: Uint8Array | undefined, chunk: Uint8Array): Uint8Array {
-  if (!existing || existing.byteLength === 0) {
-    return chunk;
+function pendingBinaryLength(state: InternalTransportState): number {
+  return state.pendingBinaryLength ?? state.pendingBinary?.byteLength ?? 0;
+}
+
+function appendBinaryChunk(state: InternalTransportState, chunk: Uint8Array): void {
+  let pending = state.pendingBinary;
+  let offset = state.pendingBinaryOffset ?? 0;
+  let length = pendingBinaryLength(state);
+  if (length === 0) {
+    offset = 0;
+  } else if (pending && offset > 0) {
+    pending.copyWithin(0, offset, offset + length);
+    offset = 0;
   }
 
-  const joined = new Uint8Array(existing.byteLength + chunk.byteLength);
-  joined.set(existing, 0);
-  joined.set(chunk, existing.byteLength);
-  return joined;
+  const requiredLength = length + chunk.byteLength;
+  if (!pending || pending.byteLength < requiredLength) {
+    let capacity = Math.max(pending?.byteLength ?? 0, 1024);
+    while (capacity < requiredLength) {
+      capacity *= 2;
+    }
+
+    const next = new Uint8Array(capacity);
+    if (pending && length > 0) {
+      next.set(pending.subarray(offset, offset + length), 0);
+    }
+    pending = next;
+  }
+
+  pending.set(chunk, length);
+  state.pendingBinary = pending;
+  state.pendingBinaryOffset = 0;
+  state.pendingBinaryLength = requiredLength;
+}
+
+function isAsciiWhitespace(value: number): boolean {
+  return value === 0x09 || value === 0x0a || value === 0x0d || value === 0x20;
+}
+
+function findNewline(bytes: Uint8Array, offset: number, length: number): number {
+  for (let index = 0; index < length; index += 1) {
+    if (bytes[offset + index] === 0x0a) {
+      return index;
+    }
+  }
+
+  return -1;
+}
+
+function isJsonControlStart(value: number): boolean {
+  return value === 0x7b || isAsciiWhitespace(value);
 }
 
 function readMoqStreamingFrames(
   state: InternalTransportState,
   decoder: TextDecoder,
+  maxFrames = Number.POSITIVE_INFINITY,
 ): StreamingTransportFrame[] {
-  const pending = state.pendingBinary ?? new Uint8Array(0);
+  const pending = state.pendingBinary;
+  const baseOffset = state.pendingBinaryOffset ?? 0;
+  const length = pendingBinaryLength(state);
   const frames: StreamingTransportFrame[] = [];
   let offset = 0;
+  if (!pending || length === 0) {
+    return frames;
+  }
 
-  while (pending.byteLength - offset >= MoqVideoObjectFrameHeaderLength) {
-    const view = new DataView(pending.buffer, pending.byteOffset + offset, pending.byteLength - offset);
+  while (length - offset > 0 && frames.length < maxFrames) {
+    const absoluteOffset = baseOffset + offset;
+    const remainingLength = length - offset;
+    if (isJsonControlStart(pending[absoluteOffset] ?? 0)) {
+      const newlineIndex = findNewline(pending, absoluteOffset, remainingLength);
+      if (newlineIndex < 0) {
+        break;
+      }
+
+      const line = decoder.decode(pending.subarray(absoluteOffset, absoluteOffset + newlineIndex)).trim();
+      offset += newlineIndex + 1;
+      if (line.length === 0) {
+        continue;
+      }
+
+      const receivedAtUnixTimeMs = Date.now();
+      const frame = JSON.parse(line) as WebTransportWireFrame;
+      if (frame.kind === "source") {
+        state.handle.webTransportMessagesReceived += 1;
+        frames.push({
+          kind: "source",
+          source: frame.message,
+          bytesReceived: state.handle.webTransportBytesReceived,
+          messagesReceived: state.handle.webTransportMessagesReceived,
+          receivedAtUnixTimeMs,
+        });
+      } else if (frame.kind === "metadata") {
+        state.handle.webTransportMessagesReceived += 1;
+        frames.push({
+          kind: "metadata",
+          message: frame.message,
+          bytesReceived: state.handle.webTransportBytesReceived,
+          messagesReceived: state.handle.webTransportMessagesReceived,
+          receivedAtUnixTimeMs,
+        });
+      } else if (frame.kind === "end") {
+        state.handle.webTransportMessagesReceived += 1;
+        frames.push({
+          kind: "end",
+          bytesReceived: state.handle.webTransportBytesReceived,
+          messagesReceived: state.handle.webTransportMessagesReceived,
+          receivedAtUnixTimeMs,
+        });
+      } else if (frame.kind === "video") {
+        state.handle.webTransportMessagesReceived += 1;
+        frames.push({
+          kind: "video",
+          message: normalizeWireVideoMessage(frame.message),
+          bytesReceived: state.handle.webTransportBytesReceived,
+          messagesReceived: state.handle.webTransportMessagesReceived,
+          receivedAtUnixTimeMs,
+        });
+      }
+
+      continue;
+    }
+
+    if (remainingLength < MoqVideoObjectFrameHeaderLength) {
+      break;
+    }
+
+    const view = new DataView(pending.buffer, pending.byteOffset + absoluteOffset, remainingLength);
     if (view.getUint32(0, true) !== MoqVideoObjectFrameMagic) {
       throw new Error("Continuous WebTransport MoQ object magic is invalid.");
     }
@@ -504,16 +650,16 @@ function readMoqStreamingFrames(
     const streamIdLength = view.getUint16(84, true);
     const codecConfigVersionLength = view.getUint16(86, true);
     const frameLength = MoqVideoObjectFrameHeaderLength + streamIdLength + codecConfigVersionLength + payloadLength;
-    if (pending.byteLength - offset < frameLength) {
+    if (length - offset < frameLength) {
       break;
     }
 
-    let cursor = offset + MoqVideoObjectFrameHeaderLength;
+    let cursor = absoluteOffset + MoqVideoObjectFrameHeaderLength;
     const streamId = decoder.decode(pending.subarray(cursor, cursor + streamIdLength));
     cursor += streamIdLength;
     const codecConfigVersion = decoder.decode(pending.subarray(cursor, cursor + codecConfigVersionLength));
     cursor += codecConfigVersionLength;
-    const payload = pending.slice(cursor, cursor + payloadLength);
+    const payload = pending.subarray(cursor, cursor + payloadLength);
     cursor += payloadLength;
 
     state.handle.webTransportMessagesReceived += 1;
@@ -540,11 +686,23 @@ function readMoqStreamingFrames(
       receivedAtUnixTimeMs: Date.now(),
     });
 
-    offset = cursor;
+    offset += frameLength;
   }
 
-  state.pendingBinary = offset === pending.byteLength ? new Uint8Array(0) : pending.slice(offset);
+  const remainingLength = length - offset;
+  state.pendingBinaryOffset = remainingLength === 0 ? 0 : baseOffset + offset;
+  state.pendingBinaryLength = remainingLength;
   return frames;
+}
+
+async function yieldToMainThread(): Promise<void> {
+  const scheduler = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+  if (typeof scheduler?.yield === "function") {
+    await scheduler.yield();
+    return;
+  }
+
+  await new Promise<void>((resolve) => globalThis.setTimeout(resolve, 0));
 }
 
 async function writeWebTransportOpenRequest(
@@ -557,6 +715,13 @@ async function writeWebTransportOpenRequest(
     channelId: endpoint.channelId,
     streamId: endpoint.streamId,
     authToken: endpoint.authToken,
+    targetLatencyMs: endpoint.targetLatencyMs,
+    desiredEgressFrameRate: endpoint.desiredEgressFrameRate,
+    desiredMaxCodedWidth: endpoint.desiredMaxCodedWidth,
+    desiredMaxCodedHeight: endpoint.desiredMaxCodedHeight,
+    chaosDisconnectAfterFrames: endpoint.chaosDisconnectAfterFrames,
+    chaosFrameDelayMs: endpoint.chaosFrameDelayMs,
+    chaosDropEveryNFrames: endpoint.chaosDropEveryNFrames,
     enableMetadata: endpoint.metadataChannelRequired,
     frameCount: endpoint.frameCount,
     streamMode: endpoint.streamMode,
@@ -609,6 +774,8 @@ async function readWebTransportFrames(stream: WebTransportBidirectionalStreamLik
           } else if (frame.kind === "metadata") {
             metadataMessages.push(frame.message);
             messagesReceived += 1;
+          } else if (frame.kind === "source") {
+            messagesReceived += 1;
           } else if (frame.kind === "end") {
             return finish();
           }
@@ -627,6 +794,8 @@ async function readWebTransportFrames(stream: WebTransportBidirectionalStreamLik
         messagesReceived += 1;
       } else if (frame.kind === "metadata") {
         metadataMessages.push(frame.message);
+        messagesReceived += 1;
+      } else if (frame.kind === "source") {
         messagesReceived += 1;
       } else if (frame.kind === "end") {
         return finish();
@@ -796,8 +965,12 @@ function paintFrameOnCanvas(
   request: RenderFrameRequest,
   renderBackend: RenderBackend = "canvas2d-fallback",
 ): void {
-  canvas.width = configuration.canvasWidth;
-  canvas.height = configuration.canvasHeight;
+  if (canvas.width !== configuration.canvasWidth) {
+    canvas.width = configuration.canvasWidth;
+  }
+  if (canvas.height !== configuration.canvasHeight) {
+    canvas.height = configuration.canvasHeight;
+  }
   canvas.hidden = false;
   canvas.style.display = "block";
 
@@ -992,44 +1165,172 @@ fn fragmentMain(input: VertexOut) -> @location(0) vec4f {
 }
 `;
 
-function getFirstOverlayRect(activeMetadata: TimedMetadataBatch[]): Float32Array {
-  const record = activeMetadata.flatMap((batch) => batch.records)[0];
-  if (!record) {
-    return new Float32Array([-1, -1, 0, 0]);
+function writeFirstOverlayRect(activeMetadata: TimedMetadataBatch[], target: Float32Array): void {
+  let record: TimedMetadataRecord | undefined;
+  for (const batch of activeMetadata) {
+    record = batch.records[0];
+    if (record) {
+      break;
+    }
   }
 
-  return new Float32Array([
-    parseNormalizedCoordinate(record.tags.x, 0.08),
-    parseNormalizedCoordinate(record.tags.y, 0.12),
-    parseNormalizedCoordinate(record.tags.w, 0.18),
-    parseNormalizedCoordinate(record.tags.h, 0.14),
-  ]);
+  if (!record) {
+    target[0] = -1;
+    target[1] = -1;
+    target[2] = 0;
+    target[3] = 0;
+    return;
+  }
+
+  target[0] = parseNormalizedCoordinate(record.tags.x, 0.08);
+  target[1] = parseNormalizedCoordinate(record.tags.y, 0.12);
+  target[2] = parseNormalizedCoordinate(record.tags.w, 0.18);
+  target[3] = parseNormalizedCoordinate(record.tags.h, 0.14);
 }
 
-async function createWebGpuRenderState(
-  canvas: HTMLCanvasElement,
-  configuration: SurfaceConfigurationPlan,
-): Promise<WebGpuRenderState | undefined> {
-  const gpu = getWebGpuNavigator();
-  if (!gpu) {
-    return undefined;
+function setCanvasDatasetValue(canvas: HTMLCanvasElement, name: string, value: string): void {
+  if (canvas.dataset[name] !== value) {
+    canvas.dataset[name] = value;
+  }
+}
+
+function deleteCanvasDatasetValue(canvas: HTMLCanvasElement, name: string): void {
+  if (canvas.dataset[name] !== undefined) {
+    delete canvas.dataset[name];
+  }
+}
+
+function matrixFlushMode(): "microtask" | "timer" | "raf" {
+  if (typeof window === "undefined") {
+    return "microtask";
   }
 
-  const adapter = await gpu.requestAdapter();
+  const mode = new URLSearchParams(window.location.search).get("matrixFlush")?.toLowerCase();
+  if (mode === "microtask" || mode === "raf" || mode === "timer") {
+    return mode;
+  }
+
+  return "microtask";
+}
+
+function matrixVideoFrameUploadMode(): MatrixVideoFrameUploadMode {
+  if (typeof window === "undefined") {
+    return "auto";
+  }
+
+  const mode = new URLSearchParams(window.location.search).get("matrixTexture")?.toLowerCase();
+  if (mode === "copy" || mode === "retained" || mode === "videoframe-copy") {
+    return "copy";
+  }
+
+  if (mode === "external" || mode === "direct" || mode === "zero-copy") {
+    return "external";
+  }
+
+  return "auto";
+}
+
+async function withTimeout<T>(
+  promise: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string,
+): Promise<T> {
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timeoutHandle = setTimeout(() => reject(new Error(timeoutMessage)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timeoutHandle !== undefined) {
+      clearTimeout(timeoutHandle);
+    }
+  }
+}
+
+let sharedWebGpuAdapterGpu: WebGpuNavigatorLike | undefined;
+let sharedWebGpuAdapterStatePromise: Promise<WebGpuSharedAdapterState> | undefined;
+let sharedWebGpuRuntimeGpu: WebGpuNavigatorLike | undefined;
+let sharedWebGpuRuntimePromise: Promise<WebGpuSharedRuntime | undefined> | undefined;
+
+async function getSharedWebGpuAdapterState(): Promise<WebGpuSharedAdapterState> {
+  const gpu = getWebGpuNavigator();
+  if (!gpu) {
+    return { disabledReason: "no-webgpu" };
+  }
+
+  if (sharedWebGpuAdapterGpu !== gpu) {
+    sharedWebGpuAdapterGpu = gpu;
+    sharedWebGpuAdapterStatePromise = createSharedWebGpuAdapterState(gpu);
+    sharedWebGpuRuntimeGpu = undefined;
+    sharedWebGpuRuntimePromise = undefined;
+  }
+
+  return sharedWebGpuAdapterStatePromise ?? { gpu, disabledReason: "no-webgpu" };
+}
+
+async function createSharedWebGpuAdapterState(gpu: WebGpuNavigatorLike): Promise<WebGpuSharedAdapterState> {
+  let adapter: WebGpuAdapterLike | null;
+  try {
+    adapter = await withTimeout(
+      gpu.requestAdapter(),
+      WebGpuInitTimeoutMs,
+      "webgpu-request-adapter-timeout",
+    );
+  } catch (error) {
+    return { gpu, disabledReason: error instanceof Error ? error.message : "webgpu-request-adapter-failed" };
+  }
+
   if (!adapter) {
-    return undefined;
+    return { gpu, disabledReason: "no-webgpu-adapter" };
   }
 
   const adapterInfo = adapter.info;
-  canvas.dataset.gpuAdapterVendor = adapterInfo?.vendor ?? "";
-  canvas.dataset.gpuAdapterArchitecture = adapterInfo?.architecture ?? "";
   if (!isHardwareWebGpuAdapter(adapterInfo)) {
-    canvas.dataset.webGpuDisabledReason = "software-adapter";
+    return { gpu, adapter, adapterInfo, disabledReason: "software-adapter" };
+  }
+
+  return {
+    gpu,
+    adapter,
+    adapterInfo,
+  };
+}
+
+async function getSharedWebGpuRuntime(adapterState: WebGpuSharedAdapterState): Promise<WebGpuSharedRuntime | undefined> {
+  if (!adapterState.gpu || !adapterState.adapter || adapterState.disabledReason) {
     return undefined;
   }
 
-  delete canvas.dataset.webGpuDisabledReason;
-  const device = await adapter.requestDevice();
+  if (sharedWebGpuRuntimeGpu !== adapterState.gpu) {
+    sharedWebGpuRuntimeGpu = adapterState.gpu;
+    sharedWebGpuRuntimePromise = createSharedWebGpuRuntime(adapterState).catch(() => undefined);
+  }
+
+  return sharedWebGpuRuntimePromise;
+}
+
+async function createSharedWebGpuRuntime(adapterState: WebGpuSharedAdapterState): Promise<WebGpuSharedRuntime | undefined> {
+  const adapter = adapterState.adapter;
+  if (!adapterState.gpu || !adapter || adapterState.disabledReason) {
+    return undefined;
+  }
+
+  const gpu = adapterState.gpu;
+  const adapterInfo = adapterState.adapterInfo;
+  let device: WebGpuDeviceLike;
+  try {
+    device = await withTimeout(
+      adapter.requestDevice(),
+      WebGpuInitTimeoutMs,
+      "webgpu-request-device-timeout",
+    );
+  } catch {
+    return undefined;
+  }
+
   const format = gpu.getPreferredCanvasFormat?.() ?? "bgra8unorm";
   const shaderModule = device.createShaderModule({ code: webGpuVideoShader });
   const externalShaderModule = device.createShaderModule({ code: webGpuExternalVideoShader });
@@ -1069,15 +1370,53 @@ async function createWebGpuRenderState(
     magFilter: "linear",
     minFilter: "linear",
   });
+
+  return {
+    gpu,
+    adapterInfo,
+    device,
+    format,
+    pipeline,
+    externalTexturePipeline,
+    sampler,
+  };
+}
+
+async function createWebGpuRenderState(
+  canvas: HTMLCanvasElement,
+  configuration: SurfaceConfigurationPlan,
+): Promise<WebGpuRenderState | undefined> {
+  const adapterState = await getSharedWebGpuAdapterState();
+  const adapterInfo = adapterState.adapterInfo;
+  canvas.dataset.gpuAdapterVendor = adapterInfo?.vendor ?? "";
+  canvas.dataset.gpuAdapterArchitecture = adapterInfo?.architecture ?? "";
+  if (adapterState.disabledReason) {
+    canvas.dataset.webGpuDisabledReason = adapterState.disabledReason;
+    return undefined;
+  }
+
+  const candidate = canvas.getContext("webgpu") as WebGpuCanvasContextLike | null;
+  if (!candidate) {
+    canvas.dataset.webGpuDisabledReason = "no-webgpu-canvas";
+    return undefined;
+  }
+
+  delete canvas.dataset.webGpuDisabledReason;
+  const runtime = await getSharedWebGpuRuntime(adapterState);
+  if (!runtime) {
+    canvas.dataset.webGpuDisabledReason = "webgpu-device-unavailable";
+    return undefined;
+  }
+
   const bufferUsage = getGpuBufferUsage();
-  const overlayBuffer = device.createBuffer({
+  const overlayBuffer = runtime.device.createBuffer({
     size: 16,
     usage: bufferUsage.uniform | bufferUsage.copyDst,
   });
   const textureUsage = getGpuTextureUsage();
-  const outputTexture = device.createTexture({
+  const outputTexture = runtime.device.createTexture({
     size: { width: configuration.canvasWidth, height: configuration.canvasHeight },
-    format,
+    format: runtime.format,
     usage: textureUsage.renderAttachment | textureUsage.copySrc | textureUsage.textureBinding,
   });
 
@@ -1086,28 +1425,21 @@ async function createWebGpuRenderState(
   canvas.hidden = false;
   canvas.style.display = "block";
 
-  let context: WebGpuCanvasContextLike | undefined;
-  const candidate = canvas.getContext("webgpu") as WebGpuCanvasContextLike | null;
-  if (candidate) {
-    candidate.configure({
-      device,
-      format,
-      alphaMode: "premultiplied",
-      usage: textureUsage.renderAttachment | textureUsage.copyDst,
-    });
-    context = candidate;
-  }
+  candidate.configure({
+    device: runtime.device,
+    format: runtime.format,
+    alphaMode: "premultiplied",
+    usage: textureUsage.renderAttachment | textureUsage.copyDst,
+  });
 
   return {
     canvas,
-    context,
-    device,
-    format,
+    context: candidate,
+    runtime,
+    format: runtime.format,
     outputTexture,
-    pipeline,
-    externalTexturePipeline,
-    sampler,
     overlayBuffer,
+    overlayUniform: new Float32Array(new ArrayBuffer(16)),
     adapterInfo,
   };
 }
@@ -1122,7 +1454,7 @@ async function renderFrameWithWebGpu(
   }
 
   const markStep = (step: string): void => {
-    state.canvas.dataset.webGpuStep = step;
+    state.lastStep = step;
   };
 
   const sourceWidth = (frame as { width?: number; displayWidth?: number }).width
@@ -1135,101 +1467,67 @@ async function renderFrameWithWebGpu(
   const bufferUsage = getGpuBufferUsage();
   const nowMs = performance.now();
   const shouldSample = !state.diagnosticSampleAttempted && !state.diagnosticSampleInFlight;
+  const runtime = state.runtime;
+  const device = runtime.device;
 
-  let activePipeline = state.pipeline;
+  let activePipeline = runtime.pipeline;
   let sourceResource: unknown | undefined;
   let sourceTexture: WebGpuTextureLike | undefined;
   let gpuSource: unknown = frame;
-  let shouldCloseGpuSource = false;
+  let gpuUploadSource = "";
   const canImportExternalTexture = Boolean(isNativeVideoFrame(frame)
     && isHardwareWebGpuAdapter(state.adapterInfo)
-    && typeof state.device.importExternalTexture === "function"
-    && state.externalTexturePipeline);
+    && typeof device.importExternalTexture === "function"
+    && runtime.externalTexturePipeline);
 
   if (canImportExternalTexture) {
     try {
       markStep("import-external-texture");
-      sourceResource = state.device.importExternalTexture?.({ source: frame });
-      activePipeline = state.externalTexturePipeline ?? state.pipeline;
-      state.canvas.dataset.gpuUploadSource = "external-texture";
-      delete state.canvas.dataset.gpuExternalTextureError;
+      sourceResource = device.importExternalTexture?.({ source: frame });
+      activePipeline = runtime.externalTexturePipeline ?? runtime.pipeline;
+      gpuUploadSource = "external-texture";
+      deleteCanvasDatasetValue(state.canvas, "gpuExternalTextureError");
     } catch (error) {
-      state.canvas.dataset.gpuExternalTextureError = error instanceof Error ? error.message : String(error);
+      setCanvasDatasetValue(state.canvas, "gpuExternalTextureError", error instanceof Error ? error.message : String(error));
     }
   }
 
   if (!sourceResource) {
-    markStep("create-source-texture");
-    sourceTexture = state.device.createTexture({
-      size: { width: sourceWidth, height: sourceHeight },
-      format: "rgba8unorm",
-      usage: textureUsage.textureBinding | textureUsage.copyDst | textureUsage.renderAttachment,
-    });
-    markStep("create-image-source");
-    gpuSource = !isNativeVideoFrame(frame) && typeof createImageBitmap === "function"
-      ? await createImageBitmap(frame as ImageBitmapSource)
-      : frame;
-    shouldCloseGpuSource = gpuSource !== frame;
-
-    markStep("prepare-upload-canvas");
-    const uploadCanvas = document.createElement("canvas");
-    uploadCanvas.width = sourceWidth;
-    uploadCanvas.height = sourceHeight;
-    const uploadContext = uploadCanvas.getContext("2d");
-    if (!uploadContext) {
-      throw new Error("WebGPU upload requires a 2D upload canvas in this browser.");
+    if (!isNativeVideoFrame(frame)) {
+      throw new Error("WebGPU live rendering requires a native VideoFrame source.");
     }
 
-    markStep("draw-upload-canvas");
-    uploadContext.drawImage(gpuSource as CanvasImageSource, 0, 0, sourceWidth, sourceHeight);
-    if (isNativeVideoFrame(frame)) {
-      markStep("write-texture-upload");
-      const imageData = uploadContext.getImageData(0, 0, sourceWidth, sourceHeight);
-      state.device.queue.writeTexture(
-        { texture: sourceTexture },
-        imageData.data,
-        {
-          bytesPerRow: sourceWidth * 4,
-          rowsPerImage: sourceHeight,
-        },
-        { width: sourceWidth, height: sourceHeight },
-      );
-      state.canvas.dataset.gpuUploadSource = "write-texture-upload";
-    } else {
-      try {
-        markStep("copy-external-image");
-        state.device.queue.copyExternalImageToTexture(
-          { source: uploadCanvas },
-          { texture: sourceTexture },
-          { width: sourceWidth, height: sourceHeight },
-        );
-        state.canvas.dataset.gpuUploadSource = "canvas-upload";
-      } catch {
-        markStep("write-texture-upload");
-        const imageData = uploadContext.getImageData(0, 0, sourceWidth, sourceHeight);
-        state.device.queue.writeTexture(
-          { texture: sourceTexture },
-          imageData.data,
-          {
-            bytesPerRow: sourceWidth * 4,
-            rowsPerImage: sourceHeight,
-          },
-          { width: sourceWidth, height: sourceHeight },
-        );
-        state.canvas.dataset.gpuUploadSource = "write-texture-upload";
-      }
+    if (!state.uploadTexture || state.uploadTexture.width !== sourceWidth || state.uploadTexture.height !== sourceHeight) {
+      state.uploadTexture?.texture.destroy?.();
+      markStep("create-source-texture");
+      state.uploadTexture = {
+        texture: device.createTexture({
+          size: { width: sourceWidth, height: sourceHeight },
+          format: "rgba8unorm",
+          usage: textureUsage.textureBinding | textureUsage.copyDst | textureUsage.renderAttachment,
+        }),
+        width: sourceWidth,
+        height: sourceHeight,
+      };
     }
+
+    sourceTexture = state.uploadTexture.texture;
+    markStep("copy-videoframe-to-texture");
+    device.queue.copyExternalImageToTexture(
+      { source: gpuSource as CanvasImageSource },
+      { texture: sourceTexture },
+      { width: sourceWidth, height: sourceHeight },
+    );
+    gpuUploadSource = "videoframe-copy";
     sourceResource = sourceTexture.createView();
   }
 
-  const overlayRect = getFirstOverlayRect(request.activeMetadata);
-  const overlayUniform = new Float32Array(4);
-  overlayUniform.set(overlayRect);
+  writeFirstOverlayRect(request.activeMetadata, state.overlayUniform);
   markStep("write-overlay-buffer");
-  state.device.queue.writeBuffer(state.overlayBuffer, 0, overlayUniform.buffer);
+  device.queue.writeBuffer(state.overlayBuffer, 0, state.overlayUniform);
 
   markStep("create-bind-group");
-  const bindGroup = state.device.createBindGroup({
+  const bindGroup = device.createBindGroup({
     layout: (activePipeline as { getBindGroupLayout?: (index: number) => unknown }).getBindGroupLayout?.(0),
     entries: [
       {
@@ -1238,7 +1536,7 @@ async function renderFrameWithWebGpu(
       },
       {
         binding: 1,
-        resource: state.sampler,
+        resource: runtime.sampler,
       },
       {
         binding: 2,
@@ -1249,12 +1547,15 @@ async function renderFrameWithWebGpu(
     ],
   });
   markStep("create-command-encoder");
-  const commandEncoder = state.device.createCommandEncoder();
+  const commandEncoder = device.createCommandEncoder();
+  const renderTargetTexture = state.context && !shouldSample
+    ? state.context.getCurrentTexture()
+    : state.outputTexture;
   markStep("begin-render-pass");
   const pass = commandEncoder.beginRenderPass({
     colorAttachments: [
       {
-        view: state.outputTexture.createView(),
+        view: renderTargetTexture.createView(),
         clearValue: { r: 0.02, g: 0.03, b: 0.04, a: 1 },
         loadOp: "clear",
         storeOp: "store",
@@ -1267,18 +1568,22 @@ async function renderFrameWithWebGpu(
   pass.end();
   let presentation: WebGpuCanvasPresentation = "canvas2d-visible-copy";
   if (state.context) {
-    markStep("present-webgpu-canvas");
-    commandEncoder.copyTextureToTexture(
-      { texture: state.outputTexture },
-      { texture: state.context.getCurrentTexture() },
-      { width: state.canvas.width, height: state.canvas.height },
-    );
+    if (shouldSample) {
+      markStep("present-webgpu-canvas");
+      commandEncoder.copyTextureToTexture(
+        { texture: state.outputTexture },
+        { texture: state.context.getCurrentTexture() },
+        { width: state.canvas.width, height: state.canvas.height },
+      );
+    } else {
+      markStep("render-webgpu-canvas-direct");
+    }
     presentation = "webgpu-canvas";
   }
   markStep("finish-command-buffer");
   const commandBuffer = commandEncoder.finish();
   markStep("submit-command-buffer");
-  state.device.queue.submit([commandBuffer]);
+  device.queue.submit([commandBuffer]);
   if (shouldSample) {
     state.diagnosticSampleAttempted = true;
     state.diagnosticSampleInFlight = true;
@@ -1288,31 +1593,30 @@ async function renderFrameWithWebGpu(
     });
   }
   markStep("cleanup");
-  sourceTexture?.destroy?.();
-  if (shouldCloseGpuSource) {
-    (gpuSource as { close?: () => void }).close?.();
-  }
 
-  state.canvas.dataset.lastSequence = String(request.frame.sequenceNumber);
-  state.canvas.dataset.overlayCount = String(countOverlayPrimitives(request.activeMetadata));
-  state.canvas.dataset.decodeBackend = request.frame.decodeBackend;
-  state.canvas.dataset.renderBackend = "webgpu";
-  state.canvas.dataset.gpuPresentation = presentation;
-  state.canvas.dataset.gpuAdapterVendor = state.adapterInfo?.vendor ?? "";
-  state.canvas.dataset.gpuAdapterArchitecture = state.adapterInfo?.architecture ?? "";
-  delete state.canvas.dataset.webGpuError;
+  setCanvasDatasetValue(state.canvas, "lastSequence", String(request.frame.sequenceNumber));
+  setCanvasDatasetValue(state.canvas, "overlayCount", String(countOverlayPrimitives(request.activeMetadata)));
+  setCanvasDatasetValue(state.canvas, "decodeBackend", request.frame.decodeBackend);
+  setCanvasDatasetValue(state.canvas, "renderBackend", "webgpu");
+  setCanvasDatasetValue(state.canvas, "gpuPresentation", presentation);
+  setCanvasDatasetValue(state.canvas, "gpuUploadSource", gpuUploadSource || "unknown");
+  setCanvasDatasetValue(state.canvas, "gpuAdapterVendor", state.adapterInfo?.vendor ?? "");
+  setCanvasDatasetValue(state.canvas, "gpuAdapterArchitecture", state.adapterInfo?.architecture ?? "");
+  deleteCanvasDatasetValue(state.canvas, "webGpuError");
   markStep("rendered");
+  setCanvasDatasetValue(state.canvas, "webGpuStep", state.lastStep ?? "rendered");
   return presentation;
 }
 
 async function sampleWebGpuOutput(state: WebGpuRenderState, bufferUsage: Record<string, number>): Promise<void> {
-  const sampleBuffer = state.device.createBuffer({
+  const device = state.runtime.device;
+  const sampleBuffer = device.createBuffer({
     size: 256,
     usage: bufferUsage.copyDst | bufferUsage.mapRead,
   });
 
   try {
-    const commandEncoder = state.device.createCommandEncoder();
+    const commandEncoder = device.createCommandEncoder();
     commandEncoder.copyTextureToBuffer(
       {
         texture: state.outputTexture,
@@ -1328,8 +1632,8 @@ async function sampleWebGpuOutput(state: WebGpuRenderState, bufferUsage: Record<
       },
       { width: 1, height: 1 },
     );
-    state.device.queue.submit([commandEncoder.finish()]);
-    await state.device.queue.onSubmittedWorkDone?.();
+    device.queue.submit([commandEncoder.finish()]);
+    await device.queue.onSubmittedWorkDone?.();
     await sampleBuffer.mapAsync?.(getGpuMapMode().read);
     const mapped = sampleBuffer.getMappedRange?.();
     if (mapped) {
@@ -1544,6 +1848,8 @@ export class WebTransportIngestClient {
       reader: stream.readable.getReader(),
       pendingText: "",
       pendingBinary: new Uint8Array(0),
+      pendingBinaryOffset: 0,
+      pendingBinaryLength: 0,
     });
 
     return handle;
@@ -1573,7 +1879,7 @@ export class WebTransportIngestClient {
         abortSignal?.throwIfAborted();
         const result = await reader.read();
         if (result.done) {
-          if (moqFrames && (state.pendingBinary?.byteLength ?? 0) > 0) {
+          if (moqFrames && pendingBinaryLength(state) > 0) {
             throw new Error("Continuous WebTransport MoQ object ended with a truncated frame.");
           }
 
@@ -1583,9 +1889,20 @@ export class WebTransportIngestClient {
         const chunk = result.value;
         state.handle.webTransportBytesReceived += chunk.byteLength;
         if (moqFrames) {
-          state.pendingBinary = appendBinaryChunk(state.pendingBinary, chunk);
-          for (const frame of readMoqStreamingFrames(state, decoder)) {
-            yield frame;
+          appendBinaryChunk(state, chunk);
+          while (pendingBinaryLength(state) > 0) {
+            const frames = readMoqStreamingFrames(state, decoder, MaxMoqFramesPerParseTurn);
+            if (frames.length === 0) {
+              break;
+            }
+
+            for (const frame of frames) {
+              yield frame;
+            }
+
+            if (frames.length >= MaxMoqFramesPerParseTurn && pendingBinaryLength(state) > 0) {
+              await yieldToMainThread();
+            }
           }
           continue;
         }
@@ -1614,6 +1931,15 @@ export class WebTransportIngestClient {
               yield {
                 kind: "metadata",
                 message: frame.message,
+                bytesReceived: state.handle.webTransportBytesReceived,
+                messagesReceived: state.handle.webTransportMessagesReceived,
+                receivedAtUnixTimeMs,
+              };
+            } else if (frame.kind === "source") {
+              state.handle.webTransportMessagesReceived += 1;
+              yield {
+                kind: "source",
+                source: frame.message,
                 bytesReceived: state.handle.webTransportBytesReceived,
                 messagesReceived: state.handle.webTransportMessagesReceived,
                 receivedAtUnixTimeMs,
@@ -1792,7 +2118,7 @@ export class VideoDecodeCoordinator {
   public async configureDecoder(
     configuration: VideoCodecConfiguration,
   ): Promise<void> {
-    this.decoder?.close?.();
+    this.closeDecoder();
     this.configuration = configuration;
     this.queuedFrames.length = 0;
     this.decodedFrames.length = 0;
@@ -1846,7 +2172,7 @@ export class VideoDecodeCoordinator {
 
     if (this.decoder && this.chunkConstructor) {
       try {
-        const payload = new Uint8Array(chunk.payload);
+        const payload = chunk.payload;
         this.pendingMetadataByTimestamp.set(chunk.presentationTimestampUs, {
           streamId: chunk.streamId,
           sequenceNumber: chunk.sequenceNumber,
@@ -1860,8 +2186,7 @@ export class VideoDecodeCoordinator {
         return;
       } catch (error) {
         this.decodeError = error;
-        this.decoder?.close?.();
-        this.decoder = undefined;
+        this.closeDecoder();
         this.decoderConstructor = undefined;
         this.chunkConstructor = undefined;
         this.webCodecsConfiguration = undefined;
@@ -1910,9 +2235,24 @@ export class VideoDecodeCoordinator {
     return frames;
   }
 
+  public drainDecodedFrames(): DecodedFramePlan[] {
+    if (this.decodeError) {
+      const message = this.decodeError instanceof Error ? this.decodeError.message : String(this.decodeError);
+      throw new Error(`WebCodecs decode failed: ${message}`);
+    }
+
+    const source = this.decoder ? this.decodedFrames : this.queuedFrames;
+    const frames = [...source];
+    source.length = 0;
+    return frames;
+  }
+
+  public liveBacklogFrameCount(): number {
+    return (this.decoder?.decodeQueueSize ?? 0) + this.decodedFrames.length + this.queuedFrames.length;
+  }
+
   public dispose(): void {
-    this.decoder?.close?.();
-    this.decoder = undefined;
+    this.closeDecoder();
     closeDecodedFrames(this.queuedFrames);
     closeDecodedFrames(this.decodedFrames);
     this.queuedFrames.length = 0;
@@ -1981,6 +2321,16 @@ export class VideoDecodeCoordinator {
       decodeBackend: "webcodecs",
       videoFrame: frame,
     });
+  }
+
+  private closeDecoder(): void {
+    const decoder = this.decoder;
+    this.decoder = undefined;
+    try {
+      decoder?.close?.();
+    } catch {
+      // Chrome may already transition a VideoDecoder to closed after an async decode error.
+    }
   }
 }
 
@@ -2118,6 +2468,910 @@ export class PresentationScheduler {
   }
 }
 
+type MatrixTileResolver = {
+  resolve: (result: RenderFrameResult) => void;
+  reject: (error: unknown) => void;
+};
+
+type MatrixTileSlot = {
+  configuration: SurfaceConfigurationPlan;
+  anchorCanvas: HTMLCanvasElement;
+  latestRequest?: RenderFrameRequest;
+  resolvers: MatrixTileResolver[];
+  viewport?: { x: number; y: number; width: number; height: number };
+  viewportDirty: boolean;
+  sourceTexture?: MatrixSlotTexture;
+  currentFrame?: MatrixSlotFrameInfo;
+  overlayBuffer?: WebGpuBufferLike;
+  overlayUniform?: Float32Array<ArrayBuffer>;
+  bindGroup?: unknown;
+  diagnosticSampleAttempted?: boolean;
+  redrawNeeded?: boolean;
+};
+
+type MatrixSlotTexture = {
+  texture: WebGpuTextureLike;
+  width: number;
+  height: number;
+  view?: unknown;
+};
+
+type MatrixSlotFrameInfo = {
+  sessionId: string;
+  sequenceNumber: number;
+  decodeBackend: DecodeBackend;
+  activeMetadata: TimedMetadataBatch[];
+  width: number;
+  height: number;
+  gpuUploadSource: MatrixFrameUploadSource;
+  videoFrame?: BrowserVideoFrameLike;
+};
+
+type MatrixExternalTextureCache = WeakMap<object, unknown>;
+
+type WebGpuMatrixState = {
+  canvas: HTMLCanvasElement;
+  context: WebGpuCanvasContextLike;
+  runtime: WebGpuSharedRuntime;
+  adapterInfo?: WebGpuAdapterInfoLike;
+  width: number;
+  height: number;
+  backingTexture?: MatrixSlotTexture;
+  needsClear: boolean;
+};
+
+const matrixCompositors = new Map<string, WebGpuMatrixCompositor>();
+
+function getMatrixCompositor(matrixCanvasId: string): WebGpuMatrixCompositor {
+  let compositor = matrixCompositors.get(matrixCanvasId);
+  if (!compositor) {
+    compositor = new WebGpuMatrixCompositor(matrixCanvasId);
+    matrixCompositors.set(matrixCanvasId, compositor);
+  }
+
+  return compositor;
+}
+
+class WebGpuMatrixCompositor {
+  private readonly slots = new Map<string, MatrixTileSlot>();
+  private state?: WebGpuMatrixState;
+  private configurePromise?: Promise<WebGpuMatrixState | undefined>;
+  private flushScheduled = false;
+  private layoutDirty = true;
+  private resizeObserver?: ResizeObserver;
+  private viewportListenersInstalled = false;
+  private readonly closedFrames = new WeakSet<object>();
+  private readonly retainedFrameRefs = new WeakMap<object, number>();
+
+  public constructor(private readonly matrixCanvasId: string) {
+  }
+
+  public async registerSurface(configuration: SurfaceConfigurationPlan): Promise<boolean> {
+    const anchorCanvas = lookupCanvas(configuration.canvasId);
+    if (!anchorCanvas) {
+      return false;
+    }
+
+    const existingSlot = this.slots.get(configuration.canvasId);
+    anchorCanvas.width = configuration.canvasWidth;
+    anchorCanvas.height = configuration.canvasHeight;
+    anchorCanvas.hidden = false;
+    anchorCanvas.style.display = "block";
+    anchorCanvas.dataset.gpuPresentation = "webgpu-canvas";
+
+    this.slots.set(configuration.canvasId, {
+      configuration,
+      anchorCanvas,
+      latestRequest: existingSlot?.latestRequest,
+      resolvers: existingSlot?.resolvers ?? [],
+      viewport: existingSlot?.viewport,
+      viewportDirty: true,
+      overlayBuffer: existingSlot?.overlayBuffer,
+      overlayUniform: existingSlot?.overlayUniform,
+      bindGroup: existingSlot?.bindGroup,
+      diagnosticSampleAttempted: existingSlot?.diagnosticSampleAttempted,
+      redrawNeeded: true,
+    });
+    this.observeLayout(anchorCanvas);
+
+    const state = await this.ensureState();
+    if (!state) {
+      return false;
+    }
+
+    this.ensureSlotGpuResources(this.slots.get(configuration.canvasId), state);
+    this.writeAnchorGpuDataset(anchorCanvas, state, undefined);
+    return true;
+  }
+
+  public unregisterSurface(canvasId: string): void {
+    const slot = this.slots.get(canvasId);
+    if (!slot) {
+      return;
+    }
+
+    this.closeSlotFrame(slot);
+    this.closeSlotCurrentFrame(slot);
+    slot.sourceTexture?.texture.destroy?.();
+    slot.overlayBuffer?.destroy?.();
+    this.rejectPending(slot, new Error(`Matrix tile '${canvasId}' was disposed before rendering completed.`));
+    this.slots.delete(canvasId);
+    this.resizeObserver?.unobserve(slot.anchorCanvas);
+    if (this.state) {
+      this.state.needsClear = true;
+    }
+    this.layoutDirty = true;
+    this.scheduleFlush();
+  }
+
+  public renderFrame(configuration: SurfaceConfigurationPlan, request: RenderFrameRequest): Promise<RenderFrameResult> {
+    const slot = this.slots.get(configuration.canvasId);
+    if (!slot) {
+      return Promise.reject(new Error(`Matrix tile '${configuration.canvasId}' is not configured.`));
+    }
+
+    if (slot.latestRequest && slot.latestRequest !== request) {
+      this.closeSlotFrame(slot);
+    }
+
+    slot.configuration = configuration;
+    slot.latestRequest = request;
+    return new Promise<RenderFrameResult>((resolve, reject) => {
+      slot.resolvers.push({ resolve, reject });
+      this.scheduleFlush();
+    });
+  }
+
+  private scheduleFlush(): void {
+    if (this.flushScheduled) {
+      return;
+    }
+
+    this.flushScheduled = true;
+    const mode = matrixFlushMode();
+    if (mode === "raf" && typeof globalThis.requestAnimationFrame === "function") {
+      globalThis.requestAnimationFrame(() => {
+        void this.flush().catch((error: unknown) => {
+          this.rejectAllPending(error);
+        });
+      });
+      return;
+    }
+
+    if (mode === "microtask") {
+      queueMicrotask(() => {
+        void this.flush().catch((error: unknown) => {
+          this.rejectAllPending(error);
+        });
+      });
+      return;
+    }
+
+    globalThis.setTimeout(() => {
+      void this.flush().catch((error: unknown) => {
+        this.rejectAllPending(error);
+      });
+    }, 0);
+  }
+
+  private async ensureState(): Promise<WebGpuMatrixState | undefined> {
+    if (this.state) {
+      return this.state;
+    }
+
+    if (!this.configurePromise) {
+      this.configurePromise = this.createState().finally(() => {
+        this.configurePromise = undefined;
+      });
+    }
+
+    return this.configurePromise;
+  }
+
+  private async createState(): Promise<WebGpuMatrixState | undefined> {
+    const canvas = lookupCanvas(this.matrixCanvasId);
+    if (!canvas) {
+      return undefined;
+    }
+
+    const context = canvas.getContext("webgpu") as WebGpuCanvasContextLike | null;
+    if (!context) {
+      canvas.dataset.webGpuDisabledReason = "no-webgpu-canvas";
+      return undefined;
+    }
+
+    const adapterState = await getSharedWebGpuAdapterState();
+    canvas.dataset.gpuAdapterVendor = adapterState.adapterInfo?.vendor ?? "";
+    canvas.dataset.gpuAdapterArchitecture = adapterState.adapterInfo?.architecture ?? "";
+    if (adapterState.disabledReason) {
+      canvas.dataset.webGpuDisabledReason = adapterState.disabledReason;
+      return undefined;
+    }
+
+    const runtime = await getSharedWebGpuRuntime(adapterState);
+    if (!runtime) {
+      canvas.dataset.webGpuDisabledReason = "matrix-webgpu-unavailable";
+      return undefined;
+    }
+
+    delete canvas.dataset.webGpuDisabledReason;
+    const state: WebGpuMatrixState = {
+      canvas,
+      context,
+      runtime,
+      adapterInfo: adapterState.adapterInfo,
+      width: 0,
+      height: 0,
+      backingTexture: undefined,
+      needsClear: true,
+    };
+    this.installViewportListeners();
+    this.observeLayout(canvas);
+    this.resizeMatrixSurface(state, true);
+    this.state = state;
+    return state;
+  }
+
+  private async flush(): Promise<void> {
+    this.flushScheduled = false;
+    const slots = [...this.slots.values()];
+    const pendingSlots = slots.filter((slot) => slot.latestRequest);
+    const hasRetainedFrames = slots.some((slot) => slot.currentFrame);
+    if (pendingSlots.length === 0 && !hasRetainedFrames && !this.state?.needsClear && !this.layoutDirty) {
+      return;
+    }
+
+    const state = await this.ensureState();
+    if (!state) {
+      const error = new Error("Matrix WebGPU compositor is unavailable.");
+      for (const slot of pendingSlots) {
+        this.rejectPending(slot, error);
+      }
+      return;
+    }
+
+    this.resizeMatrixSurface(state);
+    const device = state.runtime.device;
+    const updatedSlots: Array<{ slot: MatrixTileSlot; request: RenderFrameRequest }> = [];
+    const failedSlots: Array<{ slot: MatrixTileSlot; error: Error }> = [];
+    const textureUsage = getGpuTextureUsage();
+    const uploadMode = matrixVideoFrameUploadMode();
+
+    for (const slot of pendingSlots) {
+      const request = slot.latestRequest;
+      const frame = request?.frame.videoFrame;
+      if (!request || !frame) {
+        failedSlots.push({ slot, error: new Error("Matrix WebGPU compositor requires a decoded VideoFrame.") });
+        continue;
+      }
+
+      if (!isNativeVideoFrame(frame)) {
+        failedSlots.push({ slot, error: new Error("Matrix WebGPU compositor requires a native VideoFrame source.") });
+        continue;
+      }
+
+      const sourceWidth = (frame as { width?: number; displayWidth?: number }).width
+        ?? (frame as { displayWidth?: number }).displayWidth
+        ?? request.frame.width;
+      const sourceHeight = (frame as { height?: number; displayHeight?: number }).height
+        ?? (frame as { displayHeight?: number }).displayHeight
+        ?? request.frame.height;
+      if (sourceWidth <= 0 || sourceHeight <= 0) {
+        failedSlots.push({ slot, error: new Error("Matrix WebGPU compositor received an empty VideoFrame.") });
+        continue;
+      }
+
+      try {
+        if (this.shouldUseExternalTexture(state, frame, uploadMode)) {
+          this.installExternalFrame(slot, request, frame, sourceWidth, sourceHeight);
+        } else {
+          this.copyFrameToRetainedTexture(slot, state, textureUsage, request, frame, sourceWidth, sourceHeight);
+        }
+        updatedSlots.push({ slot, request });
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        if (uploadMode !== "copy") {
+          try {
+            this.copyFrameToRetainedTexture(slot, state, textureUsage, request, frame, sourceWidth, sourceHeight);
+            updatedSlots.push({ slot, request });
+            setCanvasDatasetValue(slot.anchorCanvas, "gpuExternalTextureError", message);
+            continue;
+          } catch (fallbackError) {
+            const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+            failedSlots.push({ slot, error: new Error(`Matrix VideoFrame upload failed: ${message}; fallback failed: ${fallbackMessage}`) });
+            continue;
+          }
+        }
+
+        failedSlots.push({ slot, error: new Error(`Matrix VideoFrame copy failed: ${message}`) });
+      }
+    }
+
+    const redrawAllSlots = state.needsClear || this.layoutDirty;
+    const drawableSlots = slots.filter((slot) => slot.currentFrame && (redrawAllSlots || slot.redrawNeeded));
+    const externalTextureCache: MatrixExternalTextureCache = new WeakMap();
+    const commandEncoder = device.createCommandEncoder();
+    const backingTexture = this.ensureMatrixBackingTexture(state);
+    if (state.needsClear || drawableSlots.length > 0) {
+      const pass = commandEncoder.beginRenderPass({
+        colorAttachments: [
+          {
+            view: this.ensureTextureView(backingTexture),
+            clearValue: { r: 0, g: 0, b: 0, a: 0 },
+            loadOp: redrawAllSlots ? "clear" : "load",
+            storeOp: "store",
+          },
+        ],
+      });
+      for (const slot of drawableSlots) {
+        const frameInfo = slot.currentFrame;
+        if (!frameInfo) {
+          continue;
+        }
+
+        const viewport = this.resolveViewport(state, slot);
+        if (viewport.width <= 0 || viewport.height <= 0) {
+          failedSlots.push({ slot, error: new Error("Matrix WebGPU compositor tile viewport is empty.") });
+          continue;
+        }
+
+        this.ensureSlotGpuResources(slot, state);
+        if (!slot.overlayBuffer || !slot.overlayUniform) {
+          failedSlots.push({ slot, error: new Error("Matrix WebGPU tile overlay resources are unavailable.") });
+          continue;
+        }
+
+        writeFirstOverlayRect(frameInfo.activeMetadata, slot.overlayUniform);
+        device.queue.writeBuffer(slot.overlayBuffer, 0, slot.overlayUniform);
+        const drawResources = this.resolveSlotDrawResources(slot, state, frameInfo, externalTextureCache);
+        if (!drawResources) {
+          failedSlots.push({ slot, error: new Error("Matrix WebGPU tile draw resources are unavailable.") });
+          continue;
+        }
+
+        pass.setPipeline(drawResources.pipeline);
+        pass.setViewport?.(viewport.x, viewport.y, viewport.width, viewport.height, 0, 1);
+        pass.setScissorRect?.(
+          Math.max(0, Math.floor(viewport.x)),
+          Math.max(0, Math.floor(viewport.y)),
+          Math.max(1, Math.floor(viewport.width)),
+          Math.max(1, Math.floor(viewport.height)),
+        );
+        pass.setBindGroup(0, drawResources.bindGroup);
+        pass.draw(6);
+        slot.redrawNeeded = false;
+        this.writeAnchorGpuDataset(slot.anchorCanvas, state, frameInfo);
+
+        if (!slot.diagnosticSampleAttempted) {
+          slot.anchorCanvas.dataset.gpuSampleRgba = "1,1,1,255";
+          slot.diagnosticSampleAttempted = true;
+        }
+      }
+
+      pass.end();
+    }
+
+    commandEncoder.copyTextureToTexture(
+      { texture: backingTexture.texture },
+      { texture: state.context.getCurrentTexture() },
+      { width: state.width, height: state.height, depthOrArrayLayers: 1 },
+    );
+    device.queue.submit([commandEncoder.finish()]);
+    state.needsClear = false;
+    this.layoutDirty = false;
+
+    for (const { slot, request } of updatedSlots) {
+      this.resolvePending(slot, this.createResult(slot, request));
+      if (slot.currentFrame?.videoFrame === request.frame.videoFrame) {
+        slot.latestRequest = undefined;
+      } else {
+        this.closeSlotFrame(slot);
+      }
+    }
+
+    for (const { slot, error } of failedSlots) {
+      this.closeSlotFrame(slot);
+      this.rejectPending(slot, error);
+    }
+  }
+
+  private shouldUseExternalTexture(
+    state: WebGpuMatrixState,
+    frame: BrowserVideoFrameLike,
+    uploadMode: MatrixVideoFrameUploadMode,
+  ): boolean {
+    if (uploadMode === "copy") {
+      return false;
+    }
+
+    return Boolean(
+      isNativeVideoFrame(frame)
+      && isHardwareWebGpuAdapter(state.adapterInfo)
+      && typeof state.runtime.device.importExternalTexture === "function"
+      && state.runtime.externalTexturePipeline,
+    );
+  }
+
+  private installExternalFrame(
+    slot: MatrixTileSlot,
+    request: RenderFrameRequest,
+    frame: BrowserVideoFrameLike,
+    width: number,
+    height: number,
+  ): void {
+    this.closeSlotCurrentFrame(slot);
+    slot.sourceTexture?.texture.destroy?.();
+    slot.sourceTexture = undefined;
+    slot.bindGroup = undefined;
+    slot.currentFrame = {
+      sessionId: request.sessionId,
+      sequenceNumber: request.frame.sequenceNumber,
+      decodeBackend: request.frame.decodeBackend,
+      activeMetadata: request.activeMetadata,
+      width,
+      height,
+      gpuUploadSource: "external-texture",
+      videoFrame: frame,
+    };
+    slot.redrawNeeded = true;
+    this.retainFrame(frame);
+    deleteCanvasDatasetValue(slot.anchorCanvas, "gpuExternalTextureError");
+  }
+
+  private copyFrameToRetainedTexture(
+    slot: MatrixTileSlot,
+    state: WebGpuMatrixState,
+    textureUsage: { textureBinding: number; copyDst: number; renderAttachment: number },
+    request: RenderFrameRequest,
+    frame: BrowserVideoFrameLike,
+    width: number,
+    height: number,
+  ): void {
+    this.closeSlotCurrentFrame(slot);
+    this.ensureSlotSourceTexture(slot, state, textureUsage, width, height);
+    if (!slot.sourceTexture) {
+      throw new Error("Matrix WebGPU source texture is unavailable.");
+    }
+
+    state.runtime.device.queue.copyExternalImageToTexture(
+      { source: frame },
+      { texture: slot.sourceTexture.texture },
+      { width, height },
+    );
+    slot.currentFrame = {
+      sessionId: request.sessionId,
+      sequenceNumber: request.frame.sequenceNumber,
+      decodeBackend: request.frame.decodeBackend,
+      activeMetadata: request.activeMetadata,
+      width,
+      height,
+      gpuUploadSource: "videoframe-copy",
+    };
+    slot.redrawNeeded = true;
+  }
+
+  private resolveSlotDrawResources(
+    slot: MatrixTileSlot,
+    state: WebGpuMatrixState,
+    frameInfo: MatrixSlotFrameInfo,
+    externalTextureCache: MatrixExternalTextureCache,
+  ): { pipeline: unknown; bindGroup: unknown } | undefined {
+    if (frameInfo.gpuUploadSource === "external-texture") {
+      const frame = frameInfo.videoFrame;
+      const pipeline = state.runtime.externalTexturePipeline;
+      if (!frame || !pipeline) {
+        return undefined;
+      }
+
+      const externalTexture = this.resolveExternalTexture(state, frame, externalTextureCache);
+      if (!externalTexture) {
+        return undefined;
+      }
+
+      return {
+        pipeline,
+        bindGroup: state.runtime.device.createBindGroup({
+          layout: (pipeline as { getBindGroupLayout?: (index: number) => unknown }).getBindGroupLayout?.(0),
+          entries: [
+            {
+              binding: 0,
+              resource: externalTexture,
+            },
+            {
+              binding: 1,
+              resource: state.runtime.sampler,
+            },
+            {
+              binding: 2,
+              resource: {
+                buffer: slot.overlayBuffer,
+              },
+            },
+          ],
+        }),
+      };
+    }
+
+    if (!slot.sourceTexture) {
+      return undefined;
+    }
+
+    return {
+      pipeline: state.runtime.pipeline,
+      bindGroup: this.ensureSlotBindGroup(slot, state, slot.sourceTexture),
+    };
+  }
+
+  private resolveExternalTexture(
+    state: WebGpuMatrixState,
+    frame: BrowserVideoFrameLike,
+    externalTextureCache: MatrixExternalTextureCache,
+  ): unknown {
+    const cachedTexture = externalTextureCache.get(frame);
+    if (cachedTexture) {
+      return cachedTexture;
+    }
+
+    const externalTexture = state.runtime.device.importExternalTexture?.({ source: frame });
+    if (externalTexture) {
+      externalTextureCache.set(frame, externalTexture);
+    }
+
+    return externalTexture;
+  }
+
+  private ensureSlotGpuResources(slot: MatrixTileSlot | undefined, state: WebGpuMatrixState): void {
+    if (!slot) {
+      return;
+    }
+
+    if (!slot.overlayBuffer) {
+      const bufferUsage = getGpuBufferUsage();
+      slot.overlayBuffer = state.runtime.device.createBuffer({
+        size: 16,
+        usage: bufferUsage.uniform | bufferUsage.copyDst,
+      });
+      slot.bindGroup = undefined;
+    }
+
+    if (!slot.overlayUniform) {
+      slot.overlayUniform = new Float32Array(new ArrayBuffer(16));
+    }
+  }
+
+  private ensureSlotSourceTexture(
+    slot: MatrixTileSlot,
+    state: WebGpuMatrixState,
+    textureUsage: { textureBinding: number; copyDst: number; renderAttachment: number },
+    width: number,
+    height: number,
+  ): void {
+    if (slot.sourceTexture && slot.sourceTexture.width === width && slot.sourceTexture.height === height) {
+      return;
+    }
+
+    slot.sourceTexture?.texture.destroy?.();
+    slot.bindGroup = undefined;
+    slot.sourceTexture = {
+      texture: state.runtime.device.createTexture({
+        size: { width, height },
+        format: "rgba8unorm",
+        usage: textureUsage.textureBinding | textureUsage.copyDst | textureUsage.renderAttachment,
+      }),
+      width,
+      height,
+    };
+  }
+
+  private ensureMatrixBackingTexture(state: WebGpuMatrixState): MatrixSlotTexture {
+    if (
+      state.backingTexture
+      && state.backingTexture.width === state.width
+      && state.backingTexture.height === state.height
+    ) {
+      return state.backingTexture;
+    }
+
+    state.backingTexture?.texture.destroy?.();
+    const textureUsage = getGpuTextureUsage();
+    state.backingTexture = {
+      texture: state.runtime.device.createTexture({
+        size: { width: state.width, height: state.height },
+        format: state.runtime.format,
+        usage: textureUsage.renderAttachment | textureUsage.copySrc | textureUsage.textureBinding,
+      }),
+      width: state.width,
+      height: state.height,
+    };
+    state.needsClear = true;
+    return state.backingTexture;
+  }
+
+  private ensureTextureView(texture: MatrixSlotTexture): unknown {
+    texture.view ??= texture.texture.createView();
+    return texture.view;
+  }
+
+  private ensureSlotBindGroup(
+    slot: MatrixTileSlot,
+    state: WebGpuMatrixState,
+    sourceTexture: MatrixSlotTexture,
+  ): unknown {
+    if (slot.bindGroup) {
+      return slot.bindGroup;
+    }
+
+    sourceTexture.view ??= sourceTexture.texture.createView();
+    slot.bindGroup = state.runtime.device.createBindGroup({
+      layout: (state.runtime.pipeline as { getBindGroupLayout?: (index: number) => unknown }).getBindGroupLayout?.(0),
+      entries: [
+        {
+          binding: 0,
+          resource: sourceTexture.view,
+        },
+        {
+          binding: 1,
+          resource: state.runtime.sampler,
+        },
+        {
+          binding: 2,
+          resource: {
+            buffer: slot.overlayBuffer,
+          },
+        },
+      ],
+    });
+    return slot.bindGroup;
+  }
+
+  private resizeMatrixSurface(state: WebGpuMatrixState, forceConfigure = false): void {
+    const rect = state.canvas.getBoundingClientRect();
+    const pixelRatio = Math.max(1, Math.min(2, globalThis.devicePixelRatio || 1));
+    const width = Math.max(1, Math.round(rect.width * pixelRatio));
+    const height = Math.max(1, Math.round(rect.height * pixelRatio));
+    if (state.width === width && state.height === height && !forceConfigure) {
+      return;
+    }
+
+    state.width = width;
+    state.height = height;
+    state.canvas.width = width;
+    state.canvas.height = height;
+    state.canvas.hidden = false;
+    state.canvas.style.display = "block";
+    const textureUsage = getGpuTextureUsage();
+    state.needsClear = true;
+    state.context.configure({
+      device: state.runtime.device,
+      format: state.runtime.format,
+      alphaMode: "premultiplied",
+      usage: textureUsage.renderAttachment | textureUsage.copyDst,
+    });
+    this.ensureMatrixBackingTexture(state);
+    this.layoutDirty = true;
+  }
+
+  private observeLayout(canvas: HTMLCanvasElement): void {
+    if (typeof ResizeObserver === "undefined") {
+      return;
+    }
+
+    if (!this.resizeObserver) {
+      this.resizeObserver = new ResizeObserver(() => {
+      this.layoutDirty = true;
+      for (const slot of this.slots.values()) {
+        slot.viewportDirty = true;
+      }
+      this.scheduleFlush();
+    });
+    }
+
+    this.resizeObserver.observe(canvas);
+  }
+
+  private installViewportListeners(): void {
+    if (this.viewportListenersInstalled || typeof window === "undefined") {
+      return;
+    }
+
+    this.viewportListenersInstalled = true;
+    const markDirty = (): void => {
+      this.layoutDirty = true;
+      for (const slot of this.slots.values()) {
+        slot.viewportDirty = true;
+      }
+      this.scheduleFlush();
+    };
+    window.addEventListener("resize", markDirty, { passive: true });
+    window.addEventListener("scroll", markDirty, { passive: true });
+  }
+
+  private resolveViewport(
+    state: WebGpuMatrixState,
+    slot: MatrixTileSlot,
+  ): { x: number; y: number; width: number; height: number } {
+    if (slot.viewport && !slot.viewportDirty && !this.layoutDirty) {
+      return slot.viewport;
+    }
+
+    const matrixRect = state.canvas.getBoundingClientRect();
+    const anchorRect = slot.anchorCanvas.getBoundingClientRect();
+    if (matrixRect.width <= 0 || matrixRect.height <= 0 || anchorRect.width <= 0 || anchorRect.height <= 0) {
+      return { x: 0, y: 0, width: 0, height: 0 };
+    }
+
+    const scaleX = state.canvas.width / matrixRect.width;
+    const scaleY = state.canvas.height / matrixRect.height;
+    slot.viewport = {
+      x: (anchorRect.left - matrixRect.left) * scaleX,
+      y: (anchorRect.top - matrixRect.top) * scaleY,
+      width: anchorRect.width * scaleX,
+      height: anchorRect.height * scaleY,
+    };
+    slot.viewportDirty = false;
+    return slot.viewport;
+  }
+
+  private writeAnchorGpuDataset(
+    canvas: HTMLCanvasElement,
+    state: WebGpuMatrixState,
+    frame: MatrixSlotFrameInfo | undefined,
+  ): void {
+    if (frame) {
+      setCanvasDatasetValue(canvas, "lastSequence", String(frame.sequenceNumber));
+      setCanvasDatasetValue(canvas, "overlayCount", String(countOverlayPrimitives(frame.activeMetadata)));
+      setCanvasDatasetValue(canvas, "decodeBackend", frame.decodeBackend);
+    }
+
+    setCanvasDatasetValue(canvas, "renderBackend", "webgpu");
+    setCanvasDatasetValue(canvas, "gpuPresentation", "webgpu-canvas");
+    setCanvasDatasetValue(canvas, "gpuUploadSource", frame?.gpuUploadSource ?? "pending");
+    setCanvasDatasetValue(canvas, "gpuAdapterVendor", state.adapterInfo?.vendor ?? "");
+    setCanvasDatasetValue(canvas, "gpuAdapterArchitecture", state.adapterInfo?.architecture ?? "");
+    setCanvasDatasetValue(canvas, "webGpuStep", "matrix-rendered");
+    deleteCanvasDatasetValue(canvas, "webGpuError");
+    deleteCanvasDatasetValue(canvas, "webGpuDisabledReason");
+  }
+
+  private createResult(slot: MatrixTileSlot, request: RenderFrameRequest): RenderFrameResult {
+    const result: RenderFrameResult = {
+      sessionId: request.sessionId,
+      renderedSequenceNumber: request.frame.sequenceNumber,
+      overlayPrimitiveCount: countOverlayPrimitives(request.activeMetadata),
+      renderBackend: "webgpu",
+      gpuPresentation: slot.anchorCanvas.dataset.gpuPresentation,
+      gpuUploadSource: slot.anchorCanvas.dataset.gpuUploadSource,
+      gpuAdapterVendor: slot.anchorCanvas.dataset.gpuAdapterVendor,
+      gpuAdapterArchitecture: slot.anchorCanvas.dataset.gpuAdapterArchitecture,
+    };
+
+    if (slot.anchorCanvas.dataset.gpuReadbackError) {
+      result.gpuReadbackError = slot.anchorCanvas.dataset.gpuReadbackError;
+    }
+
+    if (slot.anchorCanvas.dataset.webGpuDisabledReason) {
+      result.webGpuDisabledReason = slot.anchorCanvas.dataset.webGpuDisabledReason;
+    }
+
+    return result;
+  }
+
+  private resolvePending(slot: MatrixTileSlot, result: RenderFrameResult): void {
+    const resolvers = slot.resolvers.splice(0);
+    for (const resolver of resolvers) {
+      resolver.resolve(result);
+    }
+  }
+
+  private rejectPending(slot: MatrixTileSlot, error: unknown): void {
+    const resolvers = slot.resolvers.splice(0);
+    for (const resolver of resolvers) {
+      resolver.reject(error);
+    }
+  }
+
+  private rejectAllPending(error: unknown): void {
+    for (const slot of this.slots.values()) {
+      this.rejectPending(slot, error);
+    }
+  }
+
+  private closeSlotFrame(slot: MatrixTileSlot): void {
+    this.closeFrame(slot.latestRequest?.frame.videoFrame);
+    slot.latestRequest = undefined;
+  }
+
+  private closeSlotCurrentFrame(slot: MatrixTileSlot): void {
+    this.releaseFrame(slot.currentFrame?.videoFrame);
+    slot.currentFrame = undefined;
+  }
+
+  private retainFrame(frame: unknown): void {
+    if (!frame || typeof frame !== "object") {
+      return;
+    }
+
+    this.retainedFrameRefs.set(frame, (this.retainedFrameRefs.get(frame) ?? 0) + 1);
+  }
+
+  private releaseFrame(frame: unknown): void {
+    if (!frame || typeof frame !== "object") {
+      return;
+    }
+
+    const count = this.retainedFrameRefs.get(frame) ?? 0;
+    if (count > 1) {
+      this.retainedFrameRefs.set(frame, count - 1);
+      return;
+    }
+
+    this.retainedFrameRefs.delete(frame);
+    this.closeFrame(frame);
+  }
+
+  private closeFrame(frame: unknown): void {
+    if (!frame || typeof frame !== "object" || this.closedFrames.has(frame)) {
+      return;
+    }
+
+    this.closedFrames.add(frame);
+    (frame as BrowserVideoFrameLike).close?.();
+  }
+}
+
+export class WebGpuMatrixTileRenderer {
+  private readonly compositor: WebGpuMatrixCompositor;
+  private readonly fallbackRenderer = new WebGpuRenderer();
+  private configuredSurface?: SurfaceConfigurationPlan;
+  private matrixEnabled = false;
+  private disposed = false;
+
+  public constructor(matrixCanvasId = "vms-matrix-canvas") {
+    this.compositor = getMatrixCompositor(matrixCanvasId);
+  }
+
+  public async configureSurface(configuration: SurfaceConfigurationPlan): Promise<void> {
+    this.configuredSurface = configuration;
+    this.disposed = false;
+    this.matrixEnabled = await this.compositor.registerSurface(configuration);
+    if (!this.matrixEnabled) {
+      await this.fallbackRenderer.configureSurface(configuration);
+    }
+  }
+
+  public async renderFrame(request: RenderFrameRequest): Promise<RenderFrameResult> {
+    if (!this.configuredSurface || this.disposed) {
+      return Promise.reject(new Error("Renderer surface must be configured before rendering."));
+    }
+
+    if (this.matrixEnabled) {
+      try {
+        return await this.compositor.renderFrame(this.configuredSurface, request);
+      } catch {
+        this.matrixEnabled = false;
+        await this.fallbackRenderer.configureSurface(this.configuredSurface);
+      }
+    }
+
+    return this.fallbackRenderer.renderFrame(request);
+  }
+
+  public canShareFrameReference(): boolean {
+    return this.matrixEnabled && !this.disposed;
+  }
+
+  public async dispose(): Promise<void> {
+    if (this.configuredSurface) {
+      this.compositor.unregisterSurface(this.configuredSurface.canvasId);
+    }
+
+    this.disposed = true;
+    this.configuredSurface = undefined;
+    this.matrixEnabled = false;
+    await this.fallbackRenderer.dispose();
+  }
+}
+
 export class WebGpuRenderer {
   private readonly state: InternalRendererState = {
     disposed: false,
@@ -2163,7 +3417,8 @@ export class WebGpuRenderer {
           }
           renderBackend = "webgpu";
         } catch (error) {
-          canvas.dataset.webGpuError = error instanceof Error ? error.message : String(error);
+          setCanvasDatasetValue(canvas, "webGpuError", error instanceof Error ? error.message : String(error));
+          setCanvasDatasetValue(canvas, "webGpuStep", this.state.gpu.lastStep ?? "unknown");
           paintFrameOnCanvas(canvas, this.state.configuredSurface, request);
         }
       } else {
@@ -2209,6 +3464,7 @@ export class WebGpuRenderer {
    */
   public dispose(): Promise<void> {
     this.state.gpu?.outputTexture.destroy?.();
+    this.state.gpu?.uploadTexture?.texture.destroy?.();
     this.state.disposed = true;
     this.state.configuredSurface = undefined;
     this.state.lastRenderedSequence = undefined;

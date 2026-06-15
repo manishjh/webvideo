@@ -12,6 +12,13 @@ export interface TransportEndpointDescriptor {
   requestedTransport: BrowserTransportMode;
   allowHttpFallback: boolean;
   serverCertificateHash?: string;
+  targetLatencyMs?: number;
+  desiredEgressFrameRate?: number;
+  desiredMaxCodedWidth?: number;
+  desiredMaxCodedHeight?: number;
+  chaosDisconnectAfterFrames?: number;
+  chaosFrameDelayMs?: number;
+  chaosDropEveryNFrames?: number;
   frameCount?: number;
   streamMode?: "bounded" | "continuous" | "continuous-binary" | "continuous-moq";
 }
@@ -40,6 +47,13 @@ export interface TransportConnectionHandle {
   webTransportReady: boolean;
   webTransportBytesReceived: number;
   webTransportMessagesReceived: number;
+}
+
+export interface SelectedVideoSourceDescriptor {
+  channelId: ChannelId;
+  streamId: StreamId;
+  sourceRtspUrl: string;
+  codec: VideoCodecConfiguration & { profile?: string; frameRate?: number };
 }
 
 export interface VideoTransportMessage {

@@ -91,6 +91,27 @@ app.MapGet(
     (ContinuousRtspStreamFanout liveFanout) => Results.Ok(liveFanout.GetMetrics()));
 
 app.MapGet(
+    "/api/demo/live/egress-metrics",
+    () => Results.Ok(BrowserDemoWebTransportEndpoint.GetEgressMetrics()));
+
+app.MapGet(
+    "/api/demo/live/process-metrics",
+    () =>
+    {
+        using var process = System.Diagnostics.Process.GetCurrentProcess();
+        return Results.Ok(new
+        {
+            processId = Environment.ProcessId,
+            totalProcessorTimeMs = process.TotalProcessorTime.TotalMilliseconds,
+            workingSetBytes = process.WorkingSet64,
+            privateMemoryBytes = process.PrivateMemorySize64,
+            gcHeapBytes = GC.GetTotalMemory(forceFullCollection: false),
+            threadCount = process.Threads.Count,
+            utcNow = DateTimeOffset.UtcNow
+        });
+    });
+
+app.MapGet(
     "/api/demo/webtransport/certificate-hash",
     () => Results.Ok(new
     {

@@ -32,6 +32,9 @@ export interface BrowserDemoSessionRequest {
   targetLatencyMs: number;
   enableMetadata: boolean;
   frameCount?: number;
+  desiredEgressFrameRate?: number;
+  desiredMaxCodedWidth?: number;
+  desiredMaxCodedHeight?: number;
 }
 
 export interface BrowserDemoApiResponse {

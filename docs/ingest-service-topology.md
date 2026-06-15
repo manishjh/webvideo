@@ -8,7 +8,7 @@ Current state:
 - backend contracts cover ingest, archive, proxy, browser sessions, fanout, metadata, and telemetry
 - in-memory coordinator implementations and tests lock expected behavior alongside the local browser media path
 - the demo host maps client-provided channel IDs to predefined backend-selected streams, captures local RTSP H.264 access units when enabled, and serves browser sessions over WebTransport/QUIC
-- the local browser path now includes bounded live demo playback, a bounded multi-channel tile wall, continuous React VMS playback, opt-in long-running VMS soaks, and opt-in 4K/mixed-resolution stress paths
+- the local browser path now includes bounded live demo playback, a bounded multi-channel tile wall, continuous React VMS playback, default 4K RTSP sources, opt-in long-running VMS soaks, and opt-in 4K/mixed-resolution browser stress profiles
 - the current continuous path uses a compact MoQ-shaped object envelope, but is not yet full MOQT/MSF compatible
 
 Target requirement:

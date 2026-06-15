@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Buffers;
 using System.Diagnostics;
 using System.Threading.Channels;
 
@@ -32,6 +33,17 @@ public sealed record ContinuousRtspFanoutMetrics(
     long SubscriberFramesDropped,
     long LastFrameUnixTimeMs,
     long LastKeyFrameUnixTimeMs,
+    long LastFrameIntervalMs,
+    long MaxFrameIntervalMs,
+    long LastKeyFrameIntervalMs,
+    long ReaderRestartCount,
+    long ReaderErrorCount,
+    double IngressFps,
+    double PublishedFps,
+    double SubscriberReadFps,
+    double RecentIngressFps,
+    double RecentPublishedFps,
+    double RecentSubscriberReadFps,
     IReadOnlyList<ContinuousRtspSubscriberMetrics> Subscribers);
 
 public sealed record ContinuousRtspSubscriberMetrics(
@@ -39,7 +51,8 @@ public sealed record ContinuousRtspSubscriberMetrics(
     long FramesWritten,
     long FramesRead,
     long FramesDropped,
-    int PendingFrames);
+    int PendingFrames,
+    double RecentReadFps);
 
 public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
 {
@@ -76,15 +89,17 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
         string streamId,
         string rtspUrl,
         double frameRate,
+        int? targetLatencyMs,
         CancellationToken cancellationToken)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(streamId);
         ArgumentException.ThrowIfNullOrWhiteSpace(rtspUrl);
 
+        var workerKey = $"{streamId}\n{rtspUrl}";
         var worker = _workers.GetOrAdd(
-            streamId,
+            workerKey,
             _ => new StreamWorker(_ffmpegPath, _sourceFactory, streamId, rtspUrl, frameRate, _startupTimeout));
-        return await worker.SubscribeAsync(cancellationToken);
+        return await worker.SubscribeAsync(targetLatencyMs, cancellationToken);
     }
 
     public IReadOnlyList<ContinuousRtspFanoutMetrics> GetMetrics()
@@ -105,12 +120,13 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
 
     private sealed class StreamWorker : IAsyncDisposable
     {
-        private const int MaxSubscriberQueue = 6;
+        private const int MaxSubscriberQueue = 12;
         private readonly object _gate = new();
         private readonly string _ffmpegPath;
         private readonly ContinuousRtspFrameSourceFactory? _sourceFactory;
         private readonly string _streamId;
         private readonly string _rtspUrl;
+        private readonly double _frameRate;
         private readonly long _frameDurationUs;
         private readonly TimeSpan _startupTimeout;
         private readonly Dictionary<Guid, SubscriberState> _subscribers = [];
@@ -126,6 +142,13 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
         private long _subscriberFramesDropped;
         private long _lastFrameUnixTimeMs;
         private long _lastKeyFrameUnixTimeMs;
+        private long _lastFrameIntervalMs;
+        private long _maxFrameIntervalMs;
+        private long _lastKeyFrameIntervalMs;
+        private long _readerRestartCount;
+        private long _readerErrorCount;
+        private long _startedUnixTimeMs;
+        private readonly long[] _recentFrameUnixTimeMs = new long[256];
 
         public StreamWorker(
             string ffmpegPath,
@@ -139,21 +162,23 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
             _sourceFactory = sourceFactory;
             _streamId = streamId;
             _rtspUrl = rtspUrl;
+            _frameRate = frameRate;
             _frameDurationUs = (long)Math.Round(1_000_000.0 / frameRate);
             _startupTimeout = startupTimeout;
         }
 
-        public Task<ContinuousRtspSubscription> SubscribeAsync(CancellationToken cancellationToken)
+        public Task<ContinuousRtspSubscription> SubscribeAsync(int? targetLatencyMs, CancellationToken cancellationToken)
         {
             cancellationToken.ThrowIfCancellationRequested();
             var id = Guid.NewGuid();
-            var channel = Channel.CreateBounded<ContinuousRtspFrame>(new BoundedChannelOptions(MaxSubscriberQueue)
+            var maxQueue = ComputeSubscriberQueueDepth(targetLatencyMs);
+            var channel = Channel.CreateBounded<ContinuousRtspFrame>(new BoundedChannelOptions(maxQueue)
             {
                 FullMode = BoundedChannelFullMode.DropOldest,
                 SingleReader = true,
                 SingleWriter = false
             });
-            var subscriber = new SubscriberState(id, channel);
+            var subscriber = new SubscriberState(id, channel, maxQueue);
 
             lock (_gate)
             {
@@ -203,6 +228,14 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
                 .Select(subscriber => subscriber.GetMetrics())
                 .OrderBy(metrics => metrics.SubscriptionId)
                 .ToArray();
+            var nowUnixTimeMs = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            var elapsedSeconds = Math.Max(
+                (nowUnixTimeMs - Interlocked.Read(ref _startedUnixTimeMs)) / 1000.0,
+                0.001);
+            var framesRead = Interlocked.Read(ref _framesRead);
+            var framesPublished = Interlocked.Read(ref _framesPublished);
+            var subscriberFramesRead = subscriberMetrics.Sum(metrics => metrics.FramesRead);
+            var recentFrameFps = ComputeRecentFps(_recentFrameUnixTimeMs, nowUnixTimeMs);
 
             return new ContinuousRtspFanoutMetrics(
                 StreamId: _streamId,
@@ -210,14 +243,25 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
                 ReaderRunning: readerTask is { IsCompleted: false },
                 ProcessRunning: IsProcessRunning(process),
                 SubscriberCount: subscriberMetrics.Length,
-                FramesRead: Interlocked.Read(ref _framesRead),
+                FramesRead: framesRead,
                 KeyFramesRead: Interlocked.Read(ref _keyFramesRead),
                 BytesRead: Interlocked.Read(ref _bytesRead),
-                FramesPublished: Interlocked.Read(ref _framesPublished),
+                FramesPublished: framesPublished,
                 SubscriberFramesWritten: Interlocked.Read(ref _subscriberFramesWritten),
                 SubscriberFramesDropped: Interlocked.Read(ref _subscriberFramesDropped),
                 LastFrameUnixTimeMs: Interlocked.Read(ref _lastFrameUnixTimeMs),
                 LastKeyFrameUnixTimeMs: Interlocked.Read(ref _lastKeyFrameUnixTimeMs),
+                LastFrameIntervalMs: Interlocked.Read(ref _lastFrameIntervalMs),
+                MaxFrameIntervalMs: Interlocked.Read(ref _maxFrameIntervalMs),
+                LastKeyFrameIntervalMs: Interlocked.Read(ref _lastKeyFrameIntervalMs),
+                ReaderRestartCount: Interlocked.Read(ref _readerRestartCount),
+                ReaderErrorCount: Interlocked.Read(ref _readerErrorCount),
+                IngressFps: framesRead / elapsedSeconds,
+                PublishedFps: framesPublished / elapsedSeconds,
+                SubscriberReadFps: subscriberFramesRead / elapsedSeconds,
+                RecentIngressFps: recentFrameFps,
+                RecentPublishedFps: recentFrameFps,
+                RecentSubscriberReadFps: subscriberMetrics.Sum(metrics => metrics.RecentReadFps),
                 Subscribers: subscriberMetrics);
         }
 
@@ -258,6 +302,7 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
             }
 
             _stop = new CancellationTokenSource();
+            Interlocked.Exchange(ref _startedUnixTimeMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
             _readerTask = Task.Run(() => RunAsync(_stop.Token));
         }
 
@@ -275,6 +320,8 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
                 }
                 catch
                 {
+                    Interlocked.Increment(ref _readerErrorCount);
+                    Interlocked.Increment(ref _readerRestartCount);
                     await Task.Delay(250, cancellationToken);
                 }
             }
@@ -300,6 +347,10 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
             {
                 "-hide_banner",
                 "-loglevel", "error",
+                "-fflags", "nobuffer",
+                "-flags", "low_delay",
+                "-probesize", "32768",
+                "-analyzeduration", "0",
                 "-rtsp_transport", "tcp",
                 "-i", _rtspUrl,
                 "-map", "0:v:0",
@@ -356,59 +407,65 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
             CancellationToken startupToken,
             CancellationToken cancellationToken)
         {
-            var buffer = new byte[64 * 1024];
-            var pending = new List<byte>(256 * 1024);
+            var buffer = ArrayPool<byte>.Shared.Rent(64 * 1024);
+            var parser = new ContinuousRtspAccessUnitStreamParser();
             var hasSeenBytes = false;
-            while (!cancellationToken.IsCancellationRequested)
+            try
             {
-                var bytesRead = await source.ReadAsync(buffer, cancellationToken);
-                if (bytesRead == 0)
+                while (!cancellationToken.IsCancellationRequested)
                 {
-                    return;
+                    var bytesRead = await source.ReadAsync(buffer, cancellationToken);
+                    if (bytesRead == 0)
+                    {
+                        foreach (var unit in parser.Flush())
+                        {
+                            Publish(unit);
+                        }
+
+                        return;
+                    }
+                    Interlocked.Add(ref _bytesRead, bytesRead);
+
+                    if (!hasSeenBytes)
+                    {
+                        startupToken.ThrowIfCancellationRequested();
+                        hasSeenBytes = true;
+                    }
+
+                    foreach (var unit in parser.Append(buffer.AsSpan(0, bytesRead)))
+                    {
+                        Publish(unit);
+                    }
                 }
-                Interlocked.Add(ref _bytesRead, bytesRead);
-
-                if (!hasSeenBytes)
-                {
-                    startupToken.ThrowIfCancellationRequested();
-                    hasSeenBytes = true;
-                }
-
-                pending.AddRange(buffer.AsSpan(0, bytesRead).ToArray());
-                EmitCompleteUnits(pending);
             }
-        }
-
-        private void EmitCompleteUnits(List<byte> pending)
-        {
-            var bytes = pending.ToArray();
-            var units = RtspH264AccessUnitCapture.SplitAnnexBAccessUnits(bytes)
-                .Where(unit => unit.HasVideoSlice)
-                .ToArray();
-            if (units.Length <= 1)
+            finally
             {
-                return;
+                ArrayPool<byte>.Shared.Return(buffer);
             }
-
-            var consumed = bytes.Length - units[^1].Payload.Length;
-            foreach (var unit in units.Take(units.Length - 1))
-            {
-                Publish(unit);
-            }
-
-            pending.RemoveRange(0, Math.Min(consumed, pending.Count));
         }
 
         private void Publish(RtspCapturedAccessUnit unit)
         {
             var sequence = Interlocked.Increment(ref _sequence);
             var now = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds();
+            Interlocked.Exchange(ref _recentFrameUnixTimeMs[(int)(sequence % _recentFrameUnixTimeMs.Length)], now);
             Interlocked.Increment(ref _framesRead);
-            Interlocked.Exchange(ref _lastFrameUnixTimeMs, now);
+            var previousFrameUnixTimeMs = Interlocked.Exchange(ref _lastFrameUnixTimeMs, now);
+            if (previousFrameUnixTimeMs > 0)
+            {
+                var intervalMs = Math.Max(0, now - previousFrameUnixTimeMs);
+                Interlocked.Exchange(ref _lastFrameIntervalMs, intervalMs);
+                UpdateMax(ref _maxFrameIntervalMs, intervalMs);
+            }
+
             if (unit.IsKeyFrame)
             {
                 Interlocked.Increment(ref _keyFramesRead);
-                Interlocked.Exchange(ref _lastKeyFrameUnixTimeMs, now);
+                var previousKeyFrameUnixTimeMs = Interlocked.Exchange(ref _lastKeyFrameUnixTimeMs, now);
+                if (previousKeyFrameUnixTimeMs > 0)
+                {
+                    Interlocked.Exchange(ref _lastKeyFrameIntervalMs, Math.Max(0, now - previousKeyFrameUnixTimeMs));
+                }
             }
 
             var frame = new ContinuousRtspFrame(
@@ -425,7 +482,7 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
                 Interlocked.Increment(ref _framesPublished);
                 foreach (var subscriber in _subscribers.Values)
                 {
-                    var writeResult = subscriber.TryWrite(frame, MaxSubscriberQueue);
+                    var writeResult = subscriber.TryWrite(frame);
                     if (writeResult.Written)
                     {
                         Interlocked.Increment(ref _subscriberFramesWritten);
@@ -473,27 +530,88 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
             }
         }
 
+        private static void UpdateMax(ref long target, long candidate)
+        {
+            while (true)
+            {
+                var current = Interlocked.Read(ref target);
+                if (candidate <= current)
+                {
+                    return;
+                }
+
+                if (Interlocked.CompareExchange(ref target, candidate, current) == current)
+                {
+                    return;
+                }
+            }
+        }
+
+        private static double ComputeRecentFps(long[] samples, long nowUnixTimeMs)
+        {
+            const long WindowMs = 3000;
+            var count = 0;
+            var min = long.MaxValue;
+            var max = 0L;
+
+            for (var index = 0; index < samples.Length; index++)
+            {
+                var timestamp = Interlocked.Read(ref samples[index]);
+                if (timestamp <= 0 || nowUnixTimeMs - timestamp > WindowMs)
+                {
+                    continue;
+                }
+
+                count += 1;
+                min = Math.Min(min, timestamp);
+                max = Math.Max(max, timestamp);
+            }
+
+            if (count < 2 || max <= min)
+            {
+                return 0;
+            }
+
+            return (count - 1) / ((max - min) / 1000.0);
+        }
+
+        private int ComputeSubscriberQueueDepth(int? targetLatencyMs)
+        {
+            if (targetLatencyMs is null or <= 0)
+            {
+                return MaxSubscriberQueue;
+            }
+
+            var framesInBudget = (int)Math.Ceiling(targetLatencyMs.Value * _frameRate / 1000.0);
+            var burstCushionFrames = Math.Max(framesInBudget * 3, (int)Math.Ceiling(_frameRate * 0.75));
+            return Math.Clamp(burstCushionFrames, 4, MaxSubscriberQueue);
+        }
+
         private sealed class SubscriberState
         {
-            public SubscriberState(Guid id, Channel<ContinuousRtspFrame> channel)
+            public SubscriberState(Guid id, Channel<ContinuousRtspFrame> channel, int maxQueue)
             {
                 Id = id;
                 Channel = channel;
+                MaxQueue = maxQueue;
             }
 
             public Guid Id { get; }
 
             public Channel<ContinuousRtspFrame> Channel { get; }
 
+            public int MaxQueue { get; }
+
             private long _framesWritten;
             private long _framesRead;
             private long _framesDropped;
             private int _pendingFrames;
+            private readonly long[] _recentReadUnixTimeMs = new long[256];
 
-            public (bool Written, bool DroppedOldest) TryWrite(ContinuousRtspFrame frame, int maxQueue)
+            public (bool Written, bool DroppedOldest) TryWrite(ContinuousRtspFrame frame)
             {
                 var pendingBeforeWrite = Volatile.Read(ref _pendingFrames);
-                var willDropOldest = pendingBeforeWrite >= maxQueue;
+                var willDropOldest = pendingBeforeWrite >= MaxQueue;
                 if (!willDropOldest)
                 {
                     Interlocked.Increment(ref _pendingFrames);
@@ -520,8 +638,11 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
 
             public void MarkFrameRead()
             {
+                var framesRead = Interlocked.Increment(ref _framesRead);
+                Interlocked.Exchange(
+                    ref _recentReadUnixTimeMs[(int)(framesRead % _recentReadUnixTimeMs.Length)],
+                    DateTimeOffset.UtcNow.ToUnixTimeMilliseconds());
                 DecrementPendingFrame();
-                Interlocked.Increment(ref _framesRead);
             }
 
             public ContinuousRtspSubscriberMetrics GetMetrics()
@@ -530,7 +651,8 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
                     FramesWritten: Interlocked.Read(ref _framesWritten),
                     FramesRead: Interlocked.Read(ref _framesRead),
                     FramesDropped: Interlocked.Read(ref _framesDropped),
-                    PendingFrames: Math.Max(0, Volatile.Read(ref _pendingFrames)));
+                    PendingFrames: Math.Max(0, Volatile.Read(ref _pendingFrames)),
+                    RecentReadFps: ComputeRecentFps(_recentReadUnixTimeMs, DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()));
 
             private void DecrementPendingFrame()
             {

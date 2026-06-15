@@ -29,6 +29,7 @@ test.describe("contract harness page", () => {
     await expect(page.getByTestId("scenario-row-player-recovers-from-stream-discontinuity")).toContainText("cctv-entrance-720p");
     await expect(page.getByTestId("scenario-row-tile-wall-renders-independent-channels")).toContainText("cctv-floor-1080p");
     await expect(page.getByTestId("scenario-row-high-resolution-4k-channel-is-declared")).toContainText("cctv-parking-4k");
+    await expect(page.getByTestId("scenario-row-high-stress-4k60-crowd-channel-is-declared")).toContainText("cctv-road-crowd-4k60");
   });
 
   test("runs the RTSP-backed player flow end to end in the browser harness", async ({ page }) => {

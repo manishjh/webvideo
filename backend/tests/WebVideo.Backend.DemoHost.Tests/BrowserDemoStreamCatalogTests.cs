@@ -3,6 +3,7 @@ using Xunit;
 using System.Buffers;
 using System.Buffers.Binary;
 using System.IO.Pipelines;
+using System.Text;
 using System.Text.Json;
 
 namespace WebVideo.Backend.DemoHost.Tests;
@@ -37,6 +38,11 @@ public sealed class BrowserDemoStreamCatalogTests
             {
                 Assert.Equal("camera-4k", fourth.StreamId);
                 Assert.Equal("cctv-parking-4k", fourth.ScenarioId);
+            },
+            fifth =>
+            {
+                Assert.Equal("camera-4k-crowd", fifth.StreamId);
+                Assert.Equal("cctv-road-crowd-4k60", fifth.ScenarioId);
             });
     }
 
@@ -76,7 +82,110 @@ public sealed class BrowserDemoStreamCatalogTests
                 Assert.Equal("cctv-parking-4k", fourth.ScenarioId);
                 Assert.Equal(3840, fourth.Codec.CodedWidth);
                 Assert.Equal(2160, fourth.Codec.CodedHeight);
+            },
+            fifth =>
+            {
+                Assert.Equal("channel-4k-crowd", fifth.ChannelId);
+                Assert.Equal("camera-4k-crowd", fifth.StreamId);
+                Assert.Equal("cctv-road-crowd-4k60", fifth.ScenarioId);
+                Assert.Equal(3840, fifth.Codec.CodedWidth);
+                Assert.Equal(2160, fifth.Codec.CodedHeight);
+                Assert.Equal(60.0, fifth.Codec.FrameRate);
             });
+    }
+
+    [Fact]
+    public void GetChannel_selects_adaptive_source_variant_when_desired_frame_rate_is_lower()
+    {
+        var catalog = new BrowserDemoStreamCatalog();
+
+        var channel = catalog.GetChannel("channel-4k-crowd", desiredEgressFrameRate: 24);
+
+        Assert.Equal("channel-4k-crowd", channel.ChannelId);
+        Assert.Equal("camera-4k-crowd", channel.StreamId);
+        Assert.Equal("rtsp://127.0.0.1:8554/live/cctv-road-crowd-1080p24", channel.SourceRtspUrl);
+        Assert.Equal(1920, channel.Codec.CodedWidth);
+        Assert.Equal(1080, channel.Codec.CodedHeight);
+        Assert.Equal(24, channel.Codec.FrameRate);
+    }
+
+    [Fact]
+    public void GetChannel_preserves_high_frame_rate_when_only_resolution_is_limited()
+    {
+        var catalog = new BrowserDemoStreamCatalog();
+
+        var channel = catalog.GetChannel(
+            "channel-4k-crowd",
+            desiredEgressFrameRate: null,
+            desiredMaxCodedWidth: 1920,
+            desiredMaxCodedHeight: 1080);
+
+        Assert.Equal("rtsp://127.0.0.1:8554/live/cctv-road-crowd-1080p60", channel.SourceRtspUrl);
+        Assert.Equal(1920, channel.Codec.CodedWidth);
+        Assert.Equal(1080, channel.Codec.CodedHeight);
+        Assert.Equal(60, channel.Codec.FrameRate);
+    }
+
+    [Fact]
+    public void GetChannel_selects_resolution_limited_source_variants_for_grid_views()
+    {
+        var catalog = new BrowserDemoStreamCatalog();
+
+        var crowd = catalog.GetChannel(
+            "channel-4k-crowd",
+            desiredEgressFrameRate: 15,
+            desiredMaxCodedWidth: 1280,
+            desiredMaxCodedHeight: 720);
+        var parking = catalog.GetChannel(
+            "channel-4k",
+            desiredEgressFrameRate: 15,
+            desiredMaxCodedWidth: 1280,
+            desiredMaxCodedHeight: 720);
+
+        Assert.Equal("rtsp://127.0.0.1:8554/live/cctv-road-crowd-720p15", crowd.SourceRtspUrl);
+        Assert.Equal(1280, crowd.Codec.CodedWidth);
+        Assert.Equal(720, crowd.Codec.CodedHeight);
+        Assert.Equal("rtsp://127.0.0.1:8554/live/cctv-parking-720p15", parking.SourceRtspUrl);
+        Assert.Equal(1280, parking.Codec.CodedWidth);
+        Assert.Equal(720, parking.Codec.CodedHeight);
+    }
+
+    [Fact]
+    public void GetChannel_selects_low_rate_source_variants_for_dense_wall_requests()
+    {
+        var catalog = new BrowserDemoStreamCatalog();
+
+        var lobby = catalog.GetChannel("channel-001", desiredEgressFrameRate: 15);
+        var floor = catalog.GetChannel("channel-003", desiredEgressFrameRate: 15);
+        var crowd = catalog.GetChannel("channel-4k-crowd", desiredEgressFrameRate: 15);
+
+        Assert.Equal("rtsp://127.0.0.1:8554/live/cctv-lobby-720p15", lobby.SourceRtspUrl);
+        Assert.Equal(15, lobby.Codec.FrameRate);
+        Assert.Equal("rtsp://127.0.0.1:8554/live/cctv-floor-1080p15", floor.SourceRtspUrl);
+        Assert.Equal(15, floor.Codec.FrameRate);
+        Assert.Equal("rtsp://127.0.0.1:8554/live/cctv-road-crowd-720p15", crowd.SourceRtspUrl);
+        Assert.Equal(15, crowd.Codec.FrameRate);
+    }
+
+    [Fact]
+    public void GetChannel_selects_emergency_source_variants_for_severe_pressure()
+    {
+        var catalog = new BrowserDemoStreamCatalog();
+
+        var lobby = catalog.GetChannel("channel-001", desiredEgressFrameRate: 5);
+        var floor = catalog.GetChannel("channel-003", desiredEgressFrameRate: 2);
+        var crowd = catalog.GetChannel(
+            "channel-4k-crowd",
+            desiredEgressFrameRate: 5,
+            desiredMaxCodedWidth: 1280,
+            desiredMaxCodedHeight: 720);
+
+        Assert.Equal("rtsp://127.0.0.1:8554/live/cctv-lobby-720p5", lobby.SourceRtspUrl);
+        Assert.Equal(5, lobby.Codec.FrameRate);
+        Assert.Equal("rtsp://127.0.0.1:8554/live/cctv-floor-1080p2", floor.SourceRtspUrl);
+        Assert.Equal(2, floor.Codec.FrameRate);
+        Assert.Equal("rtsp://127.0.0.1:8554/live/cctv-road-crowd-720p5", crowd.SourceRtspUrl);
+        Assert.Equal(5, crowd.Codec.FrameRate);
     }
 
     [Fact]
@@ -153,6 +262,40 @@ public sealed class BrowserDemoStreamCatalogTests
     }
 
     [Fact]
+    public void WebTransport_open_request_preserves_adaptive_source_intent()
+    {
+        var bytes = Encoding.UTF8.GetBytes("""
+            {
+              "channelId": "channel-4k-crowd",
+              "streamId": "camera-4k-crowd",
+              "viewerId": "viewer-1",
+              "authToken": "demo-token",
+              "targetLatencyMs": 150,
+              "enableMetadata": true,
+              "streamMode": "continuous-moq",
+              "desiredEgressFrameRate": 24,
+              "desiredMaxCodedWidth": 1920,
+              "desiredMaxCodedHeight": 1080,
+              "chaosDisconnectAfterFrames": 30,
+              "chaosFrameDelayMs": 15,
+              "chaosDropEveryNFrames": 7
+            }
+            """);
+
+        var request = BrowserDemoWebTransportFrameCodec.DecodeOpenRequest(bytes);
+        var sessionRequest = BrowserDemoWebTransportFrameCodec.ToSessionOpenRequest(request);
+
+        Assert.Equal("channel-4k-crowd", request.ChannelId);
+        Assert.Equal("continuous-moq", request.StreamMode);
+        Assert.Equal(24.0, sessionRequest.DesiredEgressFrameRate.GetValueOrDefault());
+        Assert.Equal(1920, sessionRequest.DesiredMaxCodedWidth);
+        Assert.Equal(1080, sessionRequest.DesiredMaxCodedHeight);
+        Assert.Equal(30, request.ChaosDisconnectAfterFrames);
+        Assert.Equal(15, request.ChaosFrameDelayMs);
+        Assert.Equal(7, request.ChaosDropEveryNFrames);
+    }
+
+    [Fact]
     public async Task Continuous_fanout_metrics_are_empty_before_live_subscriptions()
     {
         await using var fanout = new ContinuousRtspStreamFanout("ffmpeg");
@@ -170,12 +313,14 @@ public sealed class BrowserDemoStreamCatalogTests
             CreateSingleRunSource(CreateAnnexBAccessUnitSequence(4), sourceGate.Task),
             TimeSpan.FromSeconds(2));
 
-        await using var first = await fanout.SubscribeAsync("camera-001", "rtsp://fake.local/live/one", 30, CancellationToken.None);
-        await using var second = await fanout.SubscribeAsync("camera-001", "rtsp://fake.local/live/one", 30, CancellationToken.None);
+        await using var first = await fanout.SubscribeAsync("camera-001", "rtsp://fake.local/live/one", 30, targetLatencyMs: 150, CancellationToken.None);
+        await using var second = await fanout.SubscribeAsync("camera-001", "rtsp://fake.local/live/one", 30, targetLatencyMs: 150, CancellationToken.None);
 
         sourceGate.SetResult();
         var firstFrame = await ReadFrameAsync(first);
         var secondFrame = await ReadFrameAsync(second);
+        await ReadFrameAsync(first);
+        await ReadFrameAsync(second);
         var metrics = await WaitForFanoutMetricAsync(
             fanout,
             metrics => metrics.StreamId == "camera-001" && metrics.FramesPublished >= 2 && metrics.SubscriberCount == 2);
@@ -193,7 +338,28 @@ public sealed class BrowserDemoStreamCatalogTests
         Assert.True(metrics.BytesRead > 0);
         Assert.True(metrics.SubscriberFramesWritten >= 4);
         Assert.Equal(0, metrics.SubscriberFramesDropped);
-        Assert.All(metrics.Subscribers, subscriber => Assert.InRange(subscriber.PendingFrames, 0, 6));
+        Assert.True(metrics.RecentPublishedFps >= 0);
+        Assert.True(metrics.RecentSubscriberReadFps >= 0);
+        Assert.All(metrics.Subscribers, subscriber => Assert.InRange(subscriber.PendingFrames, 0, 10));
+        Assert.All(metrics.Subscribers, subscriber => Assert.True(subscriber.RecentReadFps >= 0));
+    }
+
+    [Fact]
+    public async Task Continuous_fanout_absorbs_short_low_fps_source_bursts()
+    {
+        await using var fanout = new ContinuousRtspStreamFanout(
+            CreateSingleRunSource(CreateAnnexBAccessUnitSequence(10)),
+            TimeSpan.FromSeconds(2));
+
+        await using var subscription = await fanout.SubscribeAsync("camera-002", "rtsp://fake.local/live/two", 15, targetLatencyMs: 150, CancellationToken.None);
+
+        var metrics = await WaitForFanoutMetricAsync(
+            fanout,
+            metrics => metrics.StreamId == "camera-002" && metrics.FramesPublished >= 10 && metrics.SubscriberCount == 1);
+
+        Assert.Equal(0, metrics.SubscriberFramesDropped);
+        Assert.Single(metrics.Subscribers);
+        Assert.InRange(metrics.Subscribers[0].PendingFrames, 10, 12);
     }
 
     [Fact]
@@ -203,7 +369,7 @@ public sealed class BrowserDemoStreamCatalogTests
             CreateSingleRunSource(CreateAnnexBAccessUnitSequence(24)),
             TimeSpan.FromSeconds(2));
 
-        await using var subscription = await fanout.SubscribeAsync("camera-002", "rtsp://fake.local/live/two", 30, CancellationToken.None);
+        await using var subscription = await fanout.SubscribeAsync("camera-002", "rtsp://fake.local/live/two", 30, targetLatencyMs: 100, CancellationToken.None);
 
         var metrics = await WaitForFanoutMetricAsync(
             fanout,
@@ -212,8 +378,9 @@ public sealed class BrowserDemoStreamCatalogTests
 
         Assert.True(metrics.FramesPublished > 6);
         Assert.True(metrics.SubscriberFramesDropped > 0);
+        Assert.True(metrics.RecentPublishedFps >= 0);
         Assert.Single(metrics.Subscribers);
-        Assert.InRange(metrics.Subscribers[0].PendingFrames, 0, 6);
+        Assert.InRange(metrics.Subscribers[0].PendingFrames, 0, 12);
         Assert.True(firstReadableFrame.SequenceNumber > 1);
     }
 
@@ -225,7 +392,7 @@ public sealed class BrowserDemoStreamCatalogTests
             CreateSingleRunSource(CreateAnnexBAccessUnitSequence(4), sourceGate.Task),
             TimeSpan.FromSeconds(2));
 
-        var subscription = await fanout.SubscribeAsync("camera-003", "rtsp://fake.local/live/three", 30, CancellationToken.None);
+        var subscription = await fanout.SubscribeAsync("camera-003", "rtsp://fake.local/live/three", 30, targetLatencyMs: 150, CancellationToken.None);
         var runningMetrics = await WaitForFanoutMetricAsync(
             fanout,
             metrics => metrics.StreamId == "camera-003" && metrics.ReaderRunning && metrics.SubscriberCount == 1);
@@ -309,6 +476,22 @@ public sealed class BrowserDemoStreamCatalogTests
     }
 
     [Fact]
+    public void Moq_object_timeline_starts_groups_on_keyframes_and_advances_delta_objects()
+    {
+        var timeline = new BrowserDemoMoqObjectTimeline();
+
+        var firstKey = timeline.Advance(CreateContinuousFrame(sequenceNumber: 1, sourceTimestampMs: 10_000, keyFrame: true));
+        var firstDelta = timeline.Advance(CreateContinuousFrame(sequenceNumber: 2, sourceTimestampMs: 10_033, keyFrame: false));
+        var secondDelta = timeline.Advance(CreateContinuousFrame(sequenceNumber: 3, sourceTimestampMs: 10_066, keyFrame: false));
+        var nextKey = timeline.Advance(CreateContinuousFrame(sequenceNumber: 30, sourceTimestampMs: 11_000, keyFrame: true));
+
+        Assert.Equal(new BrowserDemoMoqObjectIdentity(10_000, 0), firstKey);
+        Assert.Equal(new BrowserDemoMoqObjectIdentity(10_000, 1), firstDelta);
+        Assert.Equal(new BrowserDemoMoqObjectIdentity(10_000, 2), secondDelta);
+        Assert.Equal(new BrowserDemoMoqObjectIdentity(11_000, 0), nextKey);
+    }
+
+    [Fact]
     public async Task OpenChannelSession_resolves_channel_and_creates_a_browser_sink()
     {
         var catalog = new BrowserDemoStreamCatalog();
@@ -348,6 +531,28 @@ public sealed class BrowserDemoStreamCatalogTests
         Assert.Equal("cctv-parking-4k", response.ScenarioId);
         Assert.Equal(3840, response.Codec.CodedWidth);
         Assert.Equal(2160, response.Codec.CodedHeight);
+        Assert.Equal(1, response.RequestedFrameCount);
+        Assert.Single(response.VideoMessages);
+        Assert.Single(response.MetadataMessages);
+    }
+
+    [Fact]
+    public async Task OpenChannelSession_exposes_a_4k60_crowd_stress_channel_shape()
+    {
+        var catalog = new BrowserDemoStreamCatalog();
+
+        var response = await catalog.OpenChannelSessionAsync(
+            "channel-4k-crowd",
+            new BrowserDemoSessionOpenRequest("viewer-4k60", "token-4k60", 150, true, FrameCount: 1),
+            cancellationToken: CancellationToken.None);
+
+        Assert.Equal("channel-4k-crowd", response.ChannelId);
+        Assert.Equal("camera-4k-crowd", response.StreamId);
+        Assert.Equal("cctv-road-crowd-4k60", response.ScenarioId);
+        Assert.Equal("rtsp://127.0.0.1:8554/live/cctv-road-crowd-4k60", response.SourceRtspUrl);
+        Assert.Equal(3840, response.Codec.CodedWidth);
+        Assert.Equal(2160, response.Codec.CodedHeight);
+        Assert.Equal(60.0, response.Codec.FrameRate);
         Assert.Equal(1, response.RequestedFrameCount);
         Assert.Single(response.VideoMessages);
         Assert.Single(response.MetadataMessages);
@@ -415,6 +620,16 @@ public sealed class BrowserDemoStreamCatalogTests
 
         return bytes.ToArray();
     }
+
+    private static ContinuousRtspFrame CreateContinuousFrame(long sequenceNumber, long sourceTimestampMs, bool keyFrame)
+        => new(
+            SequenceNumber: sequenceNumber,
+            PresentationTimestampUs: sequenceNumber * 33_333,
+            DecodeTimestampUs: sequenceNumber * 33_333,
+            SourceTimestampUnixTimeMs: sourceTimestampMs,
+            ServerTimestampUnixTimeMs: sourceTimestampMs,
+            KeyFrame: keyFrame,
+            Payload: []);
 
     private static ContinuousRtspFrameSourceFactory CreateSingleRunSource(byte[] bytes, Task? firstReadGate = null)
     {

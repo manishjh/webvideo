@@ -64,14 +64,15 @@ PY
 }
 
 trap cleanup EXIT INT TERM
+mkdir -p "$ROOT_DIR/.run"
 
 if [[ "${WEBVIDEO_PLAYWRIGHT_START_SERVER:-1}" != "0" && "${WEBVIDEO_PLAYWRIGHT_START_SERVER:-1}" != "false" ]]; then
   export WEBVIDEO_PLAYWRIGHT_EXTERNAL_SERVER=1
   (
     cd "$ROOT_DIR"
-    START_RTSP="${START_RTSP:-1}" \
+      START_RTSP="${START_RTSP:-1}" \
       WEBVIDEO_SAMPLE_FOOTAGE="${WEBVIDEO_SAMPLE_FOOTAGE:-1}" \
-      START_4K_RTSP="${START_4K_RTSP:-${WEBVIDEO_E2E_4K:-0}}" \
+      START_4K_RTSP="${START_4K_RTSP:-1}" \
       ./start.sh
   ) &
   SERVER_PID=$!
@@ -83,4 +84,9 @@ else
 fi
 
 cd "$ROOT_DIR/frontend"
-"$NPM_BIN" exec -- playwright test "$@"
+PLAYWRIGHT_ARGS=("$@")
+if [[ -n "${WEBVIDEO_PLAYWRIGHT_GREP:-}" ]]; then
+  PLAYWRIGHT_ARGS+=(--grep "$WEBVIDEO_PLAYWRIGHT_GREP")
+fi
+
+"$NPM_BIN" exec -- playwright test "${PLAYWRIGHT_ARGS[@]}"

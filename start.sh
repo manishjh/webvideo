@@ -14,7 +14,8 @@ RTP_PORT="${RTP_PORT:-5004}"
 RTCP_PORT="${RTCP_PORT:-5005}"
 WEBTRANSPORT_PORT="${WEBTRANSPORT_PORT:-9443}"
 START_RTSP="${START_RTSP:-auto}"
-START_4K_RTSP="${START_4K_RTSP:-0}"
+START_4K_RTSP="${START_4K_RTSP:-1}"
+START_4K_STRESS_RTSP="${START_4K_STRESS_RTSP:-$START_4K_RTSP}"
 START_WEBTRANSPORT="${START_WEBTRANSPORT:-1}"
 SETUP_RTSP_TOOLS="${SETUP_RTSP_TOOLS:-auto}"
 SETUP_QUIC_TOOLS="${SETUP_QUIC_TOOLS:-auto}"
@@ -23,6 +24,16 @@ SETUP_QUIC_TOOLS_ONLY="${SETUP_QUIC_TOOLS_ONLY:-0}"
 SETUP_SAMPLE_FOOTAGE_ONLY="${SETUP_SAMPLE_FOOTAGE_ONLY:-0}"
 WEBVIDEO_SAMPLE_FOOTAGE="${WEBVIDEO_SAMPLE_FOOTAGE:-0}"
 WEBVIDEO_RTSP_COPY_INPUTS="${WEBVIDEO_RTSP_COPY_INPUTS:-auto}"
+WEBVIDEO_RTSP_FPS="${WEBVIDEO_RTSP_FPS:-30}"
+WEBVIDEO_RTSP_ADAPTIVE_FPS="${WEBVIDEO_RTSP_ADAPTIVE_FPS:-15}"
+WEBVIDEO_RTSP_4K_FPS="${WEBVIDEO_RTSP_4K_FPS:-15}"
+WEBVIDEO_RTSP_4K_STRESS_FPS="${WEBVIDEO_RTSP_4K_STRESS_FPS:-60}"
+WEBVIDEO_RTSP_4K_STRESS_ADAPTIVE_FPS="${WEBVIDEO_RTSP_4K_STRESS_ADAPTIVE_FPS:-24}"
+WEBVIDEO_RTSP_4K_STRESS_LOW_FPS="${WEBVIDEO_RTSP_4K_STRESS_LOW_FPS:-15}"
+WEBVIDEO_RTSP_EMERGENCY_FPS="${WEBVIDEO_RTSP_EMERGENCY_FPS:-5}"
+WEBVIDEO_RTSP_ULTRA_LOW_FPS="${WEBVIDEO_RTSP_ULTRA_LOW_FPS:-2}"
+WEBVIDEO_FRONTEND_MODE="${WEBVIDEO_FRONTEND_MODE:-production}"
+MEDIAMTX_WRITE_QUEUE_SIZE="${MEDIAMTX_WRITE_QUEUE_SIZE:-8192}"
 DEMO_CHANNEL_ID="${DEMO_CHANNEL_ID:-channel-001}"
 BACKEND_PROJECT="$ROOT_DIR/backend/src/WebVideo.Backend.DemoHost/WebVideo.Backend.DemoHost.csproj"
 BACKEND_DLL="$ROOT_DIR/backend/src/WebVideo.Backend.DemoHost/bin/Debug/net10.0/WebVideo.Backend.DemoHost.dll"
@@ -297,37 +308,134 @@ prepare_sample_footage_inputs() {
     return 0
   fi
 
+  local lobby_rate="${WEBVIDEO_CCTV_LOBBY_RATE:-$WEBVIDEO_RTSP_FPS}"
+  local entrance_rate="${WEBVIDEO_CCTV_ENTRANCE_RATE:-$WEBVIDEO_RTSP_FPS}"
+  local floor_rate="${WEBVIDEO_CCTV_FLOOR_RATE:-$WEBVIDEO_RTSP_FPS}"
+  local adaptive_rate="${WEBVIDEO_CCTV_ADAPTIVE_RATE:-$WEBVIDEO_RTSP_ADAPTIVE_FPS}"
+  local parking_rate="${WEBVIDEO_CCTV_4K_RATE:-$WEBVIDEO_RTSP_4K_FPS}"
+  local crowd_rate="${WEBVIDEO_CCTV_4K_CROWD_RATE:-$WEBVIDEO_RTSP_4K_STRESS_FPS}"
+  local crowd_adaptive_rate="${WEBVIDEO_CCTV_4K_CROWD_ADAPTIVE_RATE:-$WEBVIDEO_RTSP_4K_STRESS_ADAPTIVE_FPS}"
+  local crowd_low_rate="${WEBVIDEO_CCTV_4K_CROWD_LOW_RATE:-$WEBVIDEO_RTSP_4K_STRESS_LOW_FPS}"
+  local emergency_rate="${WEBVIDEO_CCTV_EMERGENCY_RATE:-$WEBVIDEO_RTSP_EMERGENCY_FPS}"
+  local ultra_low_rate="${WEBVIDEO_CCTV_ULTRA_LOW_RATE:-$WEBVIDEO_RTSP_ULTRA_LOW_FPS}"
+
   local sample_base="https://www.c-mor.com/video-surveillance-demo/sample-recordings-of-the-video-surveillance-system-c-mor"
+  local crowd_sample_url="https://assets.mixkit.co/videos/4401/4401-720.mp4"
   local lobby_source="$SAMPLE_FOOTAGE_DIR/source-cctv-lobby-720p.mp4"
   local entrance_source="$SAMPLE_FOOTAGE_DIR/source-cctv-entrance-720p.mp4"
   local floor_source="$SAMPLE_FOOTAGE_DIR/source-cctv-floor-1080p.mp4"
   local parking_source="$SAMPLE_FOOTAGE_DIR/source-cctv-parking-1080p.mp4"
-  local lobby_sample="$SAMPLE_FOOTAGE_DIR/cctv-lobby-720p-30s.mp4"
-  local entrance_sample="$SAMPLE_FOOTAGE_DIR/cctv-entrance-720p-30s.mp4"
-  local floor_sample="$SAMPLE_FOOTAGE_DIR/cctv-floor-1080p-30s.mp4"
-  local parking_sample="$SAMPLE_FOOTAGE_DIR/cctv-parking-4k-30s.mp4"
+  local crowd_source="$SAMPLE_FOOTAGE_DIR/source-cctv-road-crowd-720p.mp4"
+  local lobby_sample="$SAMPLE_FOOTAGE_DIR/cctv-lobby-720p-${lobby_rate}fps-30s.mp4"
+  local entrance_sample="$SAMPLE_FOOTAGE_DIR/cctv-entrance-720p-${entrance_rate}fps-30s.mp4"
+  local floor_sample="$SAMPLE_FOOTAGE_DIR/cctv-floor-1080p-${floor_rate}fps-30s.mp4"
+  local lobby_adaptive_sample="$SAMPLE_FOOTAGE_DIR/cctv-lobby-720p-adaptive-${adaptive_rate}fps-30s.mp4"
+  local entrance_adaptive_sample="$SAMPLE_FOOTAGE_DIR/cctv-entrance-720p-adaptive-${adaptive_rate}fps-30s.mp4"
+  local floor_adaptive_sample="$SAMPLE_FOOTAGE_DIR/cctv-floor-1080p-adaptive-${adaptive_rate}fps-30s.mp4"
+  local lobby_emergency_sample="$SAMPLE_FOOTAGE_DIR/cctv-lobby-720p-emergency-${emergency_rate}fps-30s.mp4"
+  local entrance_emergency_sample="$SAMPLE_FOOTAGE_DIR/cctv-entrance-720p-emergency-${emergency_rate}fps-30s.mp4"
+  local floor_emergency_sample="$SAMPLE_FOOTAGE_DIR/cctv-floor-1080p-emergency-${emergency_rate}fps-30s.mp4"
+  local lobby_ultra_low_sample="$SAMPLE_FOOTAGE_DIR/cctv-lobby-720p-ultra-low-${ultra_low_rate}fps-30s.mp4"
+  local entrance_ultra_low_sample="$SAMPLE_FOOTAGE_DIR/cctv-entrance-720p-ultra-low-${ultra_low_rate}fps-30s.mp4"
+  local floor_ultra_low_sample="$SAMPLE_FOOTAGE_DIR/cctv-floor-1080p-ultra-low-${ultra_low_rate}fps-30s.mp4"
+  local parking_sample="$SAMPLE_FOOTAGE_DIR/cctv-parking-4k-${parking_rate}fps-30s.mp4"
+  local parking_adaptive_sample="$SAMPLE_FOOTAGE_DIR/cctv-parking-1080p-${parking_rate}fps-30s.mp4"
+  local parking_low_sample="$SAMPLE_FOOTAGE_DIR/cctv-parking-720p-${parking_rate}fps-30s.mp4"
+  local parking_emergency_sample="$SAMPLE_FOOTAGE_DIR/cctv-parking-720p-emergency-${emergency_rate}fps-30s.mp4"
+  local parking_ultra_low_sample="$SAMPLE_FOOTAGE_DIR/cctv-parking-720p-ultra-low-${ultra_low_rate}fps-30s.mp4"
+  local crowd_sample="$SAMPLE_FOOTAGE_DIR/cctv-road-crowd-4k60-${crowd_rate}fps-30s.mp4"
+  local crowd_1080p60_sample="$SAMPLE_FOOTAGE_DIR/cctv-road-crowd-1080p60-${crowd_rate}fps-30s.mp4"
+  local crowd_adaptive_sample="$SAMPLE_FOOTAGE_DIR/cctv-road-crowd-1080p24-${crowd_adaptive_rate}fps-30s.mp4"
+  local crowd_720p60_sample="$SAMPLE_FOOTAGE_DIR/cctv-road-crowd-720p60-${crowd_rate}fps-30s.mp4"
+  local crowd_low_sample="$SAMPLE_FOOTAGE_DIR/cctv-road-crowd-720p15-${crowd_low_rate}fps-30s.mp4"
+  local crowd_emergency_sample="$SAMPLE_FOOTAGE_DIR/cctv-road-crowd-720p5-${emergency_rate}fps-30s.mp4"
+  local crowd_ultra_low_sample="$SAMPLE_FOOTAGE_DIR/cctv-road-crowd-720p2-${ultra_low_rate}fps-30s.mp4"
 
   download_if_missing "${sample_base}?download=27:motion-detection-entrance-area" "$lobby_source" "CCTV lobby source sample"
   download_if_missing "${sample_base}?download=29:motion-detection-outside-entrance" "$entrance_source" "CCTV entrance source sample"
   download_if_missing "${sample_base}?download=28:motion-detection-warehouse-door" "$floor_source" "CCTV floor source sample"
-  normalize_sample_footage "$lobby_source" "$lobby_sample" "1280x720" "30" "4000k" "CCTV lobby"
-  normalize_sample_footage "$entrance_source" "$entrance_sample" "1280x720" "30" "4000k" "CCTV entrance"
-  normalize_sample_footage "$floor_source" "$floor_sample" "1920x1080" "30" "7000k" "CCTV floor"
+  normalize_sample_footage "$lobby_source" "$lobby_sample" "1280x720" "$lobby_rate" "4000k" "CCTV lobby"
+  normalize_sample_footage "$entrance_source" "$entrance_sample" "1280x720" "$entrance_rate" "4000k" "CCTV entrance"
+  normalize_sample_footage "$floor_source" "$floor_sample" "1920x1080" "$floor_rate" "7000k" "CCTV floor"
+  normalize_sample_footage "$lobby_source" "$lobby_adaptive_sample" "1280x720" "$adaptive_rate" "2500k" "CCTV lobby adaptive"
+  normalize_sample_footage "$entrance_source" "$entrance_adaptive_sample" "1280x720" "$adaptive_rate" "2500k" "CCTV entrance adaptive"
+  normalize_sample_footage "$floor_source" "$floor_adaptive_sample" "1920x1080" "$adaptive_rate" "4500k" "CCTV floor adaptive"
+  normalize_sample_footage "$lobby_source" "$lobby_emergency_sample" "1280x720" "$emergency_rate" "1500k" "CCTV lobby emergency"
+  normalize_sample_footage "$entrance_source" "$entrance_emergency_sample" "1280x720" "$emergency_rate" "1500k" "CCTV entrance emergency"
+  normalize_sample_footage "$floor_source" "$floor_emergency_sample" "1920x1080" "$emergency_rate" "2500k" "CCTV floor emergency"
+  normalize_sample_footage "$lobby_source" "$lobby_ultra_low_sample" "1280x720" "$ultra_low_rate" "900k" "CCTV lobby ultra low"
+  normalize_sample_footage "$entrance_source" "$entrance_ultra_low_sample" "1280x720" "$ultra_low_rate" "900k" "CCTV entrance ultra low"
+  normalize_sample_footage "$floor_source" "$floor_ultra_low_sample" "1920x1080" "$ultra_low_rate" "1600k" "CCTV floor ultra low"
 
   : "${WEBVIDEO_CCTV_LOBBY_INPUT:=$lobby_sample}"
   : "${WEBVIDEO_CCTV_ENTRANCE_INPUT:=$entrance_sample}"
   : "${WEBVIDEO_CCTV_FLOOR_INPUT:=$floor_sample}"
+  : "${WEBVIDEO_CCTV_LOBBY_ADAPTIVE_INPUT:=$lobby_adaptive_sample}"
+  : "${WEBVIDEO_CCTV_ENTRANCE_ADAPTIVE_INPUT:=$entrance_adaptive_sample}"
+  : "${WEBVIDEO_CCTV_FLOOR_ADAPTIVE_INPUT:=$floor_adaptive_sample}"
+  : "${WEBVIDEO_CCTV_LOBBY_EMERGENCY_INPUT:=$lobby_emergency_sample}"
+  : "${WEBVIDEO_CCTV_ENTRANCE_EMERGENCY_INPUT:=$entrance_emergency_sample}"
+  : "${WEBVIDEO_CCTV_FLOOR_EMERGENCY_INPUT:=$floor_emergency_sample}"
+  : "${WEBVIDEO_CCTV_LOBBY_ULTRA_LOW_INPUT:=$lobby_ultra_low_sample}"
+  : "${WEBVIDEO_CCTV_ENTRANCE_ULTRA_LOW_INPUT:=$entrance_ultra_low_sample}"
+  : "${WEBVIDEO_CCTV_FLOOR_ULTRA_LOW_INPUT:=$floor_ultra_low_sample}"
 
   if is_truthy "$START_4K_RTSP"; then
     download_if_missing "${sample_base}?download=26:motion-detection-computer-room" "$parking_source" "CCTV parking source sample"
-    normalize_sample_footage "$parking_source" "$parking_sample" "3840x2160" "15" "14000k" "CCTV parking 4K"
+    normalize_sample_footage "$parking_source" "$parking_sample" "3840x2160" "$parking_rate" "14000k" "CCTV parking 4K"
+    normalize_sample_footage "$parking_source" "$parking_adaptive_sample" "1920x1080" "$parking_rate" "7000k" "CCTV parking 1080p adaptive"
+    normalize_sample_footage "$parking_source" "$parking_low_sample" "1280x720" "$parking_rate" "3500k" "CCTV parking 720p adaptive"
+    normalize_sample_footage "$parking_source" "$parking_emergency_sample" "1280x720" "$emergency_rate" "1800k" "CCTV parking 720p emergency"
+    normalize_sample_footage "$parking_source" "$parking_ultra_low_sample" "1280x720" "$ultra_low_rate" "1000k" "CCTV parking 720p ultra low"
     : "${WEBVIDEO_CCTV_4K_INPUT:=$parking_sample}"
+    : "${WEBVIDEO_CCTV_4K_ADAPTIVE_INPUT:=$parking_adaptive_sample}"
+    : "${WEBVIDEO_CCTV_4K_LOW_INPUT:=$parking_low_sample}"
+    : "${WEBVIDEO_CCTV_4K_EMERGENCY_INPUT:=$parking_emergency_sample}"
+    : "${WEBVIDEO_CCTV_4K_ULTRA_LOW_INPUT:=$parking_ultra_low_sample}"
+  fi
+
+  if is_truthy "$START_4K_STRESS_RTSP"; then
+    download_if_missing "$crowd_sample_url" "$crowd_source" "CCTV road crowd source sample"
+    normalize_sample_footage "$crowd_source" "$crowd_sample" "3840x2160" "$crowd_rate" "28000k" "CCTV road crowd 4K60"
+    normalize_sample_footage "$crowd_source" "$crowd_1080p60_sample" "1920x1080" "$crowd_rate" "14000k" "CCTV road crowd 1080p60"
+    normalize_sample_footage "$crowd_source" "$crowd_adaptive_sample" "1920x1080" "$crowd_adaptive_rate" "7000k" "CCTV road crowd 1080p adaptive"
+    normalize_sample_footage "$crowd_source" "$crowd_720p60_sample" "1280x720" "$crowd_rate" "7000k" "CCTV road crowd 720p60"
+    normalize_sample_footage "$crowd_source" "$crowd_low_sample" "1280x720" "$crowd_low_rate" "3500k" "CCTV road crowd 720p low"
+    normalize_sample_footage "$crowd_source" "$crowd_emergency_sample" "1280x720" "$emergency_rate" "1800k" "CCTV road crowd 720p emergency"
+    normalize_sample_footage "$crowd_source" "$crowd_ultra_low_sample" "1280x720" "$ultra_low_rate" "1000k" "CCTV road crowd 720p ultra low"
+    : "${WEBVIDEO_CCTV_4K_CROWD_INPUT:=$crowd_sample}"
+    : "${WEBVIDEO_CCTV_4K_CROWD_1080P60_INPUT:=$crowd_1080p60_sample}"
+    : "${WEBVIDEO_CCTV_4K_CROWD_ADAPTIVE_INPUT:=$crowd_adaptive_sample}"
+    : "${WEBVIDEO_CCTV_4K_CROWD_720P60_INPUT:=$crowd_720p60_sample}"
+    : "${WEBVIDEO_CCTV_4K_CROWD_LOW_INPUT:=$crowd_low_sample}"
+    : "${WEBVIDEO_CCTV_4K_CROWD_EMERGENCY_INPUT:=$crowd_emergency_sample}"
+    : "${WEBVIDEO_CCTV_4K_CROWD_ULTRA_LOW_INPUT:=$crowd_ultra_low_sample}"
   fi
 
   export WEBVIDEO_CCTV_LOBBY_INPUT
   export WEBVIDEO_CCTV_ENTRANCE_INPUT
   export WEBVIDEO_CCTV_FLOOR_INPUT
+  export WEBVIDEO_CCTV_LOBBY_ADAPTIVE_INPUT
+  export WEBVIDEO_CCTV_ENTRANCE_ADAPTIVE_INPUT
+  export WEBVIDEO_CCTV_FLOOR_ADAPTIVE_INPUT
+  export WEBVIDEO_CCTV_LOBBY_EMERGENCY_INPUT
+  export WEBVIDEO_CCTV_ENTRANCE_EMERGENCY_INPUT
+  export WEBVIDEO_CCTV_FLOOR_EMERGENCY_INPUT
+  export WEBVIDEO_CCTV_LOBBY_ULTRA_LOW_INPUT
+  export WEBVIDEO_CCTV_ENTRANCE_ULTRA_LOW_INPUT
+  export WEBVIDEO_CCTV_FLOOR_ULTRA_LOW_INPUT
   export WEBVIDEO_CCTV_4K_INPUT
+  export WEBVIDEO_CCTV_4K_ADAPTIVE_INPUT
+  export WEBVIDEO_CCTV_4K_LOW_INPUT
+  export WEBVIDEO_CCTV_4K_EMERGENCY_INPUT
+  export WEBVIDEO_CCTV_4K_ULTRA_LOW_INPUT
+  export WEBVIDEO_CCTV_4K_CROWD_INPUT
+  export WEBVIDEO_CCTV_4K_CROWD_1080P60_INPUT
+  export WEBVIDEO_CCTV_4K_CROWD_ADAPTIVE_INPUT
+  export WEBVIDEO_CCTV_4K_CROWD_720P60_INPUT
+  export WEBVIDEO_CCTV_4K_CROWD_LOW_INPUT
+  export WEBVIDEO_CCTV_4K_CROWD_EMERGENCY_INPUT
+  export WEBVIDEO_CCTV_4K_CROWD_ULTRA_LOW_INPUT
 }
 
 normalize_arch() {
@@ -539,6 +647,26 @@ PY
   fi
 }
 
+create_rtsp_concat_loop_input() {
+  local path=$1
+  local input=$2
+  local repeats="${WEBVIDEO_RTSP_CONCAT_REPEATS:-20}"
+  local concat_file="$RUN_DIR/rtsp-${path}.ffconcat"
+
+  if ! [[ "$repeats" =~ ^[0-9]+$ ]] || [[ "$repeats" -lt 1 ]]; then
+    repeats=20
+  fi
+
+  {
+    printf 'ffconcat version 1.0\n'
+    for _ in $(seq 1 "$repeats"); do
+      printf "file '%s'\n" "$input"
+    done
+  } >"$concat_file"
+
+  printf '%s\n' "$concat_file"
+}
+
 publish_rtsp_source() {
   local path=$1
   local size=$2
@@ -548,13 +676,18 @@ publish_rtsp_source() {
   local input=${6:-}
 
   if should_copy_rtsp_input "$input"; then
+    local concat_input
+    concat_input="$(create_rtsp_concat_loop_input "$path" "$input")"
     echo "Publishing $label with H.264 stream copy from $input."
     "$FFMPEG_BIN" \
       -hide_banner \
       -loglevel warning \
       -re \
+      -fflags +genpts \
+      -f concat \
+      -safe 0 \
       -stream_loop -1 \
-      -i "$input" \
+      -i "$concat_input" \
       -map 0:v:0 \
       -an \
       -c:v copy \
@@ -632,14 +765,26 @@ start_rtsp_source() {
     return 0
   fi
 
+  local lobby_rate="${WEBVIDEO_CCTV_LOBBY_RATE:-$WEBVIDEO_RTSP_FPS}"
+  local entrance_rate="${WEBVIDEO_CCTV_ENTRANCE_RATE:-$WEBVIDEO_RTSP_FPS}"
+  local floor_rate="${WEBVIDEO_CCTV_FLOOR_RATE:-$WEBVIDEO_RTSP_FPS}"
+  local adaptive_rate="${WEBVIDEO_CCTV_ADAPTIVE_RATE:-$WEBVIDEO_RTSP_ADAPTIVE_FPS}"
+  local parking_rate="${WEBVIDEO_CCTV_4K_RATE:-$WEBVIDEO_RTSP_4K_FPS}"
+  local crowd_rate="${WEBVIDEO_CCTV_4K_CROWD_RATE:-$WEBVIDEO_RTSP_4K_STRESS_FPS}"
+  local crowd_adaptive_rate="${WEBVIDEO_CCTV_4K_CROWD_ADAPTIVE_RATE:-$WEBVIDEO_RTSP_4K_STRESS_ADAPTIVE_FPS}"
+  local crowd_low_rate="${WEBVIDEO_CCTV_4K_CROWD_LOW_RATE:-$WEBVIDEO_RTSP_4K_STRESS_LOW_FPS}"
+  local emergency_rate="${WEBVIDEO_CCTV_EMERGENCY_RATE:-$WEBVIDEO_RTSP_EMERGENCY_FPS}"
+  local ultra_low_rate="${WEBVIDEO_CCTV_ULTRA_LOW_RATE:-$WEBVIDEO_RTSP_ULTRA_LOW_FPS}"
+
   ensure_rtsp_tools
   prepare_sample_footage_inputs
 
   cat >"$RTSP_CONFIG" <<EOF
 logLevel: info
+writeQueueSize: ${MEDIAMTX_WRITE_QUEUE_SIZE}
 rtsp: yes
 rtspAddress: :${RTSP_PORT}
-rtspTransports: [udp, tcp]
+rtspTransports: [tcp]
 rtpAddress: :${RTP_PORT}
 rtcpAddress: :${RTCP_PORT}
 rtmp: no
@@ -656,14 +801,42 @@ EOF
 
   wait_for_tcp "127.0.0.1" "$RTSP_PORT" "local RTSP server"
 
-  publish_rtsp_source "cctv-lobby-720p" "1280x720" "30" "4000k" "CCTV Lobby" "${WEBVIDEO_CCTV_LOBBY_INPUT:-}"
-  publish_rtsp_source "cctv-entrance-720p" "1280x720" "30" "4000k" "CCTV Entrance" "${WEBVIDEO_CCTV_ENTRANCE_INPUT:-}"
-  publish_rtsp_source "cctv-floor-1080p" "1920x1080" "30" "7000k" "CCTV Floor" "${WEBVIDEO_CCTV_FLOOR_INPUT:-}"
+  publish_rtsp_source "cctv-lobby-720p" "1280x720" "$lobby_rate" "4000k" "CCTV Lobby" "${WEBVIDEO_CCTV_LOBBY_INPUT:-}"
+  publish_rtsp_source "cctv-entrance-720p" "1280x720" "$entrance_rate" "4000k" "CCTV Entrance" "${WEBVIDEO_CCTV_ENTRANCE_INPUT:-}"
+  publish_rtsp_source "cctv-floor-1080p" "1920x1080" "$floor_rate" "7000k" "CCTV Floor" "${WEBVIDEO_CCTV_FLOOR_INPUT:-}"
+  publish_rtsp_source "cctv-lobby-720p15" "1280x720" "$adaptive_rate" "2500k" "CCTV Lobby adaptive" "${WEBVIDEO_CCTV_LOBBY_ADAPTIVE_INPUT:-}"
+  publish_rtsp_source "cctv-entrance-720p15" "1280x720" "$adaptive_rate" "2500k" "CCTV Entrance adaptive" "${WEBVIDEO_CCTV_ENTRANCE_ADAPTIVE_INPUT:-}"
+  publish_rtsp_source "cctv-floor-1080p15" "1920x1080" "$adaptive_rate" "4500k" "CCTV Floor adaptive" "${WEBVIDEO_CCTV_FLOOR_ADAPTIVE_INPUT:-}"
+  publish_rtsp_source "cctv-lobby-720p5" "1280x720" "$emergency_rate" "1500k" "CCTV Lobby emergency" "${WEBVIDEO_CCTV_LOBBY_EMERGENCY_INPUT:-}"
+  publish_rtsp_source "cctv-entrance-720p5" "1280x720" "$emergency_rate" "1500k" "CCTV Entrance emergency" "${WEBVIDEO_CCTV_ENTRANCE_EMERGENCY_INPUT:-}"
+  publish_rtsp_source "cctv-floor-1080p5" "1920x1080" "$emergency_rate" "2500k" "CCTV Floor emergency" "${WEBVIDEO_CCTV_FLOOR_EMERGENCY_INPUT:-}"
+  publish_rtsp_source "cctv-lobby-720p2" "1280x720" "$ultra_low_rate" "900k" "CCTV Lobby ultra low" "${WEBVIDEO_CCTV_LOBBY_ULTRA_LOW_INPUT:-}"
+  publish_rtsp_source "cctv-entrance-720p2" "1280x720" "$ultra_low_rate" "900k" "CCTV Entrance ultra low" "${WEBVIDEO_CCTV_ENTRANCE_ULTRA_LOW_INPUT:-}"
+  publish_rtsp_source "cctv-floor-1080p2" "1920x1080" "$ultra_low_rate" "1600k" "CCTV Floor ultra low" "${WEBVIDEO_CCTV_FLOOR_ULTRA_LOW_INPUT:-}"
 
   if is_truthy "$START_4K_RTSP"; then
-    publish_rtsp_source "cctv-parking-4k" "3840x2160" "15" "14000k" "CCTV Parking 4K" "${WEBVIDEO_CCTV_4K_INPUT:-}"
+    publish_rtsp_source "cctv-parking-4k" "3840x2160" "$parking_rate" "14000k" "CCTV Parking 4K" "${WEBVIDEO_CCTV_4K_INPUT:-}"
+    publish_rtsp_source "cctv-parking-1080p15" "1920x1080" "$parking_rate" "7000k" "CCTV Parking 1080p adaptive" "${WEBVIDEO_CCTV_4K_ADAPTIVE_INPUT:-}"
+    publish_rtsp_source "cctv-parking-720p15" "1280x720" "$parking_rate" "3500k" "CCTV Parking 720p adaptive" "${WEBVIDEO_CCTV_4K_LOW_INPUT:-}"
+    publish_rtsp_source "cctv-parking-720p5" "1280x720" "$emergency_rate" "1800k" "CCTV Parking 720p emergency" "${WEBVIDEO_CCTV_4K_EMERGENCY_INPUT:-}"
+    publish_rtsp_source "cctv-parking-720p2" "1280x720" "$ultra_low_rate" "1000k" "CCTV Parking 720p ultra low" "${WEBVIDEO_CCTV_4K_ULTRA_LOW_INPUT:-}"
   fi
 
+  if is_truthy "$START_4K_STRESS_RTSP"; then
+    publish_rtsp_source "cctv-road-crowd-4k60" "3840x2160" "$crowd_rate" "28000k" "CCTV Road Crowd 4K60" "${WEBVIDEO_CCTV_4K_CROWD_INPUT:-}"
+    publish_rtsp_source "cctv-road-crowd-1080p60" "1920x1080" "$crowd_rate" "14000k" "CCTV Road Crowd 1080p60" "${WEBVIDEO_CCTV_4K_CROWD_1080P60_INPUT:-}"
+    publish_rtsp_source "cctv-road-crowd-1080p24" "1920x1080" "$crowd_adaptive_rate" "7000k" "CCTV Road Crowd 1080p adaptive" "${WEBVIDEO_CCTV_4K_CROWD_ADAPTIVE_INPUT:-}"
+    publish_rtsp_source "cctv-road-crowd-720p60" "1280x720" "$crowd_rate" "7000k" "CCTV Road Crowd 720p60" "${WEBVIDEO_CCTV_4K_CROWD_720P60_INPUT:-}"
+    publish_rtsp_source "cctv-road-crowd-720p15" "1280x720" "$crowd_low_rate" "3500k" "CCTV Road Crowd 720p low" "${WEBVIDEO_CCTV_4K_CROWD_LOW_INPUT:-}"
+    publish_rtsp_source "cctv-road-crowd-720p5" "1280x720" "$emergency_rate" "1800k" "CCTV Road Crowd 720p emergency" "${WEBVIDEO_CCTV_4K_CROWD_EMERGENCY_INPUT:-}"
+    publish_rtsp_source "cctv-road-crowd-720p2" "1280x720" "$ultra_low_rate" "1000k" "CCTV Road Crowd 720p ultra low" "${WEBVIDEO_CCTV_4K_CROWD_ULTRA_LOW_INPUT:-}"
+  fi
+
+  export WEBVIDEO_CHANNEL_001_FRAMERATE="${WEBVIDEO_CHANNEL_001_FRAMERATE:-$lobby_rate}"
+  export WEBVIDEO_CHANNEL_002_FRAMERATE="${WEBVIDEO_CHANNEL_002_FRAMERATE:-$entrance_rate}"
+  export WEBVIDEO_CHANNEL_003_FRAMERATE="${WEBVIDEO_CHANNEL_003_FRAMERATE:-$floor_rate}"
+  export WEBVIDEO_CHANNEL_4K_FRAMERATE="${WEBVIDEO_CHANNEL_4K_FRAMERATE:-$parking_rate}"
+  export WEBVIDEO_CHANNEL_4K_CROWD_FRAMERATE="${WEBVIDEO_CHANNEL_4K_CROWD_FRAMERATE:-$crowd_rate}"
   export WEBVIDEO_RTSP_CAPTURE=1
   export WEBVIDEO_RTSP_CAPTURE_REQUIRED=1
   export WEBVIDEO_FFMPEG_BIN="$FFMPEG_BIN"
@@ -695,6 +868,9 @@ if [[ "$SETUP_SAMPLE_FOOTAGE_ONLY" == "1" || "$SETUP_SAMPLE_FOOTAGE_ONLY" == "tr
   if [[ -n "${WEBVIDEO_CCTV_4K_INPUT:-}" ]]; then
     echo "  4K:       $WEBVIDEO_CCTV_4K_INPUT"
   fi
+  if [[ -n "${WEBVIDEO_CCTV_4K_CROWD_INPUT:-}" ]]; then
+    echo "  4K crowd: $WEBVIDEO_CCTV_4K_CROWD_INPUT"
+  fi
   exit 0
 fi
 
@@ -714,8 +890,14 @@ ensure_quic_runtime
   >"$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 
-"$NPM_BIN" --prefix "$ROOT_DIR/frontend" run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT" \
-  >"$FRONTEND_LOG" 2>&1 &
+if [[ "$WEBVIDEO_FRONTEND_MODE" == "dev" || "$WEBVIDEO_FRONTEND_MODE" == "development" ]]; then
+  "$NPM_BIN" --prefix "$ROOT_DIR/frontend" run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT" \
+    >"$FRONTEND_LOG" 2>&1 &
+else
+  "$NPM_BIN" --prefix "$ROOT_DIR/frontend" run build >>"$FRONTEND_LOG" 2>&1
+  "$NPM_BIN" --prefix "$ROOT_DIR/frontend" run preview -- --host 127.0.0.1 --port "$FRONTEND_PORT" \
+    >"$FRONTEND_LOG" 2>&1 &
+fi
 FRONTEND_PID=$!
 
 wait_for_http "http://127.0.0.1:${BACKEND_PORT}/healthz" "backend"
@@ -723,22 +905,48 @@ wait_for_http "http://127.0.0.1:${FRONTEND_PORT}/live-demo.html" "frontend"
 
 echo
 echo "WebVideo demo is running."
+echo "Frontend mode:  $WEBVIDEO_FRONTEND_MODE"
 echo "VMS client:     http://127.0.0.1:${FRONTEND_PORT}/vms.html"
 if command -v chrome-webgpu >/dev/null 2>&1; then
   echo "WebGPU Chrome:  chrome-webgpu http://127.0.0.1:${FRONTEND_PORT}/vms.html"
 else
-  echo "WebGPU Chrome:  launch Chrome with Vulkan,VulkanFromANGLE,DefaultANGLEVulkan for the fast path"
+  echo "WebGPU Chrome:  launch Chrome with --enable-unsafe-webgpu --ignore-gpu-blocklist --enable-features=Vulkan,VulkanFromANGLE"
 fi
 echo "Frontend page: http://127.0.0.1:${FRONTEND_PORT}/live-demo.html?channel=${DEMO_CHANNEL_ID}"
 echo "Tile wall:     http://127.0.0.1:${FRONTEND_PORT}/tile-wall.html?channels=channel-001,channel-002,channel-003"
+if is_truthy "$START_4K_RTSP"; then
+  echo "4K tile wall:  http://127.0.0.1:${FRONTEND_PORT}/tile-wall.html?channels=channel-4k,channel-4k-crowd&frames=1"
+fi
 echo "Backend channels: http://127.0.0.1:${BACKEND_PORT}/api/demo/channels"
 echo "WebTransport:    https://127.0.0.1:${WEBTRANSPORT_PORT}/live/${DEMO_CHANNEL_ID}"
 echo "RTSP sources:"
 echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-lobby-720p"
 echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-entrance-720p"
 echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-floor-1080p"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-lobby-720p15"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-entrance-720p15"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-floor-1080p15"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-lobby-720p5"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-entrance-720p5"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-floor-1080p5"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-lobby-720p2"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-entrance-720p2"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-floor-1080p2"
 if is_truthy "$START_4K_RTSP"; then
   echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-parking-4k"
+  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-parking-1080p15"
+  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-parking-720p15"
+  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-parking-720p5"
+  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-parking-720p2"
+fi
+if is_truthy "$START_4K_STRESS_RTSP"; then
+  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-road-crowd-4k60"
+  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-road-crowd-1080p60"
+  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-road-crowd-1080p24"
+  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-road-crowd-720p60"
+  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-road-crowd-720p15"
+  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-road-crowd-720p5"
+  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-road-crowd-720p2"
 fi
 echo "Logs:"
 echo "  $BACKEND_LOG"

@@ -14,7 +14,13 @@ public sealed record BrowserDemoWebTransportOpenRequest(
     int? TargetLatencyMs,
     bool? EnableMetadata,
     int? FrameCount = null,
-    string? StreamMode = null);
+    string? StreamMode = null,
+    double? DesiredEgressFrameRate = null,
+    int? DesiredMaxCodedWidth = null,
+    int? DesiredMaxCodedHeight = null,
+    int? ChaosDisconnectAfterFrames = null,
+    int? ChaosFrameDelayMs = null,
+    int? ChaosDropEveryNFrames = null);
 
 public static class BrowserDemoWebTransportFrameCodec
 {
@@ -70,7 +76,15 @@ public static class BrowserDemoWebTransportFrameCodec
     }
 
     public static BrowserDemoSessionOpenRequest ToSessionOpenRequest(BrowserDemoWebTransportOpenRequest request)
-        => new(request.ViewerId, request.AuthToken, request.TargetLatencyMs, request.EnableMetadata, request.FrameCount);
+        => new(
+            request.ViewerId,
+            request.AuthToken,
+            request.TargetLatencyMs,
+            request.EnableMetadata,
+            request.FrameCount,
+            request.DesiredEgressFrameRate,
+            request.DesiredMaxCodedWidth,
+            request.DesiredMaxCodedHeight);
 
     public static async ValueTask<BrowserDemoWebTransportOpenRequest> ReadOpenRequestAsync(
         PipeReader reader,
@@ -132,14 +146,45 @@ public static class BrowserDemoWebTransportFrameCodec
     {
         var streamIdBytes = Encoding.UTF8.GetBytes(message.StreamId);
         var codecConfigVersionBytes = Encoding.UTF8.GetBytes(message.CodecConfigVersion);
+        await WriteMoqVideoObjectFrameAsync(
+            writer,
+            streamIdBytes,
+            message.SequenceNumber,
+            message.PresentationTimestampUs,
+            message.DecodeTimestampUs,
+            message.SourceTimestampUnixTimeMs,
+            message.ServerTimestampUnixTimeMs,
+            message.KeyFrame,
+            codecConfigVersionBytes,
+            message.Payload,
+            groupId,
+            objectId,
+            cancellationToken);
+    }
+
+    public static async Task WriteMoqVideoObjectFrameAsync(
+        PipeWriter writer,
+        ReadOnlyMemory<byte> streamIdBytes,
+        long sequenceNumber,
+        long presentationTimestampUs,
+        long decodeTimestampUs,
+        long sourceTimestampUnixTimeMs,
+        long serverTimestampUnixTimeMs,
+        bool keyFrame,
+        ReadOnlyMemory<byte> codecConfigVersionBytes,
+        ReadOnlyMemory<byte> payload,
+        long groupId,
+        long objectId,
+        CancellationToken cancellationToken)
+    {
         if (streamIdBytes.Length > ushort.MaxValue || codecConfigVersionBytes.Length > ushort.MaxValue)
         {
             throw new InvalidOperationException("MoQ video object string fields exceed UInt16 length.");
         }
 
-        var payloadLength = checked((uint)message.Payload.Length);
-        var totalLength = checked(MoqVideoObjectFrameHeaderLength + streamIdBytes.Length + codecConfigVersionBytes.Length + message.Payload.Length);
-        var target = writer.GetSpan(totalLength);
+        var payloadLength = checked((uint)payload.Length);
+        var headerLength = checked(MoqVideoObjectFrameHeaderLength + streamIdBytes.Length + codecConfigVersionBytes.Length);
+        var target = writer.GetSpan(headerLength);
         var offset = 0;
 
         target[offset++] = (byte)'M';
@@ -148,7 +193,7 @@ public static class BrowserDemoWebTransportFrameCodec
         target[offset++] = (byte)'L';
         target[offset++] = MoqVideoObjectFrameVersion;
         target[offset++] = MoqVideoObjectFrameKind;
-        target[offset++] = message.KeyFrame ? (byte)1 : (byte)0;
+        target[offset++] = keyFrame ? (byte)1 : (byte)0;
         target[offset++] = 0; // Publisher Priority. Zero is highest priority in the current MoQ drafts.
 
         BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), 1); // Track Alias
@@ -159,15 +204,15 @@ public static class BrowserDemoWebTransportFrameCodec
         offset += sizeof(long);
         BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), 0); // Subgroup ID
         offset += sizeof(long);
-        BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), message.SequenceNumber);
+        BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), sequenceNumber);
         offset += sizeof(long);
-        BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), message.PresentationTimestampUs);
+        BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), presentationTimestampUs);
         offset += sizeof(long);
-        BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), message.DecodeTimestampUs);
+        BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), decodeTimestampUs);
         offset += sizeof(long);
-        BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), message.SourceTimestampUnixTimeMs);
+        BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), sourceTimestampUnixTimeMs);
         offset += sizeof(long);
-        BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), message.ServerTimestampUnixTimeMs);
+        BinaryPrimitives.WriteInt64LittleEndian(target.Slice(offset, sizeof(long)), serverTimestampUnixTimeMs);
         offset += sizeof(long);
         BinaryPrimitives.WriteUInt32LittleEndian(target.Slice(offset, sizeof(uint)), payloadLength);
         offset += sizeof(uint);
@@ -176,16 +221,30 @@ public static class BrowserDemoWebTransportFrameCodec
         BinaryPrimitives.WriteUInt16LittleEndian(target.Slice(offset, sizeof(ushort)), (ushort)codecConfigVersionBytes.Length);
         offset += sizeof(ushort);
 
-        streamIdBytes.CopyTo(target.Slice(offset, streamIdBytes.Length));
+        streamIdBytes.Span.CopyTo(target.Slice(offset, streamIdBytes.Length));
         offset += streamIdBytes.Length;
-        codecConfigVersionBytes.CopyTo(target.Slice(offset, codecConfigVersionBytes.Length));
+        codecConfigVersionBytes.Span.CopyTo(target.Slice(offset, codecConfigVersionBytes.Length));
         offset += codecConfigVersionBytes.Length;
-        message.Payload.CopyTo(target.Slice(offset, message.Payload.Length));
-        offset += message.Payload.Length;
 
         writer.Advance(offset);
-        await writer.FlushAsync(cancellationToken);
+        if (payload.Length > 0)
+        {
+            await writer.WriteAsync(payload, cancellationToken);
+        }
+        else
+        {
+            await writer.FlushAsync(cancellationToken);
+        }
     }
+
+    public static long ComputeMoqVideoObjectFrameLength(
+        int streamIdBytesLength,
+        int codecConfigVersionBytesLength,
+        int payloadBytesLength)
+        => checked(MoqVideoObjectFrameHeaderLength
+            + streamIdBytesLength
+            + codecConfigVersionBytesLength
+            + payloadBytesLength);
 
     public static async Task WriteMetadataFrameAsync(
         PipeWriter writer,
@@ -196,6 +255,24 @@ public static class BrowserDemoWebTransportFrameCodec
         {
             kind = "metadata",
             message
+        }, cancellationToken);
+    }
+
+    public static async Task WriteSelectedSourceFrameAsync(
+        PipeWriter writer,
+        BrowserDemoChannelSummary channel,
+        CancellationToken cancellationToken)
+    {
+        await WriteFrameAsync(writer, new
+        {
+            kind = "source",
+            message = new
+            {
+                channel.ChannelId,
+                channel.StreamId,
+                channel.SourceRtspUrl,
+                channel.Codec
+            }
         }, cancellationToken);
     }
 
