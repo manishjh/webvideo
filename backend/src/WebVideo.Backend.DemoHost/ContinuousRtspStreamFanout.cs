@@ -697,12 +697,12 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
         {
             if (targetLatencyMs is null or <= 0)
             {
-                return MaxSubscriberQueue;
+                return Math.Min(6, MaxSubscriberQueue);
             }
 
             var framesInBudget = (int)Math.Ceiling(targetLatencyMs.Value * _frameRate / 1000.0);
-            var burstCushionFrames = Math.Max(framesInBudget * 3, (int)Math.Ceiling(_frameRate * 0.75));
-            return Math.Clamp(burstCushionFrames, 4, MaxSubscriberQueue);
+            var burstCushionFrames = framesInBudget + 2;
+            return Math.Clamp(burstCushionFrames, 2, MaxSubscriberQueue);
         }
 
         private sealed class SubscriberState

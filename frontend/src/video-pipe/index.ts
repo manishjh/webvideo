@@ -1,5 +1,4 @@
 export {
-  LiveDecodedFrameQueue,
   resolveAdaptiveRenderDurationPressureSeverity,
   resolveEffectiveRenderFrameRate,
   resolveEffectiveSourceEgressFrameRate,
@@ -8,6 +7,11 @@ export {
   VideoPipePlayerController,
   waitForNextPaint,
 } from "./playerController";
+export {
+  LiveDecodedFrameQueue,
+  LiveRenderTimingController,
+  resolveLiveRenderPlayoutDelayMs,
+} from "./renderTimingBuffer";
 export {
   AdaptiveRenderCadence,
   AdaptiveRenderFrameGovernor,

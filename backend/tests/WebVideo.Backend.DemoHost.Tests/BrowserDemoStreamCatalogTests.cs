@@ -246,6 +246,37 @@ public sealed class BrowserDemoStreamCatalogTests
     }
 
     [Fact]
+    public void Continuous_annex_b_parser_keeps_no_aud_multislice_frames_together()
+    {
+        byte[] annexB =
+        [
+            0, 0, 0, 1, 0x41, 0x80,
+            0, 0, 0, 1, 0x41, 0x40,
+            0, 0, 0, 1, 0x41, 0x80
+        ];
+        var parser = new ContinuousRtspAccessUnitStreamParser();
+
+        _ = parser.Append(annexB);
+        var accessUnits = parser.Flush();
+
+        Assert.Equal(2, accessUnits.Count);
+        var first = accessUnits[0];
+        Assert.Equal(
+            [
+                0, 0, 0, 1, 0x41, 0x80,
+                0, 0, 0, 1, 0x41, 0x40
+            ],
+            first.Payload);
+
+        var final = accessUnits[1];
+        Assert.Equal(
+            [
+                0, 0, 0, 1, 0x41, 0x80
+            ],
+            final.Payload);
+    }
+
+    [Fact]
     public void WebTransport_frame_codec_serializes_video_metadata_and_end_frames()
     {
         var catalog = new BrowserDemoStreamCatalog();
@@ -392,7 +423,7 @@ public sealed class BrowserDemoStreamCatalogTests
     }
 
     [Fact]
-    public async Task Continuous_fanout_absorbs_short_low_fps_source_bursts()
+    public async Task Continuous_fanout_bounds_short_low_fps_source_bursts_to_latency_budget()
     {
         await using var fanout = new ContinuousRtspStreamFanout(
             CreateSingleRunSource(CreateAnnexBAccessUnitSequence(10)),
@@ -406,11 +437,11 @@ public sealed class BrowserDemoStreamCatalogTests
                 && metrics.FramesPublished >= 10
                 && metrics.SubscriberCount == 1
                 && metrics.Subscribers.Count == 1
-                && metrics.Subscribers[0].PendingFrames >= 10);
+                && metrics.SubscriberFramesDropped > 0);
 
-        Assert.Equal(0, metrics.SubscriberFramesDropped);
+        Assert.True(metrics.SubscriberFramesDropped > 0);
         Assert.Single(metrics.Subscribers);
-        Assert.InRange(metrics.Subscribers[0].PendingFrames, 10, 12);
+        Assert.InRange(metrics.Subscribers[0].PendingFrames, 0, 5);
     }
 
     [Fact]

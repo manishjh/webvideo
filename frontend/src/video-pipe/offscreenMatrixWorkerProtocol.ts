@@ -15,6 +15,8 @@ export interface OffscreenMatrixSlotLayout {
 export interface OffscreenMatrixOptions {
   uploadMode: "auto" | "external" | "copy";
   presentMode: "immediate";
+  retainMode?: "auto" | "backing" | "swapchain";
+  powerPreference?: "high-performance" | "low-power";
 }
 
 export type OffscreenMatrixWorkerRequest =
@@ -25,6 +27,11 @@ export type OffscreenMatrixWorkerRequest =
     canvasHeight: number;
     slots: OffscreenMatrixSlotLayout[];
     options: OffscreenMatrixOptions;
+  }
+  | {
+    type: "connect-render-port";
+    canvasId: string;
+    port: MessagePort;
   }
   | {
     type: "layout";
@@ -60,6 +67,12 @@ export interface OffscreenMatrixRenderResult {
   matrixBindGroupCount: number;
   matrixVideoFrameCopyCount: number;
   matrixLastDirtySlotCount: number;
+  renderMs?: number;
+  importExternalTextureMs?: number;
+  bindGroupMs?: number;
+  uniformMs?: number;
+  encodeMs?: number;
+  submitMs?: number;
   gpuPresentation: string;
   gpuUploadSource: string;
   gpuAdapterVendor?: string;
@@ -67,6 +80,29 @@ export interface OffscreenMatrixRenderResult {
   matrixFallbackReason?: string;
   webGpuDisabledReason?: string;
 }
+
+export type OffscreenMatrixRenderPortRequest =
+  | {
+    type: "render";
+    requestId: number;
+    frame: DecodedFramePlan;
+    activeMetadata: TimedMetadataBatch[];
+  }
+  | {
+    type: "stop";
+  };
+
+export type OffscreenMatrixRenderPortResponse =
+  | {
+    type: "rendered";
+    requestId: number;
+    result: OffscreenMatrixRenderResult;
+  }
+  | {
+    type: "error";
+    requestId?: number;
+    message: string;
+  };
 
 export type OffscreenMatrixWorkerResponse =
   | {

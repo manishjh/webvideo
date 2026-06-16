@@ -11,6 +11,7 @@ Documents:
 - [Scaling and Fanout](./scaling-and-fanout.md)
 - [Implementation Plan](./implementation-plan.md)
 - [Architecture Diagrams](./architecture-diagrams.md)
+- [Current Renderer](./current-renderer.md)
 - [Future Options](./future-options.md)
 - [Local RTSP Runbook](./implementation-notes/synthetic-rtsp-runbook.md)
 - [VMS Benchmark Snapshot](./implementation-notes/vms-benchmark.md)

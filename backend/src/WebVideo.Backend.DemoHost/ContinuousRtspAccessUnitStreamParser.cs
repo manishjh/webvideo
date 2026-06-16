@@ -74,6 +74,9 @@ internal sealed class ContinuousRtspAccessUnitStreamParser
         var nalType = _buffer[header] & 0x1F;
         var isAccessUnitDelimiter = nalType == 9;
         var isVideoSlice = nalType is 1 or 5;
+        var firstMacroblockInSlice = isVideoSlice
+            ? TryReadFirstMacroblockInSlice(_buffer.AsSpan(header + 1, nalEnd - header - 1))
+            : null;
 
         if (isAccessUnitDelimiter)
         {
@@ -91,7 +94,7 @@ internal sealed class ContinuousRtspAccessUnitStreamParser
         {
             _currentAccessUnitStart = nalStart;
         }
-        else if (!_hasSeenAccessUnitDelimiter && isVideoSlice && _currentHasVideoSlice)
+        else if (!_hasSeenAccessUnitDelimiter && isVideoSlice && _currentHasVideoSlice && firstMacroblockInSlice == 0)
         {
             EmitCurrentAccessUnit(nalStart, units);
             _currentAccessUnitStart = nalStart;
@@ -188,4 +191,84 @@ internal sealed class ContinuousRtspAccessUnitStreamParser
 
     private static int StartCodeLength(byte[] bytes, int start)
         => bytes[start + 2] == 1 ? 3 : 4;
+
+    private static int? TryReadFirstMacroblockInSlice(ReadOnlySpan<byte> nalPayload)
+    {
+        Span<byte> rbsp = nalPayload.Length <= 4096 ? stackalloc byte[nalPayload.Length] : new byte[nalPayload.Length];
+        var length = 0;
+
+        for (var index = 0; index < nalPayload.Length; index++)
+        {
+            if (index >= 2 && nalPayload[index] == 0x03 && nalPayload[index - 1] == 0x00 && nalPayload[index - 2] == 0x00)
+            {
+                continue;
+            }
+
+            rbsp[length++] = nalPayload[index];
+        }
+
+        var reader = new BitReader(rbsp[..length]);
+        return reader.TryReadUnsignedExpGolomb(out var value) ? value : null;
+    }
+
+    private ref struct BitReader
+    {
+        private readonly ReadOnlySpan<byte> _bytes;
+        private int _bitOffset;
+
+        public BitReader(ReadOnlySpan<byte> bytes)
+        {
+            _bytes = bytes;
+            _bitOffset = 0;
+        }
+
+        public bool TryReadUnsignedExpGolomb(out int value)
+        {
+            value = 0;
+            var leadingZeroBits = 0;
+
+            while (TryReadBit(out var bit))
+            {
+                if (bit)
+                {
+                    var suffix = 0;
+                    for (var index = 0; index < leadingZeroBits; index++)
+                    {
+                        if (!TryReadBit(out var suffixBit))
+                        {
+                            return false;
+                        }
+
+                        suffix = (suffix << 1) | (suffixBit ? 1 : 0);
+                    }
+
+                    value = ((1 << leadingZeroBits) - 1) + suffix;
+                    return true;
+                }
+
+                leadingZeroBits++;
+                if (leadingZeroBits > 30)
+                {
+                    return false;
+                }
+            }
+
+            return false;
+        }
+
+        private bool TryReadBit(out bool bit)
+        {
+            bit = false;
+            if (_bitOffset >= _bytes.Length * 8)
+            {
+                return false;
+            }
+
+            var byteIndex = _bitOffset / 8;
+            var bitIndex = 7 - (_bitOffset % 8);
+            bit = ((_bytes[byteIndex] >> bitIndex) & 1) == 1;
+            _bitOffset++;
+            return true;
+        }
+    }
 }

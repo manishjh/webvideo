@@ -181,6 +181,12 @@ START_RTSP=1 WEBVIDEO_SAMPLE_FOOTAGE=1 ./start.sh
 chrome-webgpu http://127.0.0.1:4173/vms.html
 ```
 
+To test the experimental Chrome video-decode flags alongside the known-good WebGPU Vulkan path:
+
+```bash
+CHROME_WEBGPU_PRESET=video-strict-vulkan chrome-webgpu http://127.0.0.1:4173/vms.html
+```
+
 Add `channel-4k-crowd`, `channel-13535786`, and `channel-15116604` from the VMS page. For heavier stress, add more downloaded clips such as `channel-15300856` or duplicate `channel-4k-crowd`. You can add the same channel more than once; duplicate views share one WebTransport/WebCodecs decode session for that channel and render into separate tile viewports. For the hardware path, each active tile should report a non-software adapter and a WebGPU canvas path. The default fast path reports `external-texture / worker-offscreen-webgpu-canvas`: a worker owns WebTransport receive, MoQ parsing, WebCodecs decode, and an OffscreenCanvas WebGPU renderer for the tile. Use `?offscreen=0` only for main-thread comparison. Watch source FPS, render FPS, source-to-render p95, frame p95, server drops, client drops, sequence gaps, and hitches. Use the collapsed tile strip for live scanning; expand "stats" only when you need full diagnostics.
 
 If normal Chrome reports `canvas2d-fallback` with a disabled software adapter, that is expected protection against the slow SwiftShader WebGPU path. Use `chrome-webgpu` for hardware WebGPU validation on the local Linux setup.
@@ -229,6 +235,17 @@ WEBVIDEO_TEST_PROFILE=hardware-long scripts/test-all.sh
 WEBVIDEO_TEST_PROFILE=hardware-mixed-4k-long scripts/test-all.sh
 WEBVIDEO_TEST_PROFILE=hardware-duplicate-4k60-profile scripts/test-all.sh
 ```
+
+For targeted 4K60 profiling, `scripts/profile-vms.sh` accepts these useful knobs:
+
+```bash
+WEBVIDEO_CHROME_WEBGPU_PRESET=video-strict-vulkan ./scripts/profile-vms.sh
+WEBVIDEO_VMS_MATRIX_RETAIN=swapchain ./scripts/profile-vms.sh
+WEBVIDEO_VMS_MATRIX_RETAIN=backing ./scripts/profile-vms.sh
+WEBVIDEO_VMS_PREDECODE_ADMISSION=1 ./scripts/profile-vms.sh
+```
+
+`matrixRetain=auto` is the default: one-slot/full-redraw matrix passes render directly to the swapchain, while partial multi-tile updates use the retained backing texture. `WEBVIDEO_VMS_PREDECODE_ADMISSION=1` is diagnostic-only and drops only AVC non-reference frames before decode when render/import service time is over budget.
 
 That test samples three simultaneous VMS tiles across the 30-second sample-footage loop boundary, asserts continued frame/message progress, render FPS, source-to-render and receive-to-render budgets, fresh backend fanout metrics, bounded subscriber queues, and hardware WebGPU fast-path diagnostics when `WEBVIDEO_REQUIRE_HARDWARE_WEBGPU=1`.
 

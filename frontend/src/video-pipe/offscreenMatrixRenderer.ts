@@ -19,6 +19,12 @@ interface PendingRender {
   resolve: (result: RenderFrameResult) => void;
 }
 
+export interface OffscreenMatrixWorkerRenderTarget {
+  canvasId: string;
+  port: MessagePort;
+  release: () => void;
+}
+
 const managers = new Map<string, OffscreenMatrixViewportManager>();
 
 export function createOffscreenMatrixTileRenderer(
@@ -26,6 +32,19 @@ export function createOffscreenMatrixTileRenderer(
   getCanvasIds: () => string[],
 ): VideoPipeFrameRenderer {
   return new OffscreenMatrixTileRenderer(getOffscreenMatrixViewportManager(matrixCanvasId, getCanvasIds));
+}
+
+export async function createOffscreenMatrixRenderTarget(
+  matrixCanvasId: string,
+  getCanvasIds: () => string[],
+  configuration: SurfaceConfigurationPlan,
+): Promise<OffscreenMatrixWorkerRenderTarget | undefined> {
+  const manager = getOffscreenMatrixViewportManager(matrixCanvasId, getCanvasIds);
+  if (!manager.canUseOffscreen()) {
+    return undefined;
+  }
+
+  return await manager.createRenderTarget(configuration);
 }
 
 export function shouldUseOffscreenMatrixViewport(): boolean {
@@ -159,6 +178,25 @@ class OffscreenMatrixViewportManager {
     await this.ensureStarted();
     this.observeLayout();
     this.syncLayout();
+  }
+
+  public async createRenderTarget(configuration: SurfaceConfigurationPlan): Promise<OffscreenMatrixWorkerRenderTarget> {
+    if (typeof MessageChannel === "undefined") {
+      return Promise.reject(new Error("MessageChannel is unavailable for offscreen matrix rendering."));
+    }
+
+    await this.registerSurface(configuration);
+    const channel = new MessageChannel();
+    this.post({
+      type: "connect-render-port",
+      canvasId: configuration.canvasId,
+      port: channel.port1,
+    }, [channel.port1]);
+    return {
+      canvasId: configuration.canvasId,
+      port: channel.port2,
+      release: () => this.unregisterSurface(configuration.canvasId),
+    };
   }
 
   public unregisterSurface(canvasId: string): void {
@@ -385,6 +423,7 @@ class OffscreenMatrixViewportManager {
     const canvas = this.lookupMatrixCanvas();
     if (canvas) {
       this.prepareMatrixCanvas(canvas, layout.canvasWidth, layout.canvasHeight);
+      canvas.dataset.matrixSlotCount = String(layout.slots.length);
     }
     this.post({
       type: "layout",
@@ -558,8 +597,18 @@ function lookupCanvas(canvasId: string): HTMLCanvasElement | null {
 function readMatrixOptions(): OffscreenMatrixOptions {
   const params = new URLSearchParams(window.location.search);
   const uploadMode = params.get("matrixTexture")?.toLowerCase();
+  const retainMode = params.get("matrixRetain")?.toLowerCase();
   return {
     uploadMode: uploadMode === "copy" || uploadMode === "external" ? uploadMode : "auto",
     presentMode: "immediate",
+    retainMode: retainMode === "backing" || retainMode === "swapchain" ? retainMode : "auto",
+    powerPreference: readGpuPowerPreference(params),
   };
+}
+
+function readGpuPowerPreference(params: URLSearchParams): "high-performance" | "low-power" {
+  const mode = (params.get("webgpuPower") ?? params.get("gpuPower") ?? "").toLowerCase();
+  return ["low", "low-power", "integrated", "intel"].includes(mode)
+    ? "low-power"
+    : "high-performance";
 }

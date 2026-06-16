@@ -199,7 +199,7 @@ test.describe("VMS profiling", () => {
         }
         if (requireHardwareWebGpu) {
           expect(finalTile?.renderBackend, `${target.tileId} render backend`).toBe("webgpu");
-          expect(["external-texture", "videoframe-copy"], `${target.tileId} GPU upload source`).toContain(finalTile?.canvasGpuUploadSource);
+          expect(["external-texture", "videoframe-copy", "videoframe-bitmap-copy"], `${target.tileId} GPU upload source`).toContain(finalTile?.canvasGpuUploadSource);
           expect(["webgpu-canvas", "worker-offscreen-webgpu-canvas", "worker-offscreen-matrix-canvas"], `${target.tileId} GPU presentation`).toContain(finalTile?.canvasGpuPresentation);
           expect(finalTile?.canvasGpuAdapterVendor && finalTile.canvasGpuAdapterVendor !== "google", `${target.tileId} GPU vendor`).toBe(true);
           expect(finalTile?.canvasGpuAdapterArchitecture && finalTile.canvasGpuAdapterArchitecture !== "swiftshader", `${target.tileId} GPU architecture`).toBe(true);
@@ -572,6 +572,9 @@ function createVmsQuery(): string {
   if (process.env.WEBVIDEO_VMS_MATRIX_TEXTURE) {
     params.set("matrixTexture", process.env.WEBVIDEO_VMS_MATRIX_TEXTURE);
   }
+  if (process.env.WEBVIDEO_VMS_MATRIX_RETAIN) {
+    params.set("matrixRetain", process.env.WEBVIDEO_VMS_MATRIX_RETAIN);
+  }
   if (process.env.WEBVIDEO_VMS_MEDIA_WORKER) {
     params.set("mediaWorker", process.env.WEBVIDEO_VMS_MEDIA_WORKER);
   }
@@ -580,6 +583,18 @@ function createVmsQuery(): string {
   }
   if (process.env.WEBVIDEO_VMS_OFFSCREEN) {
     params.set("offscreen", process.env.WEBVIDEO_VMS_OFFSCREEN);
+  }
+  if (process.env.WEBVIDEO_VMS_OFFSCREEN_VIEWPORT) {
+    params.set("offscreenViewport", process.env.WEBVIDEO_VMS_OFFSCREEN_VIEWPORT);
+  }
+  if (process.env.WEBVIDEO_VMS_WORKER_TEXTURE) {
+    params.set("workerTexture", process.env.WEBVIDEO_VMS_WORKER_TEXTURE);
+  }
+  if (process.env.WEBVIDEO_VMS_PREDECODE_ADMISSION) {
+    params.set("predecodeFrameAdmission", process.env.WEBVIDEO_VMS_PREDECODE_ADMISSION);
+  }
+  if (process.env.WEBVIDEO_VMS_GPU_POWER) {
+    params.set("webgpuPower", process.env.WEBVIDEO_VMS_GPU_POWER);
   }
   if (process.env.WEBVIDEO_VMS_ADAPTIVE_RENDER) {
     params.set("adaptiveRender", process.env.WEBVIDEO_VMS_ADAPTIVE_RENDER);
@@ -604,6 +619,9 @@ function createVmsQuery(): string {
   }
   if (process.env.WEBVIDEO_VMS_MAX_SOURCE_HEIGHT) {
     params.set("maxSourceHeight", process.env.WEBVIDEO_VMS_MAX_SOURCE_HEIGHT);
+  }
+  if (process.env.WEBVIDEO_VMS_TARGET_LATENCY_MS) {
+    params.set("targetLatencyMs", process.env.WEBVIDEO_VMS_TARGET_LATENCY_MS);
   }
 
   const query = params.toString();

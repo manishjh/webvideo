@@ -4,9 +4,22 @@ import {
   WebTransportIngestClient,
 } from "../contracts/services";
 import {
+  EncodedFrameAdmissionController,
+} from "./encodedFrameAdmission";
+import {
   resolveLiveHardDecodeBacklogFrames,
+  resolveLiveRenderQueueBudgetFrames,
   resolveLiveStaleFrameDropThresholdMs,
 } from "./liveLatencyPolicy";
+import {
+  LiveDecodedFrameQueue,
+  LiveRenderTimingController,
+} from "./renderTimingBuffer";
+import type {
+  OffscreenMatrixRenderPortRequest,
+  OffscreenMatrixRenderPortResponse,
+  OffscreenMatrixRenderResult,
+} from "./offscreenMatrixWorkerProtocol";
 import type {
   DecodedFramePlan,
   MetadataTransportMessage,
@@ -31,6 +44,14 @@ type WorkerRequest =
       canvasWidth: number;
       canvasHeight: number;
     };
+    matrixRenderTarget?: {
+      canvasId: string;
+      port: MessagePort;
+    };
+    splitRenderWorker?: boolean;
+    gpuPowerPreference?: "high-performance" | "low-power";
+    workerTextureMode?: WorkerVideoFrameUploadMode;
+    predecodeFrameAdmission?: boolean;
   }
   | { type: "set-metadata-enabled"; enabled: boolean }
   | { type: "stop" };
@@ -102,6 +123,23 @@ type WorkerResponse =
     gpuUploadSource?: string;
     gpuAdapterVendor?: string;
     gpuAdapterArchitecture?: string;
+    matrixPresentMode?: string;
+    matrixPresentPath?: string;
+    matrixFlushCount?: number;
+    matrixPresentCount?: number;
+    matrixDrawCount?: number;
+    matrixExternalImportCount?: number;
+    matrixBindGroupCount?: number;
+    matrixVideoFrameCopyCount?: number;
+    matrixLastDirtySlotCount?: number;
+  }
+  | {
+    type: "progress";
+    bytesReceived: number;
+    messagesReceived: number;
+    receiveIntervalsMs: number[];
+    backlogFrameCount: number;
+    lastMessageAtUnixTimeMs?: number;
   }
   | {
     type: "drop";
@@ -154,10 +192,16 @@ type GpuDeviceLike = {
   createSampler: (descriptor?: Record<string, unknown>) => unknown;
   createBindGroup: (descriptor: Record<string, unknown>) => unknown;
   createBuffer: (descriptor: Record<string, unknown>) => GpuBufferLike;
+  createTexture: (descriptor: Record<string, unknown>) => GpuTextureLike;
   createCommandEncoder: () => GpuCommandEncoderLike;
   importExternalTexture?: (descriptor: Record<string, unknown>) => unknown;
   queue: {
     writeBuffer: (buffer: unknown, offset: number, data: BufferSource) => void;
+    copyExternalImageToTexture: (
+      source: Record<string, unknown>,
+      destination: Record<string, unknown>,
+      copySize: Record<string, number>,
+    ) => void;
     submit: (commands: unknown[]) => void;
   };
 };
@@ -189,6 +233,11 @@ type GpuBufferLike = {
   destroy?: () => void;
 };
 
+type GpuTextureLike = {
+  createView: () => unknown;
+  destroy?: () => void;
+};
+
 type OffscreenRenderResult = {
   renderMs: number;
   importExternalTextureMs: number;
@@ -201,11 +250,47 @@ type OffscreenRenderResult = {
   gpuUploadSource?: string;
   gpuAdapterVendor?: string;
   gpuAdapterArchitecture?: string;
+  matrixPresentMode?: string;
+  matrixPresentPath?: string;
+  matrixFlushCount?: number;
+  matrixPresentCount?: number;
+  matrixDrawCount?: number;
+  matrixExternalImportCount?: number;
+  matrixBindGroupCount?: number;
+  matrixVideoFrameCopyCount?: number;
+  matrixLastDirtySlotCount?: number;
 };
+
+type WorkerVideoFrameUploadMode = "auto" | "external" | "copy" | "bitmap";
+
+type OffscreenRendererClient = {
+  render: (frame: DecodedFramePlan, activeMetadata: readonly TimedMetadataBatch[]) => Promise<OffscreenRenderResult>;
+  dispose: () => void;
+};
+
+type SplitRendererRequest =
+  | {
+    type: "configure";
+    id: number;
+    target: NonNullable<Extract<WorkerRequest, { type: "start" }>["offscreenRenderTarget"]>;
+  }
+  | {
+    type: "render";
+    id: number;
+    frame: DecodedFramePlan;
+    activeMetadata: TimedMetadataBatch[];
+  }
+  | { type: "stop"; id?: number };
+
+type SplitRendererResponse =
+  | { type: "configured"; id: number }
+  | { type: "rendered"; id: number; result: OffscreenRenderResult }
+  | { type: "error"; id?: number; message: string };
 
 const OverlayTextMaxChars = 32;
 const OverlayUniformFloatCount = 8 + OverlayTextMaxChars;
 const OverlayUniformByteLength = OverlayUniformFloatCount * Float32Array.BYTES_PER_ELEMENT;
+const MaxWorkerRenderQueueFrames = 4;
 
 const offscreenExternalVideoShader = `
 struct Overlay {
@@ -409,26 +494,44 @@ fn fragmentMain(input: VertexOut) -> @location(0) vec4f {
 }
 `;
 
+const offscreenTextureVideoShader = offscreenExternalVideoShader
+  .replace("@group(0) @binding(0) var videoTexture: texture_external;", "@group(0) @binding(0) var videoTexture: texture_2d<f32>;")
+  .replace("textureSampleBaseClampToEdge(videoTexture, videoSampler, input.uv)", "textureSample(videoTexture, videoSampler, input.uv)");
+
 class OffscreenWebGpuVideoRenderer {
   private constructor(
     private readonly canvas: OffscreenCanvas,
     private readonly context: GpuCanvasContextLike,
     private readonly device: GpuDeviceLike,
-    private readonly pipeline: GpuPipelineLike,
+    private readonly externalTexturePipeline: GpuPipelineLike,
+    private readonly texturePipeline: GpuPipelineLike,
     private readonly sampler: unknown,
     private readonly overlayBuffer: GpuBufferLike,
     private readonly overlayUniform: Float32Array<ArrayBuffer>,
     private readonly format: string,
     private readonly adapterInfo: GpuAdapterLike["info"],
+    private readonly uploadMode: WorkerVideoFrameUploadMode,
   ) {}
 
-  public static async create(target: NonNullable<Extract<WorkerRequest, { type: "start" }>["offscreenRenderTarget"]>): Promise<OffscreenWebGpuVideoRenderer> {
+  private uploadTexture?: {
+    bindGroup?: unknown;
+    texture: GpuTextureLike;
+    view: unknown;
+    width: number;
+    height: number;
+  };
+
+  public static async create(
+    target: NonNullable<Extract<WorkerRequest, { type: "start" }>["offscreenRenderTarget"]>,
+    uploadMode: WorkerVideoFrameUploadMode = "auto",
+    powerPreference: "high-performance" | "low-power" = "high-performance",
+  ): Promise<OffscreenWebGpuVideoRenderer> {
     const gpu = (globalThis.navigator as { gpu?: GpuLike } | undefined)?.gpu;
     if (!gpu) {
       throw new Error("worker-offscreen-webgpu-unavailable");
     }
 
-    const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
+    const adapter = await gpu.requestAdapter({ powerPreference });
     if (!adapter) {
       throw new Error("worker-offscreen-webgpu-no-adapter");
     }
@@ -459,14 +562,31 @@ class OffscreenWebGpuVideoRenderer {
       format,
       alphaMode: "opaque",
     });
-    const pipeline = device.createRenderPipeline({
+    const externalShaderModule = device.createShaderModule({ code: offscreenExternalVideoShader });
+    const textureShaderModule = device.createShaderModule({ code: offscreenTextureVideoShader });
+    const externalTexturePipeline = device.createRenderPipeline({
       layout: "auto",
       vertex: {
-        module: device.createShaderModule({ code: offscreenExternalVideoShader }),
+        module: externalShaderModule,
         entryPoint: "vertexMain",
       },
       fragment: {
-        module: device.createShaderModule({ code: offscreenExternalVideoShader }),
+        module: externalShaderModule,
+        entryPoint: "fragmentMain",
+        targets: [{ format }],
+      },
+      primitive: {
+        topology: "triangle-list",
+      },
+    });
+    const texturePipeline = device.createRenderPipeline({
+      layout: "auto",
+      vertex: {
+        module: textureShaderModule,
+        entryPoint: "vertexMain",
+      },
+      fragment: {
+        module: textureShaderModule,
         entryPoint: "fragmentMain",
         targets: [{ format }],
       },
@@ -486,34 +606,126 @@ class OffscreenWebGpuVideoRenderer {
       target.canvas,
       context,
       device,
-      pipeline,
+      externalTexturePipeline,
+      texturePipeline,
       sampler,
       overlayBuffer,
       new Float32Array(new ArrayBuffer(OverlayUniformByteLength)),
       format,
       adapterInfo,
+      uploadMode,
     );
   }
 
-  public render(frame: DecodedFramePlan, activeMetadata: readonly TimedMetadataBatch[]): OffscreenRenderResult {
+  public async render(frame: DecodedFramePlan, activeMetadata: readonly TimedMetadataBatch[]): Promise<OffscreenRenderResult> {
     const videoFrame = frame.videoFrame as WorkerVideoFrameLike | undefined;
     if (!videoFrame || !isNativeVideoFrame(videoFrame)) {
       throw new Error("worker-offscreen-render-requires-videoframe");
     }
 
     const renderStart = performance.now();
-    const externalTexture = this.device.importExternalTexture?.({ source: videoFrame });
-    if (!externalTexture) {
-      throw new Error("worker-offscreen-import-external-texture-failed");
+    let uploadEnd = renderStart;
+    let pipeline = this.externalTexturePipeline;
+    let sourceResource: unknown | undefined;
+    let bindGroup: unknown | undefined;
+    let uploadSource = "external-texture";
+    const width = Math.max(1, videoFrame.displayWidth ?? videoFrame.codedWidth ?? frame.width);
+    const height = Math.max(1, videoFrame.displayHeight ?? videoFrame.codedHeight ?? frame.height);
+    const canvasWidth = Math.max(1, this.canvas.width);
+    const canvasHeight = Math.max(1, this.canvas.height);
+    const effectiveUploadMode = this.uploadMode;
+    let bitmapSource: ImageBitmap | undefined;
+    if (effectiveUploadMode === "external" || effectiveUploadMode === "auto") {
+      const externalTexture = this.device.importExternalTexture?.({ source: videoFrame });
+      if (externalTexture) {
+        sourceResource = externalTexture;
+        uploadEnd = performance.now();
+      }
     }
-    const importEnd = performance.now();
 
-    const bindGroup = this.device.createBindGroup({
-      layout: this.pipeline.getBindGroupLayout?.(0),
+    if (!sourceResource) {
+      let copySource: unknown = videoFrame;
+      let copyWidth = width;
+      let copyHeight = height;
+      if (effectiveUploadMode === "bitmap") {
+        const createBitmap = (globalThis as {
+          createImageBitmap?: (
+            image: ImageBitmapSource,
+            options?: ImageBitmapOptions & { resizeWidth?: number; resizeHeight?: number; resizeQuality?: ResizeQuality },
+          ) => Promise<ImageBitmap>;
+        }).createImageBitmap;
+        if (!createBitmap) {
+          throw new Error("worker-offscreen-create-image-bitmap-unavailable");
+        }
+
+        bitmapSource = await createBitmap(videoFrame as ImageBitmapSource, {
+          resizeWidth: canvasWidth,
+          resizeHeight: canvasHeight,
+          resizeQuality: "low",
+        });
+        copySource = bitmapSource;
+        copyWidth = canvasWidth;
+        copyHeight = canvasHeight;
+        uploadSource = "videoframe-bitmap-copy";
+      } else {
+        uploadSource = "videoframe-copy";
+      }
+
+      if (!this.uploadTexture || this.uploadTexture.width !== copyWidth || this.uploadTexture.height !== copyHeight) {
+        this.uploadTexture?.texture.destroy?.();
+        this.uploadTexture = undefined;
+        const textureUsage = getGpuTextureUsage();
+        const texture = this.device.createTexture({
+          size: { width: copyWidth, height: copyHeight },
+          format: "rgba8unorm",
+          usage: textureUsage.textureBinding | textureUsage.copyDst | textureUsage.renderAttachment,
+        });
+        this.uploadTexture = {
+          texture,
+          view: texture.createView(),
+          width: copyWidth,
+          height: copyHeight,
+        };
+      }
+
+      this.device.queue.copyExternalImageToTexture(
+        { source: copySource },
+        { texture: this.uploadTexture.texture },
+        { width: copyWidth, height: copyHeight },
+      );
+      uploadEnd = performance.now();
+      pipeline = this.texturePipeline;
+      sourceResource = this.uploadTexture.view;
+      if (!this.uploadTexture.bindGroup) {
+        this.uploadTexture.bindGroup = this.device.createBindGroup({
+          layout: pipeline.getBindGroupLayout?.(0),
+          entries: [
+            {
+              binding: 0,
+              resource: sourceResource,
+            },
+            {
+              binding: 1,
+              resource: this.sampler,
+            },
+            {
+              binding: 2,
+              resource: {
+                buffer: this.overlayBuffer,
+              },
+            },
+          ],
+        });
+      }
+      bindGroup = this.uploadTexture.bindGroup;
+    }
+
+    bindGroup ??= this.device.createBindGroup({
+      layout: pipeline.getBindGroupLayout?.(0),
       entries: [
         {
           binding: 0,
-          resource: externalTexture,
+          resource: sourceResource,
         },
         {
           binding: 1,
@@ -536,13 +748,12 @@ class OffscreenWebGpuVideoRenderer {
       colorAttachments: [
         {
           view: this.context.getCurrentTexture().createView(),
-          clearValue: { r: 0.02, g: 0.03, b: 0.04, a: 1 },
-          loadOp: "clear",
+          loadOp: "load",
           storeOp: "store",
         },
       ],
     });
-    pass.setPipeline(this.pipeline);
+    pass.setPipeline(pipeline);
     pass.setBindGroup(0, bindGroup);
     pass.draw(6);
     pass.end();
@@ -551,25 +762,359 @@ class OffscreenWebGpuVideoRenderer {
     this.device.queue.submit([commandBuffer]);
     const submitEnd = performance.now();
     videoFrame.close?.();
+    bitmapSource?.close();
     return {
       renderMs: submitEnd - renderStart,
-      importExternalTextureMs: importEnd - renderStart,
-      bindGroupMs: bindEnd - importEnd,
+      importExternalTextureMs: uploadEnd - renderStart,
+      bindGroupMs: bindEnd - uploadEnd,
       uniformMs: uniformEnd - bindEnd,
       encodeMs: encodeEnd - uniformEnd,
       submitMs: submitEnd - encodeEnd,
       renderBackend: "webgpu",
       gpuPresentation: "worker-offscreen-webgpu-canvas",
-      gpuUploadSource: "external-texture",
+      gpuUploadSource: uploadSource,
       gpuAdapterVendor: this.adapterInfo?.vendor,
       gpuAdapterArchitecture: this.adapterInfo?.architecture,
     };
   }
 
   public dispose(): void {
+    this.uploadTexture?.texture.destroy?.();
     this.overlayBuffer.destroy?.();
     this.canvas.width = this.canvas.width;
   }
+}
+
+class InlineOffscreenRendererClient implements OffscreenRendererClient {
+  public constructor(private readonly renderer: OffscreenWebGpuVideoRenderer) {}
+
+  public render(frame: DecodedFramePlan, activeMetadata: readonly TimedMetadataBatch[]): Promise<OffscreenRenderResult> {
+    return Promise.resolve(this.renderer.render(frame, activeMetadata));
+  }
+
+  public dispose(): void {
+    this.renderer.dispose();
+  }
+}
+
+class WorkerOffscreenRendererClient implements OffscreenRendererClient {
+  private readonly pending = new Map<number, {
+    resolve: (result: OffscreenRenderResult) => void;
+    reject: (error: Error) => void;
+    timeoutId: ReturnType<typeof setTimeout>;
+  }>();
+  private nextRequestId = 0;
+  private disposed = false;
+
+  private constructor(private readonly worker: Worker) {
+    this.worker.onmessage = (event: MessageEvent<SplitRendererResponse>) => {
+      this.handleMessage(event.data);
+    };
+    this.worker.onerror = (event) => {
+      this.failAll(new Error(event.message || "Split offscreen renderer worker failed."));
+    };
+    this.worker.onmessageerror = () => {
+      this.failAll(new Error("Split offscreen renderer worker returned an unreadable message."));
+    };
+  }
+
+  public static async create(
+    target: NonNullable<Extract<WorkerRequest, { type: "start" }>["offscreenRenderTarget"]>,
+  ): Promise<WorkerOffscreenRendererClient> {
+    const worker = new Worker(new URL("./offscreenFrameRendererWorker.ts", import.meta.url), {
+      type: "module",
+    });
+    const client = new WorkerOffscreenRendererClient(worker);
+    await client.configure(target);
+    return client;
+  }
+
+  public render(frame: DecodedFramePlan, activeMetadata: readonly TimedMetadataBatch[]): Promise<OffscreenRenderResult> {
+    if (this.disposed) {
+      return Promise.reject(new Error("Split offscreen renderer has been disposed."));
+    }
+
+    const frameTransfer = frame.videoFrame && typeof frame.videoFrame === "object"
+      ? [frame.videoFrame as Transferable]
+      : [];
+    return this.request({
+      type: "render",
+      id: 0,
+      frame,
+      activeMetadata: activeMetadata.map((batch) => ({
+        streamId: batch.streamId,
+        batchStartTimestampUs: batch.batchStartTimestampUs,
+        batchEndTimestampUs: batch.batchEndTimestampUs,
+        records: batch.records,
+      })),
+    }, frameTransfer);
+  }
+
+  public dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+
+    this.disposed = true;
+    try {
+      this.worker.postMessage({ type: "stop" } satisfies SplitRendererRequest);
+    } catch {
+      // The worker may already have gone away after a device loss or navigation.
+    }
+    this.worker.terminate();
+    this.failAll(new Error("Split offscreen renderer has been disposed."));
+  }
+
+  private configure(
+    target: NonNullable<Extract<WorkerRequest, { type: "start" }>["offscreenRenderTarget"]>,
+  ): Promise<OffscreenRenderResult> {
+    return this.request({
+      type: "configure",
+      id: 0,
+      target,
+    }, [target.canvas]);
+  }
+
+  private request(request: SplitRendererRequest, transfer: Transferable[] = []): Promise<OffscreenRenderResult> {
+    const id = ++this.nextRequestId;
+    const timeoutMs = request.type === "configure" ? 10_000 : 1_000;
+    const timeoutId = setTimeout(() => {
+      const pending = this.pending.get(id);
+      if (!pending) {
+        return;
+      }
+
+      this.pending.delete(id);
+      pending.reject(new Error(`Split offscreen renderer request '${request.type}' timed out.`));
+    }, timeoutMs);
+
+    const message = {
+      ...request,
+      id,
+    } satisfies SplitRendererRequest;
+
+    return new Promise<OffscreenRenderResult>((resolve, reject) => {
+      this.pending.set(id, { resolve, reject, timeoutId });
+      try {
+        this.worker.postMessage(message, transfer);
+      } catch (error) {
+        this.pending.delete(id);
+        clearTimeout(timeoutId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  private handleMessage(message: SplitRendererResponse): void {
+    if (message.type === "error") {
+      if (message.id === undefined) {
+        this.failAll(new Error(message.message));
+        return;
+      }
+
+      const pending = this.pending.get(message.id);
+      if (!pending) {
+        return;
+      }
+
+      this.pending.delete(message.id);
+      clearTimeout(pending.timeoutId);
+      pending.reject(new Error(message.message));
+      return;
+    }
+
+    const pending = this.pending.get(message.id);
+    if (!pending) {
+      return;
+    }
+
+    this.pending.delete(message.id);
+    clearTimeout(pending.timeoutId);
+    if (message.type === "configured") {
+      pending.resolve({
+        renderMs: 0,
+        importExternalTextureMs: 0,
+        bindGroupMs: 0,
+        uniformMs: 0,
+        encodeMs: 0,
+        submitMs: 0,
+        renderBackend: "webgpu",
+      });
+      return;
+    }
+
+    pending.resolve(message.result);
+  }
+
+  private failAll(error: Error): void {
+    for (const [id, pending] of this.pending) {
+      this.pending.delete(id);
+      clearTimeout(pending.timeoutId);
+      pending.reject(error);
+    }
+  }
+}
+
+class MatrixPortRendererClient implements OffscreenRendererClient {
+  private readonly pending = new Map<number, {
+    resolve: (result: OffscreenRenderResult) => void;
+    reject: (error: Error) => void;
+    timeoutId: ReturnType<typeof setTimeout>;
+    startedAtMs: number;
+  }>();
+  private nextRequestId = 0;
+  private disposed = false;
+
+  public constructor(private readonly port: MessagePort) {
+    this.port.onmessage = (event: MessageEvent<OffscreenMatrixRenderPortResponse>) => {
+      this.handleMessage(event.data);
+    };
+    this.port.onmessageerror = () => {
+      this.failAll(new Error("Matrix render port returned an unreadable message."));
+    };
+    this.port.start?.();
+  }
+
+  public render(frame: DecodedFramePlan, activeMetadata: readonly TimedMetadataBatch[]): Promise<OffscreenRenderResult> {
+    if (this.disposed) {
+      return Promise.reject(new Error("Matrix render port has been disposed."));
+    }
+
+    const requestId = ++this.nextRequestId;
+    const startedAtMs = performance.now();
+    const timeoutId = setTimeout(() => {
+      const pending = this.pending.get(requestId);
+      if (!pending) {
+        return;
+      }
+
+      this.pending.delete(requestId);
+      pending.reject(new Error("Matrix render port request timed out."));
+    }, 1_000);
+
+    return new Promise<OffscreenRenderResult>((resolve, reject) => {
+      this.pending.set(requestId, {
+        resolve,
+        reject,
+        timeoutId,
+        startedAtMs,
+      });
+      try {
+        const request = {
+          type: "render",
+          requestId,
+          frame,
+          activeMetadata: activeMetadata.map((batch) => ({
+            streamId: batch.streamId,
+            batchStartTimestampUs: batch.batchStartTimestampUs,
+            batchEndTimestampUs: batch.batchEndTimestampUs,
+            records: batch.records,
+          })),
+        } satisfies OffscreenMatrixRenderPortRequest;
+        const transfer = frame.videoFrame && typeof frame.videoFrame === "object"
+          ? [frame.videoFrame as Transferable]
+          : [];
+        this.port.postMessage(request, transfer);
+      } catch (error) {
+        this.pending.delete(requestId);
+        clearTimeout(timeoutId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  }
+
+  public dispose(): void {
+    if (this.disposed) {
+      return;
+    }
+
+    this.disposed = true;
+    try {
+      this.port.postMessage({ type: "stop" } satisfies OffscreenMatrixRenderPortRequest);
+    } catch {
+      // The matrix worker may already be gone during navigation or shutdown.
+    }
+    this.port.close();
+    this.failAll(new Error("Matrix render port has been disposed."));
+  }
+
+  private handleMessage(message: OffscreenMatrixRenderPortResponse): void {
+    if (message.type === "error") {
+      if (message.requestId === undefined) {
+        this.failAll(new Error(message.message));
+        return;
+      }
+
+      const pending = this.pending.get(message.requestId);
+      if (!pending) {
+        return;
+      }
+
+      this.pending.delete(message.requestId);
+      clearTimeout(pending.timeoutId);
+      pending.reject(new Error(message.message));
+      return;
+    }
+
+    const pending = this.pending.get(message.requestId);
+    if (!pending) {
+      return;
+    }
+
+    this.pending.delete(message.requestId);
+    clearTimeout(pending.timeoutId);
+    pending.resolve(toOffscreenRenderResult(message.result, performance.now() - pending.startedAtMs));
+  }
+
+  private failAll(error: Error): void {
+    for (const [id, pending] of this.pending) {
+      this.pending.delete(id);
+      clearTimeout(pending.timeoutId);
+      pending.reject(error);
+    }
+  }
+}
+
+async function createOffscreenRendererClient(
+  target: NonNullable<Extract<WorkerRequest, { type: "start" }>["offscreenRenderTarget"]>,
+  splitRenderWorker: boolean,
+  uploadMode: WorkerVideoFrameUploadMode,
+  powerPreference: "high-performance" | "low-power",
+): Promise<OffscreenRendererClient> {
+  const workerConstructor = (globalThis as { Worker?: unknown }).Worker;
+  if (splitRenderWorker && typeof workerConstructor === "function") {
+    return WorkerOffscreenRendererClient.create(target);
+  }
+
+  return new InlineOffscreenRendererClient(await OffscreenWebGpuVideoRenderer.create(target, uploadMode, powerPreference));
+}
+
+function toOffscreenRenderResult(
+  result: OffscreenMatrixRenderResult,
+  renderMs: number,
+): OffscreenRenderResult {
+  return {
+    renderMs: result.renderMs ?? renderMs,
+    importExternalTextureMs: result.importExternalTextureMs ?? 0,
+    bindGroupMs: result.bindGroupMs ?? 0,
+    uniformMs: result.uniformMs ?? 0,
+    encodeMs: result.encodeMs ?? 0,
+    submitMs: result.submitMs ?? 0,
+    renderBackend: result.renderBackend,
+    gpuPresentation: result.gpuPresentation,
+    gpuUploadSource: result.gpuUploadSource,
+    gpuAdapterVendor: result.gpuAdapterVendor,
+    gpuAdapterArchitecture: result.gpuAdapterArchitecture,
+    matrixPresentMode: result.matrixPresentMode,
+    matrixPresentPath: result.matrixPresentPath,
+    matrixFlushCount: result.matrixFlushCount,
+    matrixPresentCount: result.matrixPresentCount,
+    matrixDrawCount: result.matrixDrawCount,
+    matrixExternalImportCount: result.matrixExternalImportCount,
+    matrixBindGroupCount: result.matrixBindGroupCount,
+    matrixVideoFrameCopyCount: result.matrixVideoFrameCopyCount,
+    matrixLastDirtySlotCount: result.matrixLastDirtySlotCount,
+  };
 }
 
 class WorkerOverlayTimeline {
@@ -689,6 +1234,21 @@ function getGpuBufferUsage(): { uniform: number; copyDst: number } {
   };
 }
 
+function getGpuTextureUsage(): { textureBinding: number; copyDst: number; renderAttachment: number } {
+  const usage = (globalThis as {
+    GPUTextureUsage?: {
+      TEXTURE_BINDING?: number;
+      COPY_DST?: number;
+      RENDER_ATTACHMENT?: number;
+    };
+  }).GPUTextureUsage;
+  return {
+    textureBinding: usage?.TEXTURE_BINDING ?? 0x0004,
+    copyDst: usage?.COPY_DST ?? 0x0002,
+    renderAttachment: usage?.RENDER_ATTACHMENT ?? 0x0010,
+  };
+}
+
 function post(response: WorkerResponse, transfer: Transferable[] = []): void {
   (globalThis as unknown as Worker).postMessage(response, transfer);
 }
@@ -709,9 +1269,16 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
   const transport = new WebTransportIngestClient();
   const transportStart = performance.now();
   let connection: TransportConnectionHandle | undefined;
-  const offscreenRenderer = request.offscreenRenderTarget
-    ? await OffscreenWebGpuVideoRenderer.create(request.offscreenRenderTarget)
-    : undefined;
+  const offscreenRenderer = request.matrixRenderTarget
+    ? new MatrixPortRendererClient(request.matrixRenderTarget.port)
+    : request.offscreenRenderTarget
+      ? await createOffscreenRendererClient(
+        request.offscreenRenderTarget,
+        request.splitRenderWorker === true,
+        request.workerTextureMode ?? "auto",
+        request.gpuPowerPreference ?? "high-performance",
+      )
+      : undefined;
 
   let activeCodec = request.initialCodec;
   let activeSourceFrameRate = activeCodec.frameRate;
@@ -723,9 +1290,40 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
   const pendingMetadataBySequence = new Map<number, FrameMetadata>();
   const pendingReceiveTimesBySequence = new Map<number, number>();
   const overlayTimeline = new WorkerOverlayTimeline();
+  const renderQueue = new LiveDecodedFrameQueue();
+  const renderTiming = new LiveRenderTimingController();
+  const frameAdmission = new EncodedFrameAdmissionController();
   let drainScheduled = false;
   let drainGeneration = 0;
+  let renderGeneration = 0;
+  let renderInFlight = false;
   let pendingDecodeMs = 0;
+  let renderTimer: ReturnType<typeof setTimeout> | undefined;
+  let lastProgressPostAtMs = 0;
+  let lastReceivedVideoAtUnixTimeMs: number | undefined;
+  let videoMessagesSinceTaskYield = 0;
+  const pendingReceiveIntervalsMs: number[] = [];
+
+  const postProgress = (force = false): void => {
+    if (!connection) {
+      return;
+    }
+
+    const nowMs = performance.now();
+    if (!force && nowMs - lastProgressPostAtMs < 250 && pendingReceiveIntervalsMs.length < 16) {
+      return;
+    }
+
+    lastProgressPostAtMs = nowMs;
+    post({
+      type: "progress",
+      bytesReceived: connection.webTransportBytesReceived,
+      messagesReceived: connection.webTransportMessagesReceived,
+      receiveIntervalsMs: pendingReceiveIntervalsMs.splice(0),
+      backlogFrameCount: decoder.liveBacklogFrameCount(),
+      lastMessageAtUnixTimeMs: Date.now(),
+    });
+  };
 
   const createDecoder = (): VideoDecodeCoordinator => new VideoDecodeCoordinator(() => {
     scheduleDrain();
@@ -734,16 +1332,26 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
 
   const clearScheduledDrain = (): void => {
     drainGeneration += 1;
+    renderGeneration += 1;
     drainScheduled = false;
     pendingDecodeMs = 0;
+    if (renderTimer !== undefined) {
+      clearTimeout(renderTimer);
+      renderTimer = undefined;
+    }
   };
 
   const resetDecodeState = async (): Promise<void> => {
     clearScheduledDrain();
     decoder.dispose();
+    for (const frame of renderQueue.clear()) {
+      closeFrame(frame);
+    }
+    renderTiming.reset();
     assembler = new EncodedChunkAssembler();
     decoder = createDecoder();
     await decoder.configureDecoder(activeCodec);
+    frameAdmission.reset();
     waitingForKeyFrame = true;
     pendingMetadataBySequence.clear();
     pendingReceiveTimesBySequence.clear();
@@ -755,17 +1363,43 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
     }
 
     const frames = decoder.drainDecodedFrames();
-    if (frames.length === 0) {
+    if (frames.length === 0 && renderQueue.length === 0) {
       return 0;
     }
 
     if (offscreenRenderer) {
-      const frame = frames[frames.length - 1];
-      const droppedFrames = frames.slice(0, -1);
-      for (const droppedFrame of droppedFrames) {
+      renderQueue.enqueue(frames);
+      renderTiming.waitMsUntilNextFrame(renderQueue, activeSourceFrameRate, request.targetLatencyMs);
+      const maxRenderQueueFrames = resolveLiveRenderQueueBudgetFrames({
+        frameRate: activeSourceFrameRate,
+        maxFrames: MaxWorkerRenderQueueFrames,
+        targetLatencyMs: request.targetLatencyMs,
+      });
+      const overflowFrames = renderQueue.dropOldestUntil(maxRenderQueueFrames);
+      for (const droppedFrame of overflowFrames) {
         closeFrame(droppedFrame);
         pendingMetadataBySequence.delete(droppedFrame.sequenceNumber);
         pendingReceiveTimesBySequence.delete(droppedFrame.sequenceNumber);
+      }
+
+      if (renderInFlight) {
+        return overflowFrames.length;
+      }
+
+      const selected = renderQueue.takeNewestWhere((frame) => {
+        return renderTiming.isFrameDue(frame, activeSourceFrameRate, request.targetLatencyMs);
+      });
+      const droppedFrames = [...overflowFrames, ...selected.dropped];
+      for (const droppedFrame of selected.dropped) {
+        closeFrame(droppedFrame);
+        pendingMetadataBySequence.delete(droppedFrame.sequenceNumber);
+        pendingReceiveTimesBySequence.delete(droppedFrame.sequenceNumber);
+      }
+
+      const frame = selected.frame;
+      if (!frame) {
+        scheduleTimedRender();
+        return 0;
       }
 
       const metadata = pendingMetadataBySequence.get(frame.sequenceNumber);
@@ -773,36 +1407,72 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
       pendingMetadataBySequence.delete(frame.sequenceNumber);
       pendingReceiveTimesBySequence.delete(frame.sequenceNumber);
       const activeMetadata = metadataEnabled ? overlayTimeline.query(frame.streamId, frame.presentationTimestampUs) : [];
-      const renderResult = offscreenRenderer.render(frame, activeMetadata);
-      post({
-        type: "rendered",
-        metadata,
-        receivedAtUnixTimeMs,
-        bytesReceived: connection.webTransportBytesReceived,
-        messagesReceived: connection.webTransportMessagesReceived,
-        decodeMs,
-        renderMs: renderResult.renderMs,
-        renderStageMs: {
-          importExternalTexture: renderResult.importExternalTextureMs,
-          bindGroup: renderResult.bindGroupMs,
-          uniform: renderResult.uniformMs,
-          encode: renderResult.encodeMs,
-          submit: renderResult.submitMs,
-        },
-        backlogFrameCount: decoder.liveBacklogFrameCount(),
-        droppedBeforeRender: droppedFrames.length,
-        decodeBackend: frame.decodeBackend,
-        renderBackend: renderResult.renderBackend,
-        renderedSequenceNumber: frame.sequenceNumber,
-        overlayPrimitiveCount: countOverlayPrimitives(activeMetadata),
-        width: frame.width,
-        height: frame.height,
-        gpuPresentation: renderResult.gpuPresentation,
-        gpuUploadSource: renderResult.gpuUploadSource,
-        gpuAdapterVendor: renderResult.gpuAdapterVendor,
-        gpuAdapterArchitecture: renderResult.gpuAdapterArchitecture,
+      renderInFlight = true;
+      const generation = renderGeneration;
+      const bytesReceived = connection.webTransportBytesReceived;
+      const messagesReceived = connection.webTransportMessagesReceived;
+      const backlogFrameCount = decoder.liveBacklogFrameCount();
+      void offscreenRenderer.render(frame, activeMetadata).then((renderResult) => {
+        renderInFlight = false;
+        if (generation !== renderGeneration || !connection) {
+          return;
+        }
+
+        frameAdmission.recordPresentedFrame({
+          renderMs: renderResult.renderMs,
+          importExternalTextureMs: renderResult.importExternalTextureMs,
+          sourceFrameRate: activeSourceFrameRate,
+        });
+
+        post({
+          type: "rendered",
+          metadata,
+          receivedAtUnixTimeMs,
+          bytesReceived,
+          messagesReceived,
+          decodeMs,
+          renderMs: renderResult.renderMs,
+          renderStageMs: {
+            importExternalTexture: renderResult.importExternalTextureMs,
+            bindGroup: renderResult.bindGroupMs,
+            uniform: renderResult.uniformMs,
+            encode: renderResult.encodeMs,
+            submit: renderResult.submitMs,
+          },
+          backlogFrameCount,
+          droppedBeforeRender: droppedFrames.length,
+          decodeBackend: frame.decodeBackend,
+          renderBackend: renderResult.renderBackend,
+          renderedSequenceNumber: frame.sequenceNumber,
+          overlayPrimitiveCount: countOverlayPrimitives(activeMetadata),
+          width: frame.width,
+          height: frame.height,
+          gpuPresentation: renderResult.gpuPresentation,
+          gpuUploadSource: renderResult.gpuUploadSource,
+          gpuAdapterVendor: renderResult.gpuAdapterVendor,
+          gpuAdapterArchitecture: renderResult.gpuAdapterArchitecture,
+          matrixPresentMode: renderResult.matrixPresentMode,
+          matrixPresentPath: renderResult.matrixPresentPath,
+          matrixFlushCount: renderResult.matrixFlushCount,
+          matrixPresentCount: renderResult.matrixPresentCount,
+          matrixDrawCount: renderResult.matrixDrawCount,
+          matrixExternalImportCount: renderResult.matrixExternalImportCount,
+          matrixBindGroupCount: renderResult.matrixBindGroupCount,
+          matrixVideoFrameCopyCount: renderResult.matrixVideoFrameCopyCount,
+          matrixLastDirtySlotCount: renderResult.matrixLastDirtySlotCount,
+        });
+        if (renderQueue.length > 0) {
+          scheduleDrain();
+        }
+      }).catch((error: unknown) => {
+        renderInFlight = false;
+        post({
+          type: "error",
+          message: error instanceof Error ? error.message : String(error),
+        });
+        abortController?.abort();
       });
-      return frames.length;
+      return droppedFrames.length + 1;
     }
 
     const envelopes = frames.map((frame) => {
@@ -827,6 +1497,22 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
     return frames.length;
   };
 
+  function scheduleTimedRender(): void {
+    if (renderTimer !== undefined) {
+      return;
+    }
+
+    const waitMs = renderTiming.waitMsUntilNextFrame(renderQueue, activeSourceFrameRate, request.targetLatencyMs);
+    if (waitMs === undefined) {
+      return;
+    }
+
+    renderTimer = setTimeout(() => {
+      renderTimer = undefined;
+      scheduleDrain();
+    }, Math.min(Math.max(waitMs, 1), 100));
+  }
+
   function scheduleDrain(decodeMs = 0): void {
     pendingDecodeMs = Math.max(pendingDecodeMs, decodeMs);
     if (drainScheduled) {
@@ -845,6 +1531,8 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
         const decodedFrameCount = drainDecoded(pendingDecodeMs);
         if (decodedFrameCount > 0) {
           pendingDecodeMs = 0;
+        } else {
+          scheduleTimedRender();
         }
       } catch (error) {
         pendingDecodeMs = 0;
@@ -910,6 +1598,7 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
         };
         activeSourceFrameRate = frame.source.codec.frameRate;
         overlayTimeline.clear(frame.source.streamId);
+        renderTiming.reset();
         await resetDecodeState();
         post({ type: "source", source: frame.source });
         continue;
@@ -922,6 +1611,11 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
       }
 
       const message = frame.message;
+      if (typeof lastReceivedVideoAtUnixTimeMs === "number") {
+        pendingReceiveIntervalsMs.push(frame.receivedAtUnixTimeMs - lastReceivedVideoAtUnixTimeMs);
+      }
+      lastReceivedVideoAtUnixTimeMs = frame.receivedAtUnixTimeMs;
+      postProgress();
       const frameAgeMs = Date.now() - (message.sourceTimestampUnixTimeMs ?? message.serverTimestampUnixTimeMs ?? Date.now());
       if (!message.keyFrame && frameAgeMs > resolveLiveStaleFrameDropThresholdMs(request.targetLatencyMs)) {
         waitingForKeyFrame = true;
@@ -960,6 +1654,20 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
         waitingForKeyFrame = false;
       }
 
+      if (request.predecodeFrameAdmission === true) {
+        const admissionDecision = frameAdmission.decideBeforeDecode(message, activeCodec.codec, activeSourceFrameRate);
+        if (!admissionDecision.admit) {
+          lastDecodedSequenceNumber = message.sequenceNumber;
+          post({
+            type: "drop",
+            count: 1,
+            reason: admissionDecision.reason ?? "predecode-render-budget",
+            lastMessageAtUnixTimeMs: message.serverTimestampUnixTimeMs,
+          });
+          continue;
+        }
+      }
+
       const decodeStart = performance.now();
       try {
         if (decoder.liveBacklogFrameCount() > resolveLiveHardDecodeBacklogFrames({
@@ -988,6 +1696,11 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
           await decoder.enqueueChunk(chunk);
         }
         scheduleDrain(performance.now() - decodeStart);
+        videoMessagesSinceTaskYield += 1;
+        if (videoMessagesSinceTaskYield >= 4 || decoder.liveBacklogFrameCount() >= 4) {
+          videoMessagesSinceTaskYield = 0;
+          await yieldToWorkerEventLoop();
+        }
         lastDecodedSequenceNumber = message.sequenceNumber;
       } catch (error) {
         await resetDecodeState();
@@ -1007,6 +1720,7 @@ async function runPipeline(request: Extract<WorkerRequest, { type: "start" }>, a
       }
     }
   } finally {
+    postProgress(true);
     clearScheduledDrain();
     decoder.dispose();
     offscreenRenderer?.dispose();
@@ -1045,6 +1759,18 @@ function scheduleMicrotask(task: () => void): void {
   }
 
   void Promise.resolve().then(task);
+}
+
+async function yieldToWorkerEventLoop(): Promise<void> {
+  const scheduler = (globalThis as { scheduler?: { yield?: () => Promise<void> } }).scheduler;
+  if (typeof scheduler?.yield === "function") {
+    await scheduler.yield();
+    return;
+  }
+
+  await new Promise<void>((resolve) => {
+    globalThis.setTimeout(resolve, 0);
+  });
 }
 
 (globalThis as unknown as Worker).onmessage = (event: MessageEvent<WorkerRequest>) => {

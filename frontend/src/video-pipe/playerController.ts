@@ -15,6 +15,7 @@ import {
   WorkerMediaPipelineClient,
   type WorkerDecodedFrameEnvelope,
   type WorkerFrameMetadata,
+  type WorkerMatrixRenderTarget,
   type WorkerOffscreenRenderTarget,
   type WorkerMediaPipelineEvent,
 } from "./workerMediaPipelineClient";
@@ -56,6 +57,10 @@ import {
   resolveLiveRenderQueueBudgetFrames,
   resolveLiveStaleFrameDropThresholdMs,
 } from "./liveLatencyPolicy";
+import {
+  LiveDecodedFrameQueue,
+  LiveRenderTimingController,
+} from "./renderTimingBuffer";
 
 export type VideoPipeStatus = "starting" | "playing" | "holding" | "stopping" | "stopped" | "error";
 export type VideoPipeRenderClock = "animation-frame" | "frame-arrival";
@@ -90,6 +95,7 @@ export interface VideoPipePlayerOptions {
   chaosFrameDelayMs?: number;
   chaosDropEveryNFrames?: number;
   metadataEnabled?: boolean;
+  matrixRenderTarget?: WorkerMatrixRenderTarget;
   offscreenRenderTarget?: WorkerOffscreenRenderTarget;
   renderClock?: VideoPipeRenderClock;
   onState: (state: VideoPipeRuntimeState) => void;
@@ -106,7 +112,9 @@ export type VideoPipePlayerRuntimeOptions = Pick<
   | "maxSourceCodedHeight"
   | "maxSourceFrameRate"
   | "renderClock"
->;
+> & {
+  targetLatencyMs?: number;
+};
 
 export interface VideoPipeFrameRenderer {
   configureSurface: (configuration: SurfaceConfigurationPlan) => Promise<void>;
@@ -198,7 +206,7 @@ interface DesiredSourceRequest {
 
 export class VideoPipePlayerController {
   private static readonly MaxLiveDecodeBacklogFrames = 12;
-  private static readonly MaxLiveRenderQueueFrames = 8;
+  private static readonly MaxLiveRenderQueueFrames = 4;
   private static readonly StateEmitIntervalMs = 1000;
   private static readonly OffscreenDatasetWriteIntervalMs = 250;
   private static readonly SourceSwitchCooldownMs = 10_000;
@@ -290,6 +298,7 @@ export class VideoPipePlayerController {
     this.options.maxSourceCodedWidth = options.maxSourceCodedWidth;
     this.options.maxSourceCodedHeight = options.maxSourceCodedHeight;
     this.options.maxSourceFrameRate = options.maxSourceFrameRate;
+    this.options.targetLatencyMs = options.targetLatencyMs ?? this.options.targetLatencyMs;
     this.options.renderClock = options.renderClock;
     this.emit({ renderClock: options.renderClock ?? "frame-arrival" }, true);
     this.requestSourceSwitchIfNeeded("policy-change", previousSourceRequestKey);
@@ -360,7 +369,7 @@ export class VideoPipePlayerController {
       return;
     }
 
-    if (this.options.offscreenRenderTarget) {
+    if (this.options.offscreenRenderTarget || this.options.matrixRenderTarget) {
       this.configured = true;
       return;
     }
@@ -387,13 +396,13 @@ export class VideoPipePlayerController {
       sourceRequest.desiredEgressFrameRate,
     );
 
-    if (this.options.offscreenRenderTarget || shouldUseWorkerMediaPipeline()) {
+    if (this.options.offscreenRenderTarget || this.options.matrixRenderTarget || shouldUseWorkerMediaPipeline()) {
       try {
         await this.runWorkerContinuousSession(sourceRequest, abortSignal);
         return;
       } catch (error) {
         abortSignal.throwIfAborted();
-        if (this.options.offscreenRenderTarget) {
+        if (this.options.offscreenRenderTarget || this.options.matrixRenderTarget) {
           throw error;
         }
         this.emit({
@@ -437,6 +446,7 @@ export class VideoPipePlayerController {
     abortSignal: AbortSignal,
   ): Promise<void> {
     const renderQueue = new LiveDecodedFrameQueue();
+    const renderTiming = new LiveRenderTimingController();
     const renderSignal = new LiveRenderSignal();
     const pendingVideoMessages = new Map<number, LiveVideoFrameMetadata>();
     const pendingReceiveTimesBySequence = new Map<number, number>();
@@ -446,33 +456,37 @@ export class VideoPipePlayerController {
     let renderPumpRunning = true;
     let renderPumpError: unknown;
     let lastWorkerDecodeBacklogFrameCount = 0;
+    let nextRenderWakeDelayMs: number | undefined;
 
     const renderAvailableFrames = async (): Promise<boolean> => {
+      nextRenderWakeDelayMs = undefined;
       addSample(this.counters.decodeBacklogFrames, lastWorkerDecodeBacklogFrameCount);
       this.dropStaleQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
       this.dropOverflowQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
       addSample(this.counters.renderQueueFrames, renderQueue.length);
       this.recordAdaptiveBacklogPressure(lastWorkerDecodeBacklogFrameCount, renderQueue.length);
 
-      const candidateFrame = renderQueue.peekNewest();
-      if (!candidateFrame) {
+      const selected = renderQueue.takeNewestWhere((frame) => {
+        return renderTiming.isFrameDue(frame, this.sourceFrameRate(), this.options.targetLatencyMs);
+      });
+      if (selected.dropped.length > 0) {
+        this.recordRateLimitedFrames(selected.dropped, pendingVideoMessages, pendingReceiveTimesBySequence);
+      }
+
+      if (!selected.frame) {
+        nextRenderWakeDelayMs = renderTiming.waitMsUntilNextFrame(renderQueue, this.sourceFrameRate(), this.options.targetLatencyMs);
         return false;
       }
 
-      if (!this.isRenderFrameDue(candidateFrame)) {
-        this.dropSupersededQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
+      if (!this.isRenderFrameDue(selected.frame)) {
+        this.recordRateLimitedFrames([selected.frame], pendingVideoMessages, pendingReceiveTimesBySequence);
+        nextRenderWakeDelayMs = renderTiming.waitMsUntilNextFrame(renderQueue, this.sourceFrameRate(), this.options.targetLatencyMs);
         return false;
       }
 
-      this.dropSupersededQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
-      const frame = renderQueue.dequeue();
-      if (!frame) {
-        return false;
-      }
-
-      await this.renderFrame(frame, hasLiveMetadata, pendingVideoMessages, pendingReceiveTimesBySequence, abortSignal);
-      pendingVideoMessages.delete(frame.sequenceNumber);
-      pendingReceiveTimesBySequence.delete(frame.sequenceNumber);
+      await this.renderFrame(selected.frame, hasLiveMetadata, pendingVideoMessages, pendingReceiveTimesBySequence, abortSignal);
+      pendingVideoMessages.delete(selected.frame.sequenceNumber);
+      pendingReceiveTimesBySequence.delete(selected.frame.sequenceNumber);
       return true;
     };
 
@@ -490,7 +504,7 @@ export class VideoPipePlayerController {
         }
 
         if (!rendered) {
-          await renderSignal.wait(abortSignal);
+          await renderSignal.wait(abortSignal, nextRenderWakeDelayMs);
         }
       }
 
@@ -520,6 +534,7 @@ export class VideoPipePlayerController {
       }
 
       renderQueue.enqueue(decodedFrames);
+      renderTiming.waitMsUntilNextFrame(renderQueue, this.sourceFrameRate(), this.options.targetLatencyMs);
       renderSignal.notify();
     };
 
@@ -549,6 +564,7 @@ export class VideoPipePlayerController {
 
       if (event.type === "source") {
         this.applySelectedSource(event.source);
+        renderTiming.reset();
         this.dropQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
         pendingVideoMessages.clear();
         pendingReceiveTimesBySequence.clear();
@@ -566,6 +582,19 @@ export class VideoPipePlayerController {
         hasLiveMetadata = true;
         void this.metadataStore.ingestBatch(toTimedMetadataBatch(event.message)).then(() => {
           this.emit({ lastMessageAtUnixTimeMs: Date.now() });
+        });
+        return;
+      }
+
+      if (event.type === "progress") {
+        this.counters.bytesReceived = event.bytesReceived;
+        this.counters.messagesReceived = event.messagesReceived;
+        for (const receiveIntervalMs of event.receiveIntervalsMs) {
+          addSample(this.counters.receiveIntervalMs, receiveIntervalMs, 240);
+        }
+        addSample(this.counters.decodeBacklogFrames, event.backlogFrameCount);
+        this.emit({
+          lastMessageAtUnixTimeMs: event.lastMessageAtUnixTimeMs ?? Date.now(),
         });
         return;
       }
@@ -590,12 +619,6 @@ export class VideoPipePlayerController {
         }
         const renderedAtUnixTimeMs = Date.now();
         const serverTimestampUnixTimeMs = event.metadata?.serverTimestampUnixTimeMs ?? renderedAtUnixTimeMs;
-        if (typeof event.receivedAtUnixTimeMs === "number") {
-          if (lastReceivedVideoAtUnixTimeMs !== undefined) {
-            addSample(this.counters.receiveIntervalMs, event.receivedAtUnixTimeMs - lastReceivedVideoAtUnixTimeMs, 240);
-          }
-          lastReceivedVideoAtUnixTimeMs = event.receivedAtUnixTimeMs;
-        }
         addSample(this.counters.sourceToRenderMs, renderedAtUnixTimeMs - (event.metadata?.sourceTimestampUnixTimeMs ?? serverTimestampUnixTimeMs));
         addSample(this.counters.serverToRenderMs, renderedAtUnixTimeMs - serverTimestampUnixTimeMs);
         addSample(this.counters.receiveToRenderMs, renderedAtUnixTimeMs - (event.receivedAtUnixTimeMs ?? renderedAtUnixTimeMs));
@@ -622,7 +645,18 @@ export class VideoPipePlayerController {
           gpuUploadSource: event.gpuUploadSource,
           gpuAdapterVendor: event.gpuAdapterVendor,
           gpuAdapterArchitecture: event.gpuAdapterArchitecture,
-          matrixFallbackReason: "matrix-disabled: worker-offscreen",
+          matrixPresentMode: event.matrixPresentMode,
+          matrixPresentPath: event.matrixPresentPath,
+          matrixFlushCount: event.matrixFlushCount,
+          matrixPresentCount: event.matrixPresentCount,
+          matrixDrawCount: event.matrixDrawCount,
+          matrixExternalImportCount: event.matrixExternalImportCount,
+          matrixBindGroupCount: event.matrixBindGroupCount,
+          matrixVideoFrameCopyCount: event.matrixVideoFrameCopyCount,
+          matrixLastDirtySlotCount: event.matrixLastDirtySlotCount,
+          matrixFallbackReason: event.gpuPresentation === "worker-offscreen-matrix-canvas"
+            ? undefined
+            : "matrix-disabled: worker-offscreen",
         });
         return;
       }
@@ -669,6 +703,7 @@ export class VideoPipePlayerController {
         abortSignal,
         this.options.offscreenRenderTarget,
         this.options.metadataEnabled !== false,
+        this.options.matrixRenderTarget,
       );
 
       if (renderPumpError) {
@@ -698,17 +733,21 @@ export class VideoPipePlayerController {
     let waitingForKeyFrame = true;
     let hasLiveMetadata = false;
     const renderQueue = new LiveDecodedFrameQueue();
+    const renderTiming = new LiveRenderTimingController();
     const renderSignal = new LiveRenderSignal();
     let decoder = await this.createConfiguredDecoder(() => renderSignal.notify());
     const pendingVideoMessages = new Map<number, LiveVideoFrameMetadata>();
     const pendingReceiveTimesBySequence = new Map<number, number>();
     let renderPumpRunning = true;
     let renderPumpError: unknown;
+    let nextRenderWakeDelayMs: number | undefined;
     const renderAvailableFrames = async (): Promise<boolean> => {
+      nextRenderWakeDelayMs = undefined;
       const frames = decoder.drainDecodedFrames();
       if (frames.length > 0) {
         this.counters.framesDecoded += frames.length;
         renderQueue.enqueue(frames);
+        renderTiming.waitMsUntilNextFrame(renderQueue, this.sourceFrameRate(), this.options.targetLatencyMs);
       }
 
       const decodeBacklogFrameCount = decoder.liveBacklogFrameCount();
@@ -718,25 +757,27 @@ export class VideoPipePlayerController {
       addSample(this.counters.renderQueueFrames, renderQueue.length);
       this.recordAdaptiveBacklogPressure(decodeBacklogFrameCount, renderQueue.length);
 
-      const candidateFrame = renderQueue.peekNewest();
-      if (!candidateFrame) {
+      const selected = renderQueue.takeNewestWhere((frame) => {
+        return renderTiming.isFrameDue(frame, this.sourceFrameRate(), this.options.targetLatencyMs);
+      });
+      if (selected.dropped.length > 0) {
+        this.recordRateLimitedFrames(selected.dropped, pendingVideoMessages, pendingReceiveTimesBySequence);
+      }
+
+      if (!selected.frame) {
+        nextRenderWakeDelayMs = renderTiming.waitMsUntilNextFrame(renderQueue, this.sourceFrameRate(), this.options.targetLatencyMs);
         return false;
       }
 
-      if (!this.isRenderFrameDue(candidateFrame)) {
-        this.dropSupersededQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
+      if (!this.isRenderFrameDue(selected.frame)) {
+        this.recordRateLimitedFrames([selected.frame], pendingVideoMessages, pendingReceiveTimesBySequence);
+        nextRenderWakeDelayMs = renderTiming.waitMsUntilNextFrame(renderQueue, this.sourceFrameRate(), this.options.targetLatencyMs);
         return false;
       }
 
-      this.dropSupersededQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
-      const frame = renderQueue.dequeue();
-      if (!frame) {
-        return false;
-      }
-
-      await this.renderFrame(frame, hasLiveMetadata, pendingVideoMessages, pendingReceiveTimesBySequence, abortSignal);
-      pendingVideoMessages.delete(frame.sequenceNumber);
-      pendingReceiveTimesBySequence.delete(frame.sequenceNumber);
+      await this.renderFrame(selected.frame, hasLiveMetadata, pendingVideoMessages, pendingReceiveTimesBySequence, abortSignal);
+      pendingVideoMessages.delete(selected.frame.sequenceNumber);
+      pendingReceiveTimesBySequence.delete(selected.frame.sequenceNumber);
       return true;
     };
     const renderPump = (async (): Promise<void> => {
@@ -753,7 +794,7 @@ export class VideoPipePlayerController {
         }
 
         if (!rendered) {
-          await renderSignal.wait(abortSignal);
+          await renderSignal.wait(abortSignal, nextRenderWakeDelayMs);
         }
       }
 
@@ -785,6 +826,7 @@ export class VideoPipePlayerController {
           decoder.dispose();
           assembler = new EncodedChunkAssembler();
           decoder = await this.createConfiguredDecoder(() => renderSignal.notify());
+          renderTiming.reset();
           waitingForKeyFrame = true;
           this.dropQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
           pendingVideoMessages.clear();
@@ -846,6 +888,7 @@ export class VideoPipePlayerController {
           decoder.dispose();
           assembler = new EncodedChunkAssembler();
           decoder = await this.createConfiguredDecoder(() => renderSignal.notify());
+          renderTiming.reset();
           waitingForKeyFrame = false;
           this.dropQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
           pendingVideoMessages.clear();
@@ -869,6 +912,7 @@ export class VideoPipePlayerController {
             decoder.dispose();
             assembler = new EncodedChunkAssembler();
             decoder = await this.createConfiguredDecoder(() => renderSignal.notify());
+            renderTiming.reset();
             waitingForKeyFrame = true;
             this.dropQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
             pendingVideoMessages.clear();
@@ -901,6 +945,7 @@ export class VideoPipePlayerController {
           decoder.dispose();
           assembler = new EncodedChunkAssembler();
           decoder = await this.createConfiguredDecoder(() => renderSignal.notify());
+          renderTiming.reset();
           waitingForKeyFrame = true;
           this.dropQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
           pendingVideoMessages.clear();
@@ -1054,7 +1099,24 @@ export class VideoPipePlayerController {
     canvas.dataset.gpuUploadSource = event.gpuUploadSource ?? "external-texture";
     canvas.dataset.gpuAdapterVendor = event.gpuAdapterVendor ?? "";
     canvas.dataset.gpuAdapterArchitecture = event.gpuAdapterArchitecture ?? "";
-    canvas.dataset.matrixFallbackReason = "matrix-disabled: worker-offscreen";
+    if (event.matrixPresentMode) {
+      canvas.dataset.matrixPresentMode = event.matrixPresentMode;
+    }
+    if (event.matrixPresentPath) {
+      canvas.dataset.matrixPresentPath = event.matrixPresentPath;
+    }
+    setOptionalCanvasNumber(canvas, "matrixFlushCount", event.matrixFlushCount);
+    setOptionalCanvasNumber(canvas, "matrixPresentCount", event.matrixPresentCount);
+    setOptionalCanvasNumber(canvas, "matrixDrawCount", event.matrixDrawCount);
+    setOptionalCanvasNumber(canvas, "matrixExternalImportCount", event.matrixExternalImportCount);
+    setOptionalCanvasNumber(canvas, "matrixBindGroupCount", event.matrixBindGroupCount);
+    setOptionalCanvasNumber(canvas, "matrixVideoFrameCopyCount", event.matrixVideoFrameCopyCount);
+    setOptionalCanvasNumber(canvas, "matrixLastDirtySlotCount", event.matrixLastDirtySlotCount);
+    if (event.gpuPresentation === "worker-offscreen-matrix-canvas") {
+      delete canvas.dataset.matrixFallbackReason;
+    } else {
+      canvas.dataset.matrixFallbackReason = "matrix-disabled: worker-offscreen";
+    }
     canvas.dataset.gpuSampleRgba = "16,16,16,255";
     delete canvas.dataset.webGpuError;
     delete canvas.dataset.webGpuDisabledReason;
@@ -1130,14 +1192,6 @@ export class VideoPipePlayerController {
 
     const minimumIntervalMs = 1000 / maxFrameRate;
     return nowMs - this.lastRenderStartedAtMs >= minimumIntervalMs;
-  }
-
-  private dropSupersededQueuedFrames(
-    renderQueue: LiveDecodedFrameQueue,
-    messageBySequenceNumber: Map<number, LiveVideoFrameMetadata>,
-    receiveTimeBySequenceNumber: Map<number, number>,
-  ): void {
-    this.recordRateLimitedFrames(renderQueue.dropOldestUntil(1), messageBySequenceNumber, receiveTimeBySequenceNumber);
   }
 
   private expectedRenderFrameIntervalMs(): number | undefined {
@@ -1430,59 +1484,6 @@ export class VideoPipePlayerController {
 
 export { VideoPipePlayerController as VmsTileController };
 
-export class LiveDecodedFrameQueue {
-  private readonly frames: DecodedFramePlan[] = [];
-
-  public get length(): number {
-    return this.frames.length;
-  }
-
-  public enqueue(frames: readonly DecodedFramePlan[]): void {
-    this.frames.push(...frames);
-  }
-
-  public dequeue(): DecodedFramePlan | undefined {
-    return this.frames.shift();
-  }
-
-  public peekNewest(): DecodedFramePlan | undefined {
-    return this.frames[this.frames.length - 1];
-  }
-
-  public dropOldestUntil(maxFrames: number): DecodedFramePlan[] {
-    const dropped: DecodedFramePlan[] = [];
-    while (this.frames.length > maxFrames) {
-      const frame = this.frames.shift();
-      if (frame) {
-        dropped.push(frame);
-      }
-    }
-
-    return dropped;
-  }
-
-  public dropOldestWhile(
-    predicate: (frame: DecodedFramePlan) => boolean,
-    keepAtLeast = 0,
-  ): DecodedFramePlan[] {
-    const dropped: DecodedFramePlan[] = [];
-    while (this.frames.length > keepAtLeast) {
-      const frame = this.frames[0];
-      if (!frame || !predicate(frame)) {
-        break;
-      }
-
-      dropped.push(this.frames.shift()!);
-    }
-
-    return dropped;
-  }
-
-  public clear(): DecodedFramePlan[] {
-    return this.frames.splice(0);
-  }
-}
-
 class LiveRenderSignal {
   private resolveWaiter?: () => void;
   private readonly pollIntervalMs = 4;
@@ -1493,14 +1494,17 @@ class LiveRenderSignal {
     resolve?.();
   }
 
-  public wait(abortSignal: AbortSignal): Promise<void> {
+  public wait(abortSignal: AbortSignal, timeoutMs = this.pollIntervalMs): Promise<void> {
     if (abortSignal.aborted) {
       return Promise.resolve();
     }
 
     return new Promise<void>((resolve) => {
       let settled = false;
-      const timeoutHandle = setTimeout(finish, this.pollIntervalMs);
+      const normalizedTimeoutMs = Number.isFinite(timeoutMs) && timeoutMs > 0
+        ? Math.min(timeoutMs, 100)
+        : this.pollIntervalMs;
+      const timeoutHandle = setTimeout(finish, normalizedTimeoutMs);
       const abortListener = (): void => finish();
       const waiter = (): void => finish();
 
@@ -1785,6 +1789,14 @@ function normalizePositiveInteger(value: number | undefined): number | undefined
   return typeof value === "number" && Number.isFinite(value) && value > 0
     ? Math.floor(value)
     : undefined;
+}
+
+function setOptionalCanvasNumber(canvas: HTMLCanvasElement, name: string, value: number | undefined): void {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    return;
+  }
+
+  canvas.dataset[name] = String(value);
 }
 
 export function resolveTileSurfaceSize(canvasId: string, sourceWidth: number, sourceHeight: number): { width: number; height: number } {

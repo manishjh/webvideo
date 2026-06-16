@@ -50,7 +50,7 @@ public static class BrowserDemoWebTransportEndpoint
                 return;
             }
 
-            await HandleClientStreamAsync(channelId, catalog, liveFanout, stream, cancellationToken);
+            await HandleClientStreamAsync(channelId, catalog, liveFanout, webTransportSession, stream, cancellationToken);
             await DrainSessionAsync(webTransportSession, channelId, catalog, liveFanout, cancellationToken);
         }
         catch (KeyNotFoundException)
@@ -67,6 +67,7 @@ public static class BrowserDemoWebTransportEndpoint
         string routeChannelId,
         BrowserDemoStreamCatalog catalog,
         ContinuousRtspStreamFanout liveFanout,
+        IWebTransportSession webTransportSession,
         ConnectionContext stream,
         CancellationToken cancellationToken)
     {
@@ -86,21 +87,29 @@ public static class BrowserDemoWebTransportEndpoint
             {
                 var moqFrames = string.Equals(request.StreamMode, "continuous-binary", StringComparison.OrdinalIgnoreCase)
                     || string.Equals(request.StreamMode, "continuous-moq", StringComparison.OrdinalIgnoreCase);
-                await HandleContinuousClientStreamAsync(
-                    requestedChannelId,
-                    catalog,
-                    liveFanout,
-                    stream.Transport.Output,
-                    moqFrames,
-                    request.TargetLatencyMs,
-                    request.DesiredEgressFrameRate,
-                    request.DesiredMaxCodedWidth,
-                    request.DesiredMaxCodedHeight,
-                    request.EnableMetadata.GetValueOrDefault(true),
-                    request.ChaosDisconnectAfterFrames,
-                    request.ChaosFrameDelayMs,
-                    request.ChaosDropEveryNFrames,
-                    cancellationToken);
+                await using var mediaStream = await webTransportSession.OpenUnidirectionalStreamAsync(cancellationToken);
+                try
+                {
+                    await HandleContinuousClientStreamAsync(
+                        requestedChannelId,
+                        catalog,
+                        liveFanout,
+                        mediaStream.Transport.Output,
+                        moqFrames,
+                        request.TargetLatencyMs,
+                        request.DesiredEgressFrameRate,
+                        request.DesiredMaxCodedWidth,
+                        request.DesiredMaxCodedHeight,
+                        request.EnableMetadata.GetValueOrDefault(true),
+                        request.ChaosDisconnectAfterFrames,
+                        request.ChaosFrameDelayMs,
+                        request.ChaosDropEveryNFrames,
+                        cancellationToken);
+                }
+                finally
+                {
+                    await CompletePipeAsync(mediaStream.Transport.Output);
+                }
             }
             else
             {
@@ -462,7 +471,7 @@ public static class BrowserDemoWebTransportEndpoint
                     return;
                 }
 
-                await HandleClientStreamAsync(channelId, catalog, liveFanout, stream, timeout.Token);
+                await HandleClientStreamAsync(channelId, catalog, liveFanout, webTransportSession, stream, timeout.Token);
             }
         }
         catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)

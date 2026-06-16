@@ -36,6 +36,12 @@ describe("VMS runtime options", () => {
     });
   });
 
+  it("keeps explicit per-tile offscreen rendering for multi-tile performance mode", () => {
+    expect(createViewportOptions({ ...createBaseOptions(), offscreenCanvas: true }, 4)).toMatchObject({
+      offscreenCanvas: true,
+    });
+  });
+
   it("keeps native source policy for the fixed 2x2 wall", () => {
     expect(createViewportOptions(createBaseOptions(), 5)).toMatchObject({
       offscreenCanvas: false,
@@ -74,6 +80,7 @@ describe("VMS runtime options", () => {
       maxRenderFrameRate: 30,
       maxSourceCodedWidth: 3840,
       maxSourceCodedHeight: 2160,
+      targetLatencyMs: 50,
     }, 9)).toMatchObject({
       offscreenCanvas: false,
       maxHighFrameRateRenderFrameRate: 60,
@@ -82,7 +89,18 @@ describe("VMS runtime options", () => {
       maxSourceCodedWidth: 3840,
       maxSourceCodedHeight: 2160,
       maxSourceFrameRate: undefined,
+      targetLatencyMs: 50,
     });
+  });
+
+  it("includes explicit latency in the viewport session key", () => {
+    const baselineKey = createVideoPipeViewportSessionKey(createViewportOptions(createBaseOptions(), 1));
+    const lowLatencyKey = createVideoPipeViewportSessionKey(createViewportOptions({
+      ...createBaseOptions(),
+      targetLatencyMs: 50,
+    }, 1));
+
+    expect(lowLatencyKey).not.toBe(baselineKey);
   });
 
   it("keeps the shared matrix canvas active for the single-tile viewport path", () => {

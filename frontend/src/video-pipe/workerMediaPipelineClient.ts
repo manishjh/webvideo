@@ -26,6 +26,8 @@ export type WorkerFrameMetadata = {
   moqPublisherPriority?: number;
 };
 
+type WorkerGpuPowerPreference = "high-performance" | "low-power";
+
 export type WorkerDecodedFrameEnvelope = {
   frame: DecodedFramePlan;
   metadata?: WorkerFrameMetadata;
@@ -36,6 +38,11 @@ export interface WorkerOffscreenRenderTarget {
   canvas: OffscreenCanvas;
   canvasWidth: number;
   canvasHeight: number;
+}
+
+export interface WorkerMatrixRenderTarget {
+  canvasId: string;
+  port: MessagePort;
 }
 
 export type WorkerMediaPipelineEvent =
@@ -88,6 +95,23 @@ export type WorkerMediaPipelineEvent =
     gpuUploadSource?: string;
     gpuAdapterVendor?: string;
     gpuAdapterArchitecture?: string;
+    matrixPresentMode?: string;
+    matrixPresentPath?: string;
+    matrixFlushCount?: number;
+    matrixPresentCount?: number;
+    matrixDrawCount?: number;
+    matrixExternalImportCount?: number;
+    matrixBindGroupCount?: number;
+    matrixVideoFrameCopyCount?: number;
+    matrixLastDirtySlotCount?: number;
+  }
+  | {
+    type: "progress";
+    bytesReceived: number;
+    messagesReceived: number;
+    receiveIntervalsMs: number[];
+    backlogFrameCount: number;
+    lastMessageAtUnixTimeMs?: number;
   }
   | {
     type: "drop";
@@ -117,6 +141,11 @@ type WorkerRequest =
       canvasWidth: number;
       canvasHeight: number;
     };
+    matrixRenderTarget?: WorkerMatrixRenderTarget;
+    splitRenderWorker?: boolean;
+    gpuPowerPreference?: WorkerGpuPowerPreference;
+    workerTextureMode?: "auto" | "external" | "copy" | "bitmap";
+    predecodeFrameAdmission?: boolean;
   }
   | { type: "set-metadata-enabled"; enabled: boolean }
   | { type: "stop" };
@@ -171,6 +200,7 @@ export class WorkerMediaPipelineClient {
     abortSignal: AbortSignal,
     offscreenRenderTarget?: WorkerOffscreenRenderTarget,
     metadataEnabled = true,
+    matrixRenderTarget?: WorkerMatrixRenderTarget,
   ): Promise<void> {
     if (this.disposed) {
       return Promise.reject(new Error("Media pipeline worker has been disposed."));
@@ -204,8 +234,16 @@ export class WorkerMediaPipelineClient {
         targetLatencyMs,
         metadataEnabled,
         offscreenRenderTarget,
+        matrixRenderTarget,
+        splitRenderWorker: shouldUseSplitRenderWorker(),
+        gpuPowerPreference: resolveWorkerGpuPowerPreference(),
+        workerTextureMode: resolveWorkerTextureMode(),
+        predecodeFrameAdmission: shouldUsePredecodeFrameAdmission(),
       } satisfies WorkerRequest;
-      const transfer = offscreenRenderTarget ? [offscreenRenderTarget.canvas] : [];
+      const transfer = [
+        ...(offscreenRenderTarget ? [offscreenRenderTarget.canvas] : []),
+        ...(matrixRenderTarget ? [matrixRenderTarget.port] : []),
+      ];
       this.worker.postMessage(request, transfer);
     });
   }
@@ -275,4 +313,58 @@ export class WorkerMediaPipelineClient {
     clearTimeout(this.startupTimeoutId);
     this.startupTimeoutId = undefined;
   }
+}
+
+function resolveWorkerGpuPowerPreference(): WorkerGpuPowerPreference {
+  if (typeof window === "undefined") {
+    return "high-performance";
+  }
+
+  const mode = (
+    new URLSearchParams(window.location.search).get("webgpuPower")
+    ?? new URLSearchParams(window.location.search).get("gpuPower")
+    ?? ""
+  ).toLowerCase();
+  return ["low", "low-power", "integrated", "intel"].includes(mode)
+    ? "low-power"
+    : "high-performance";
+}
+
+function shouldUseSplitRenderWorker(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  const mode = new URLSearchParams(window.location.search).get("splitRenderWorker")?.toLowerCase();
+  return ["1", "true", "on", "split"].includes(mode ?? "");
+}
+
+function resolveWorkerTextureMode(): "auto" | "external" | "copy" | "bitmap" {
+  if (typeof window === "undefined") {
+    return "auto";
+  }
+
+  const mode = new URLSearchParams(window.location.search).get("workerTexture")?.toLowerCase();
+  if (["copy", "retained", "videoframe-copy"].includes(mode ?? "")) {
+    return "copy";
+  }
+
+  if (["bitmap", "downscale", "resized", "resize"].includes(mode ?? "")) {
+    return "bitmap";
+  }
+
+  if (["external", "direct", "zero-copy"].includes(mode ?? "")) {
+    return "external";
+  }
+
+  return "auto";
+}
+
+function shouldUsePredecodeFrameAdmission(): boolean {
+  if (typeof window === "undefined") {
+    return false;
+  }
+
+  const mode = new URLSearchParams(window.location.search).get("predecodeFrameAdmission")?.toLowerCase();
+  return ["1", "true", "yes", "on", "nonreference"].includes(mode ?? "");
 }

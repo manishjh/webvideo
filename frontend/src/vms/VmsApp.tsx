@@ -40,6 +40,7 @@ export interface RuntimeOptions {
   maxSourceCodedWidth?: number;
   maxSourceCodedHeight?: number;
   maxSourceFrameRate?: number;
+  targetLatencyMs?: number;
   chaosDisconnectAfterFrames?: number;
   chaosFrameDelayMs?: number;
   chaosDropEveryNFrames?: number;
@@ -226,7 +227,7 @@ export function VmsApp(): ReactElement {
     });
   }
 
-  const activeChannelGroups = createActiveChannelGroups(activeTiles, channels);
+  const activeChannelGroups = createActiveChannelGroups(activeTiles, channels, viewportOptions.offscreenCanvas);
   const activeTileModels = activeTiles
     .map((tile) => ({
       tile,
@@ -349,7 +350,7 @@ function canvasResetKeyForTile(
   offscreenCanvasEnabled: boolean,
   viewportSessionKey: string,
 ): string {
-  const renderMode = offscreenCanvasEnabled && channelTileCount === 1 ? "offscreen" : "shared";
+  const renderMode = offscreenCanvasEnabled ? "offscreen" : "shared";
   return `${tile.tileId}:${renderMode}:${channelTileCount}:${viewportSessionKey}`;
 }
 
@@ -378,8 +379,25 @@ function createDiagnosticTileMap(
 function createActiveChannelGroups(
   activeTiles: ActiveTileInstance[],
   channels: BrowserDemoChannelSummary[],
+  splitTilesByInstance = false,
 ): VideoPipeChannelGroup[] {
   const groups: VideoPipeChannelGroup[] = [];
+  if (splitTilesByInstance) {
+    for (const tile of activeTiles) {
+      const channel = channels.find((candidate) => candidate.channelId === tile.channelId);
+      if (!channel) {
+        continue;
+      }
+
+      groups.push({
+        channel,
+        tileIds: [tile.tileId],
+      });
+    }
+
+    return groups;
+  }
+
   for (const channelId of new Set(activeTiles.map((tile) => tile.channelId))) {
     const channel = channels.find((candidate) => candidate.channelId === channelId);
     if (!channel) {
@@ -447,10 +465,13 @@ function readRuntimeOptions(): RuntimeOptions {
   const maxSourceCodedWidth = readOptionalPositiveInt(params.get("maxSourceWidth"));
   const maxSourceCodedHeight = readOptionalPositiveInt(params.get("maxSourceHeight"));
   const maxSourceFrameRate = readOptionalRenderFrameRate(params.get("maxSourceFps"));
+  const targetLatencyMs = readOptionalPositiveInt(params.get("targetLatencyMs") ?? params.get("targetLatency"));
   const chaosDisconnectAfterFrames = readOptionalPositiveInt(params.get("chaosDisconnectAfterFrames"));
   const chaosFrameDelayMs = readOptionalPositiveInt(params.get("chaosFrameDelayMs"));
   const chaosDropEveryNFrames = readOptionalPositiveInt(params.get("chaosDropEveryNFrames"));
-  const offscreenCanvas = ["1", "true", "yes", "on"].includes((params.get("offscreen") ?? "0").toLowerCase());
+  const offscreenCanvas = ["1", "true", "yes", "on", "tile", "per-tile"].includes(
+    (params.get("offscreen") ?? "0").toLowerCase(),
+  );
   const renderClock = readRenderClock(params.get("renderClock"));
   return {
     batchFrameCount,
@@ -463,6 +484,7 @@ function readRuntimeOptions(): RuntimeOptions {
     maxSourceCodedWidth,
     maxSourceCodedHeight,
     maxSourceFrameRate,
+    targetLatencyMs,
     chaosDisconnectAfterFrames,
     chaosFrameDelayMs,
     chaosDropEveryNFrames,
@@ -511,22 +533,24 @@ export function createViewportOptions(
     || options.maxSourceCodedWidth !== undefined
     || options.maxSourceCodedHeight !== undefined
     || options.maxSourceFrameRate !== undefined
+    || options.targetLatencyMs !== undefined
   ) {
     return {
       ...options,
-      offscreenCanvas: tileCount <= 1 && options.offscreenCanvas,
+      offscreenCanvas: options.offscreenCanvas,
       maxHighFrameRateRenderFrameRate: normalizeRenderFrameRate(options.maxHighFrameRateRenderFrameRate),
       maxHighSourceFrameRate: normalizeRenderFrameRate(options.maxHighSourceFrameRate),
       maxRenderFrameRate: normalizeRenderFrameRate(options.maxRenderFrameRate),
       maxSourceCodedWidth: normalizePositiveInteger(options.maxSourceCodedWidth),
       maxSourceCodedHeight: normalizePositiveInteger(options.maxSourceCodedHeight),
       maxSourceFrameRate: normalizeRenderFrameRate(options.maxSourceFrameRate),
+      targetLatencyMs: normalizePositiveInteger(options.targetLatencyMs),
     };
   }
 
   return {
     ...options,
-    offscreenCanvas: tileCount <= 1 && options.offscreenCanvas,
+    offscreenCanvas: options.offscreenCanvas,
     maxHighFrameRateRenderFrameRate: undefined,
     maxHighSourceFrameRate: undefined,
     maxRenderFrameRate: undefined,

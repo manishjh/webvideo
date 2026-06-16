@@ -5,6 +5,8 @@ import type {
 } from "../contracts/models";
 import type {
   OffscreenMatrixOptions,
+  OffscreenMatrixRenderPortRequest,
+  OffscreenMatrixRenderPortResponse,
   OffscreenMatrixRenderResult,
   OffscreenMatrixSlotLayout,
   OffscreenMatrixWorkerRequest,
@@ -110,6 +112,12 @@ interface MatrixState {
   sampler: unknown;
   adapterInfo?: GpuAdapterLike["info"];
   format: string;
+  backingTexture?: {
+    texture: GpuTextureLike;
+    view: unknown;
+    width: number;
+    height: number;
+  };
   width: number;
   height: number;
   needsClear: boolean;
@@ -120,6 +128,26 @@ interface MatrixState {
   bindGroupCount: number;
   videoFrameCopyCount: number;
   lastDirtySlotCount: number;
+  lastPresentPath: "swapchain" | "retained-backing";
+  lastRenderMs: number;
+  lastImportExternalTextureMs: number;
+  lastBindGroupMs: number;
+  lastUniformMs: number;
+  lastEncodeMs: number;
+  lastSubmitMs: number;
+}
+
+interface MatrixDrawTimings {
+  importExternalTextureMs: number;
+  bindGroupMs: number;
+  uniformMs: number;
+}
+
+interface MatrixFlushTimings extends MatrixDrawTimings {
+  renderMs: number;
+  encodeMs: number;
+  submitMs: number;
+  presentPath: "swapchain" | "retained-backing";
 }
 
 const OverlayTextMaxChars = 32;
@@ -319,6 +347,7 @@ class OffscreenMatrixRenderer {
   private options: OffscreenMatrixOptions = {
     uploadMode: "auto",
     presentMode: "immediate",
+    retainMode: "auto",
   };
 
   public async initialize(request: Extract<OffscreenMatrixWorkerRequest, { type: "init" }>): Promise<void> {
@@ -328,7 +357,7 @@ class OffscreenMatrixRenderer {
       throw new Error("offscreen-matrix-webgpu-unavailable");
     }
 
-    const adapter = await gpu.requestAdapter({ powerPreference: "high-performance" });
+    const adapter = await gpu.requestAdapter({ powerPreference: request.options.powerPreference ?? "high-performance" });
     if (!adapter) {
       throw new Error("offscreen-matrix-no-adapter");
     }
@@ -376,6 +405,7 @@ class OffscreenMatrixRenderer {
       sampler,
       adapterInfo,
       format,
+      backingTexture: undefined,
       width: 0,
       height: 0,
       needsClear: true,
@@ -386,6 +416,13 @@ class OffscreenMatrixRenderer {
       bindGroupCount: 0,
       videoFrameCopyCount: 0,
       lastDirtySlotCount: 0,
+      lastPresentPath: "swapchain",
+      lastRenderMs: 0,
+      lastImportExternalTextureMs: 0,
+      lastBindGroupMs: 0,
+      lastUniformMs: 0,
+      lastEncodeMs: 0,
+      lastSubmitMs: 0,
     };
     this.updateLayout(request.canvasWidth, request.canvasHeight, request.slots);
     post({
@@ -408,8 +445,10 @@ class OffscreenMatrixRenderer {
         device: state.device,
         format: state.format,
         alphaMode: "premultiplied",
-        usage: getGpuTextureUsage().renderAttachment,
+        usage: getGpuTextureUsage().renderAttachment | getGpuTextureUsage().copyDst,
       });
+      state.backingTexture?.texture.destroy?.();
+      state.backingTexture = undefined;
       state.needsClear = true;
     }
 
@@ -455,7 +494,33 @@ class OffscreenMatrixRenderer {
     this.slots.delete(canvasId);
     if (this.state) {
       this.state.needsClear = true;
+      this.flush(this.state);
     }
+  }
+
+  public connectRenderPort(canvasId: string, port: MessagePort): void {
+    port.onmessage = (event: MessageEvent<OffscreenMatrixRenderPortRequest>) => {
+      try {
+        if (event.data.type === "stop") {
+          port.close();
+          return;
+        }
+
+        const result = this.render(canvasId, event.data.frame, event.data.activeMetadata);
+        port.postMessage({
+          type: "rendered",
+          requestId: event.data.requestId,
+          result,
+        } satisfies OffscreenMatrixRenderPortResponse);
+      } catch (error) {
+        port.postMessage({
+          type: "error",
+          requestId: "requestId" in event.data ? event.data.requestId : undefined,
+          message: error instanceof Error ? error.message : String(error),
+        } satisfies OffscreenMatrixRenderPortResponse);
+      }
+    };
+    port.start?.();
   }
 
   public render(canvasId: string, frame: DecodedFramePlan, activeMetadata: TimedMetadataBatch[]): OffscreenMatrixRenderResult {
@@ -492,41 +557,137 @@ class OffscreenMatrixRenderer {
 
   private flush(state: MatrixState): void {
     const drawableSlots = [...this.slots.values()].filter((slot) => Boolean(slot.currentFrame));
-    const dirtySlots = drawableSlots.filter((slot) => state.needsClear || slot.redrawNeeded);
+    const redrawAllSlots = state.needsClear;
+    const dirtySlots = drawableSlots.filter((slot) => redrawAllSlots || slot.redrawNeeded);
     state.flushCount += 1;
     state.lastDirtySlotCount = dirtySlots.length;
 
-    if (drawableSlots.length === 0) {
+    if (drawableSlots.length === 0 && !state.needsClear) {
       state.needsClear = false;
       return;
     }
 
+    const renderStart = performance.now();
+    const presentPath = this.selectPresentPath(state, drawableSlots, dirtySlots, redrawAllSlots);
+    const slotsToDraw = presentPath === "swapchain" ? drawableSlots : dirtySlots;
+    let importExternalTextureMs = 0;
+    let bindGroupMs = 0;
+    let uniformMs = 0;
+
     const commandEncoder = state.device.createCommandEncoder();
+    const colorAttachmentView = presentPath === "swapchain"
+      ? state.context.getCurrentTexture().createView()
+      : this.ensureBackingTexture(state).view;
     const pass = commandEncoder.beginRenderPass({
       colorAttachments: [
         {
-          view: state.context.getCurrentTexture().createView(),
+          view: colorAttachmentView,
           clearValue: { r: 0, g: 0, b: 0, a: 0 },
-          loadOp: "clear",
+          loadOp: presentPath === "swapchain" || redrawAllSlots ? "clear" : "load",
           storeOp: "store",
         },
       ],
     });
 
-    for (const slot of drawableSlots) {
-      this.drawSlot(state, pass, slot);
+    for (const slot of slotsToDraw) {
+      const timings = this.drawSlot(state, pass, slot);
+      importExternalTextureMs += timings.importExternalTextureMs;
+      bindGroupMs += timings.bindGroupMs;
+      uniformMs += timings.uniformMs;
     }
 
     pass.end();
     state.presentCount += 1;
+    if (presentPath === "retained-backing") {
+      const backingTexture = this.ensureBackingTexture(state);
+      commandEncoder.copyTextureToTexture(
+        { texture: backingTexture.texture },
+        { texture: state.context.getCurrentTexture() },
+        { width: state.width, height: state.height, depthOrArrayLayers: 1 },
+      );
+    }
+    const encodeEnd = performance.now();
     state.device.queue.submit([commandEncoder.finish()]);
+    const submitEnd = performance.now();
+    const encodeMs = Math.max(0, encodeEnd - renderStart - importExternalTextureMs - bindGroupMs - uniformMs);
+    const timings: MatrixFlushTimings = {
+      renderMs: submitEnd - renderStart,
+      importExternalTextureMs,
+      bindGroupMs,
+      uniformMs,
+      encodeMs,
+      submitMs: submitEnd - encodeEnd,
+      presentPath,
+    };
+    this.recordFlushTimings(state, timings);
     state.needsClear = false;
   }
 
-  private drawSlot(state: MatrixState, pass: GpuRenderPassEncoderLike, slot: Slot): void {
+  private selectPresentPath(
+    state: MatrixState,
+    drawableSlots: readonly Slot[],
+    dirtySlots: readonly Slot[],
+    redrawAllSlots: boolean,
+  ): MatrixFlushTimings["presentPath"] {
+    if (this.options.retainMode === "backing") {
+      return "retained-backing";
+    }
+
+    if (this.options.retainMode === "swapchain") {
+      return "swapchain";
+    }
+
+    if (drawableSlots.length <= 1 || redrawAllSlots || dirtySlots.length === drawableSlots.length) {
+      return "swapchain";
+    }
+
+    return "retained-backing";
+  }
+
+  private recordFlushTimings(state: MatrixState, timings: MatrixFlushTimings): void {
+    state.lastPresentPath = timings.presentPath;
+    state.lastRenderMs = timings.renderMs;
+    state.lastImportExternalTextureMs = timings.importExternalTextureMs;
+    state.lastBindGroupMs = timings.bindGroupMs;
+    state.lastUniformMs = timings.uniformMs;
+    state.lastEncodeMs = timings.encodeMs;
+    state.lastSubmitMs = timings.submitMs;
+  }
+
+  private ensureBackingTexture(state: MatrixState): NonNullable<MatrixState["backingTexture"]> {
+    if (
+      state.backingTexture
+      && state.backingTexture.width === state.width
+      && state.backingTexture.height === state.height
+    ) {
+      return state.backingTexture;
+    }
+
+    state.backingTexture?.texture.destroy?.();
+    const textureUsage = getGpuTextureUsage();
+    const texture = state.device.createTexture({
+      size: { width: state.width, height: state.height },
+      format: state.format,
+      usage: textureUsage.renderAttachment | textureUsage.copySrc,
+    });
+    state.backingTexture = {
+      texture,
+      view: texture.createView(),
+      width: state.width,
+      height: state.height,
+    };
+    state.needsClear = true;
+    return state.backingTexture;
+  }
+
+  private drawSlot(state: MatrixState, pass: GpuRenderPassEncoderLike, slot: Slot): MatrixDrawTimings {
     const frame = slot.currentFrame;
     if (!frame) {
-      return;
+      return {
+        importExternalTextureMs: 0,
+        bindGroupMs: 0,
+        uniformMs: 0,
+      };
     }
 
     this.ensureSlotResources(state, slot);
@@ -534,15 +695,20 @@ class OffscreenMatrixRenderer {
       throw new Error("Offscreen matrix OSD resources are unavailable.");
     }
 
+    const uniformStart = performance.now();
     writeOverlayUniform(frame.activeMetadata, slot.overlayUniform);
     state.device.queue.writeBuffer(slot.overlayBuffer, 0, slot.overlayUniform);
+    const uniformEnd = performance.now();
+    const importStart = uniformEnd;
     const externalTexture = state.device.importExternalTexture?.({ source: frame.frame });
     if (!externalTexture) {
       throw new Error("Offscreen matrix external texture import failed.");
     }
+    const importEnd = performance.now();
 
     state.externalImportCount += 1;
     state.bindGroupCount += 1;
+    const bindGroupStart = importEnd;
     const bindGroup = state.device.createBindGroup({
       layout: state.externalPipeline.getBindGroupLayout?.(0),
       entries: [
@@ -562,6 +728,7 @@ class OffscreenMatrixRenderer {
         },
       ],
     });
+    const bindGroupEnd = performance.now();
     const x = Math.max(0, Math.floor(slot.layout.x));
     const y = Math.max(0, Math.floor(slot.layout.y));
     const width = Math.max(1, Math.floor(slot.layout.width));
@@ -573,6 +740,11 @@ class OffscreenMatrixRenderer {
     pass.draw(6);
     state.drawCount += 1;
     slot.redrawNeeded = false;
+    return {
+      importExternalTextureMs: importEnd - importStart,
+      bindGroupMs: bindGroupEnd - bindGroupStart,
+      uniformMs: uniformEnd - uniformStart,
+    };
   }
 
   private ensureSlotResources(state: MatrixState, slot: Slot): void {
@@ -596,7 +768,7 @@ class OffscreenMatrixRenderer {
       overlayPrimitiveCount: countOverlayPrimitives(frame?.activeMetadata ?? []),
       renderBackend: "webgpu",
       matrixPresentMode: this.options.presentMode,
-      matrixPresentPath: "direct",
+      matrixPresentPath: state.lastPresentPath,
       matrixFlushCount: state.flushCount,
       matrixPresentCount: state.presentCount,
       matrixDrawCount: state.drawCount,
@@ -604,6 +776,12 @@ class OffscreenMatrixRenderer {
       matrixBindGroupCount: state.bindGroupCount,
       matrixVideoFrameCopyCount: state.videoFrameCopyCount,
       matrixLastDirtySlotCount: state.lastDirtySlotCount,
+      renderMs: state.lastRenderMs,
+      importExternalTextureMs: state.lastImportExternalTextureMs,
+      bindGroupMs: state.lastBindGroupMs,
+      uniformMs: state.lastUniformMs,
+      encodeMs: state.lastEncodeMs,
+      submitMs: state.lastSubmitMs,
       gpuPresentation: GpuPresentation,
       gpuUploadSource: frame?.gpuUploadSource ?? "external-texture",
       gpuAdapterVendor: state.adapterInfo?.vendor,
@@ -647,6 +825,11 @@ async function handleMessage(message: OffscreenMatrixWorkerRequest): Promise<voi
 
     if (message.type === "layout") {
       renderer?.updateLayout(message.canvasWidth, message.canvasHeight, message.slots);
+      return;
+    }
+
+    if (message.type === "connect-render-port") {
+      renderer?.connectRenderPort(message.canvasId, message.port);
       return;
     }
 

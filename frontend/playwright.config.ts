@@ -58,24 +58,50 @@ export default defineConfig({
 });
 
 function createWebGpuArgs(preset: string): string[] {
-  const baseArgs = [
-    "--enable-unsafe-webgpu",
-    "--ignore-gpu-blocklist",
-  ];
+  const baseArgs = ["--enable-unsafe-webgpu", "--ignore-gpu-blocklist"];
 
   switch (preset) {
     case "minimal":
       return baseArgs;
+    case "video-safe-vulkan":
+      return [
+        ...baseArgs,
+        enableFeatures([
+          "Vulkan",
+          "VulkanFromANGLE",
+          "AcceleratedVideoDecodeLinuxZeroCopyGL",
+          "AcceleratedVideoDecodeLinuxGL",
+          "VaapiIgnoreDriverChecks",
+          "VaapiOnNvidiaGPUs",
+        ]),
+      ];
+    case "video-strict-vulkan":
+      return [
+        ...baseArgs,
+        enableFeatures([
+          "Vulkan",
+          "VulkanFromANGLE",
+          "DefaultANGLEVulkan",
+          "AcceleratedVideoDecodeLinuxZeroCopyGL",
+          "AcceleratedVideoDecodeLinuxGL",
+          "VaapiIgnoreDriverChecks",
+          "VaapiOnNvidiaGPUs",
+        ]),
+      ];
     case "strict-vulkan":
       return [
         ...baseArgs,
-        "--enable-features=Vulkan,VulkanFromANGLE,DefaultANGLEVulkan",
+        enableFeatures(["Vulkan", "VulkanFromANGLE", "DefaultANGLEVulkan"]),
       ];
     case "safe-vulkan":
     default:
       return [
         ...baseArgs,
-        "--enable-features=Vulkan,VulkanFromANGLE",
+        enableFeatures(["Vulkan", "VulkanFromANGLE"]),
       ];
   }
+}
+
+function enableFeatures(features: readonly string[]): string {
+  return `--enable-features=${features.join(",")}`;
 }

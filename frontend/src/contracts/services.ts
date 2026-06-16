@@ -64,6 +64,7 @@ type WebTransportLike = {
   ready?: Promise<void>;
   closed?: Promise<void>;
   createBidirectionalStream?: () => Promise<WebTransportBidirectionalStreamLike>;
+  incomingUnidirectionalStreams?: ReadableStream<ReadableStream<Uint8Array>>;
   close?: () => void;
 };
 
@@ -858,6 +859,37 @@ async function closeWebTransportSession(transport: WebTransportLike): Promise<vo
       globalThis.setTimeout(resolve, 500);
     }),
   ]);
+}
+
+async function resolveContinuousMediaReadable(
+  transport: WebTransportLike,
+  fallbackReadable: ReadableStream<Uint8Array>,
+): Promise<ReadableStream<Uint8Array>> {
+  const incoming = transport.incomingUnidirectionalStreams;
+  if (!incoming) {
+    return fallbackReadable;
+  }
+
+  const reader = incoming.getReader();
+  let timeout: ReturnType<typeof setTimeout> | undefined;
+  try {
+    const result = await Promise.race([
+      reader.read(),
+      new Promise<ReadableStreamReadResult<ReadableStream<Uint8Array>>>((resolve) => {
+        timeout = globalThis.setTimeout(() => resolve({ done: true, value: undefined }), 2_000);
+      }),
+    ]);
+    if (!result.done && result.value) {
+      return result.value;
+    }
+  } finally {
+    if (timeout !== undefined) {
+      clearTimeout(timeout);
+    }
+    reader.releaseLock();
+  }
+
+  return fallbackReadable;
 }
 
 function findStartCode(bytes: Uint8Array, offset: number): { index: number; length: number } | undefined {
@@ -2002,6 +2034,7 @@ export class WebTransportIngestClient {
       webTransportMessagesReceived: 0,
     };
 
+    const mediaReadable = await resolveContinuousMediaReadable(transport, stream.readable);
     this.connections.set(handle.connectionId, {
       handle,
       endpoint: {
@@ -2011,7 +2044,7 @@ export class WebTransportIngestClient {
       remainingVideoMessages: [],
       remainingMetadataMessages: [],
       transport,
-      reader: stream.readable.getReader(),
+      reader: mediaReadable.getReader(),
       pendingText: "",
       pendingBinary: new Uint8Array(0),
       pendingBinaryOffset: 0,

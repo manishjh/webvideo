@@ -4,9 +4,11 @@ import {
   AdaptiveRenderCadence,
   AdaptiveRenderFrameGovernor,
   LiveDecodedFrameQueue,
+  LiveRenderTimingController,
   resolveAdaptiveRenderDurationPressureSeverity,
   resolveLiveDecodeBacklogBudgetFrames,
   resolveLiveHardDecodeBacklogFrames,
+  resolveLiveRenderPlayoutDelayMs,
   resolveLiveRenderQueueBudgetFrames,
   resolveLiveStaleFrameDropThresholdMs,
   resolveEffectiveRenderFrameRate,
@@ -23,6 +25,10 @@ import {
   shouldUseWorkerMediaPipeline,
   WorkerMediaPipelineClient,
 } from "../../src/video-pipe/workerMediaPipelineClient";
+import {
+  EncodedFrameAdmissionController,
+  isDroppableNonReferenceAvcAnnexBFrame,
+} from "../../src/video-pipe/encodedFrameAdmission";
 
 describe("VMS player controller", () => {
   it("keeps decoded burst frames for the render pump instead of dropping them immediately", () => {
@@ -71,6 +77,63 @@ describe("VMS player controller", () => {
     expect(queue.peekNewest()?.sequenceNumber).toBe(3);
     expect(queue.length).toBe(3);
     expect(queue.dequeue()?.sequenceNumber).toBe(1);
+  });
+
+  it("keeps future frames buffered until their media timestamp is due", () => {
+    const queue = new LiveDecodedFrameQueue();
+    const timing = new LiveRenderTimingController();
+    const playoutDelayMs = resolveLiveRenderPlayoutDelayMs(60, 150);
+
+    queue.enqueue([
+      createFrame(1),
+      createFrame(2),
+    ]);
+
+    expect(queue.takeNewestWhere((frame) => timing.isFrameDue(frame, 60, 150, 1_000)).frame).toBeUndefined();
+    expect(queue.length).toBe(2);
+    expect(timing.waitMsUntilNextFrame(queue, 60, 150, 1_000)).toBeCloseTo(playoutDelayMs, 1);
+
+    const firstSelection = queue.takeNewestWhere((frame) => {
+      return timing.isFrameDue(frame, 60, 150, 1_000 + playoutDelayMs + 1);
+    });
+
+    expect(firstSelection.frame?.sequenceNumber).toBe(1);
+    expect(firstSelection.dropped).toEqual([]);
+    expect(queue.length).toBe(1);
+    expect(queue.peekOldest()?.sequenceNumber).toBe(2);
+  });
+
+  it("drops old due frames and presents the newest due frame after a burst", () => {
+    const queue = new LiveDecodedFrameQueue();
+    const timing = new LiveRenderTimingController();
+    const playoutDelayMs = resolveLiveRenderPlayoutDelayMs(60, 150);
+
+    queue.enqueue([
+      createFrame(1),
+      createFrame(2),
+      createFrame(3),
+      createFrame(4),
+    ]);
+    timing.waitMsUntilNextFrame(queue, 60, 150, 1_000);
+
+    const selection = queue.takeNewestWhere((frame) => {
+      return timing.isFrameDue(frame, 60, 150, 1_000 + playoutDelayMs + 55);
+    });
+
+    expect(selection.frame?.sequenceNumber).toBe(4);
+    expect(selection.dropped.map((frame) => frame.sequenceNumber)).toEqual([1, 2, 3]);
+    expect(queue.length).toBe(0);
+  });
+
+  it("resets render timing when media timestamps jump backwards", () => {
+    const timing = new LiveRenderTimingController();
+    const playoutDelayMs = resolveLiveRenderPlayoutDelayMs(60, 150);
+
+    const firstDueMs = timing.dueTimeMs(createFrame(60), 60, 150, 1_000);
+    const resetDueMs = timing.dueTimeMs(createFrame(1), 60, 150, 2_000);
+
+    expect(firstDueMs).toBeCloseTo(1_000 + playoutDelayMs, 1);
+    expect(resetDueMs).toBeCloseTo(2_000 + playoutDelayMs, 1);
   });
 
   it("keeps at least one frame while dropping stale decoded frames", () => {
@@ -607,6 +670,82 @@ describe("VMS player controller", () => {
     });
   });
 
+  it("classifies only non-reference AVC Annex B delta frames as pre-decode droppable", () => {
+    expect(isDroppableNonReferenceAvcAnnexBFrame(annexB(0x01, [1, 2, 3]), "avc1.640033")).toBe(true);
+    expect(isDroppableNonReferenceAvcAnnexBFrame(annexB(0x21, [1, 2, 3]), "avc1.640033")).toBe(false);
+    expect(isDroppableNonReferenceAvcAnnexBFrame(annexB(0x65, [1, 2, 3]), "avc1.640033")).toBe(false);
+    expect(isDroppableNonReferenceAvcAnnexBFrame(annexB(0x01, [1, 2, 3]), "hev1.1.6.L120")).toBe(false);
+  });
+
+  it("admits reference frames while shedding non-reference frames under render-import pressure", () => {
+    const controller = new EncodedFrameAdmissionController();
+    controller.recordPresentedFrame({
+      renderMs: 30,
+      importExternalTextureMs: 30,
+      sourceFrameRate: 60,
+    });
+
+    expect(controller.decideBeforeDecode({
+      keyFrame: true,
+      presentationTimestampUs: 0,
+      payload: annexB(0x65),
+    }, "avc1.640033", 60)).toEqual({ admit: true });
+    expect(controller.decideBeforeDecode({
+      keyFrame: false,
+      presentationTimestampUs: 16_667,
+      payload: annexB(0x01),
+    }, "avc1.640033", 60)).toEqual({
+      admit: false,
+      reason: "predecode-nonreference-render-budget",
+    });
+    expect(controller.decideBeforeDecode({
+      keyFrame: false,
+      presentationTimestampUs: 33_333,
+      payload: annexB(0x21),
+    }, "avc1.640033", 60)).toEqual({ admit: true });
+    expect(controller.decideBeforeDecode({
+      keyFrame: false,
+      presentationTimestampUs: 50_000,
+      payload: annexB(0x01),
+    }, "avc1.640033", 60)).toEqual({
+      admit: false,
+      reason: "predecode-nonreference-render-budget",
+    });
+  });
+
+  it("recovers pre-decode admission when render service time returns under source cadence", () => {
+    const controller = new EncodedFrameAdmissionController();
+    controller.recordPresentedFrame({
+      renderMs: 45,
+      importExternalTextureMs: 45,
+      sourceFrameRate: 60,
+    });
+    controller.decideBeforeDecode({
+      keyFrame: true,
+      presentationTimestampUs: 0,
+      payload: annexB(0x65),
+    }, "avc1.640033", 60);
+    expect(controller.decideBeforeDecode({
+      keyFrame: false,
+      presentationTimestampUs: 16_667,
+      payload: annexB(0x01),
+    }, "avc1.640033", 60).admit).toBe(false);
+
+    for (let sample = 0; sample < 18; sample += 1) {
+      controller.recordPresentedFrame({
+        renderMs: 4,
+        importExternalTextureMs: 4,
+        sourceFrameRate: 60,
+      });
+    }
+
+    expect(controller.decideBeforeDecode({
+      keyFrame: false,
+      presentationTimestampUs: 33_333,
+      payload: annexB(0x01),
+    }, "avc1.640033", 60)).toEqual({ admit: true });
+  });
+
   it("selects a fractional render cadence instead of collapsing to every other frame", () => {
     const cadence = new AdaptiveRenderCadence();
     const selected: number[] = [];
@@ -673,4 +812,8 @@ function createFrame(sequenceNumber: number): DecodedFramePlan {
     height: 720,
     decodeBackend: "webcodecs",
   };
+}
+
+function annexB(nalHeader: number, body: readonly number[] = [0]): Uint8Array {
+  return new Uint8Array([0, 0, 0, 1, nalHeader, ...body]);
 }

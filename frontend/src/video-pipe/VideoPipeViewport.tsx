@@ -7,8 +7,9 @@ import {
   type VideoPipeRuntimeState,
   resolveTileSurfaceSize,
 } from "./playerController";
+import { createOffscreenMatrixRenderTarget } from "./offscreenMatrixRenderer";
 import { createSharedVideoViewportRenderer } from "./sharedViewport";
-import type { WorkerOffscreenRenderTarget } from "./workerMediaPipelineClient";
+import type { WorkerMatrixRenderTarget, WorkerOffscreenRenderTarget } from "./workerMediaPipelineClient";
 
 export interface VideoPipeChannelGroup {
   channel: VideoPipeChannel;
@@ -76,7 +77,7 @@ export function VideoPipeViewport({
           canvasIdForTile={canvasIdForTile}
           channelGroup={group}
           metadataEnabledByTile={metadataEnabledByTile}
-          key={`${group.channel.channelId}:${createVideoPipeViewportSessionKey(options)}:${group.tileIds.length}`}
+          key={`${group.channel.channelId}:${group.tileIds.join(",")}:${createVideoPipeViewportSessionKey(options)}`}
           matrixCanvasId={matrixCanvasId}
           options={options}
           serverCertificateHash={serverCertificateHash}
@@ -98,6 +99,10 @@ interface VideoPipeChannelSessionProps {
   serverCertificateHash?: string;
   onState: (tileIds: string[], state: VideoPipeRuntimeState) => void;
 }
+
+type MatrixRenderTargetLease = WorkerMatrixRenderTarget & {
+  release: () => void;
+};
 
 function VideoPipeChannelSession({
   authToken,
@@ -147,6 +152,7 @@ function VideoPipeChannelSession({
       maxSourceCodedWidth: options.maxSourceCodedWidth,
       maxSourceCodedHeight: options.maxSourceCodedHeight,
       maxSourceFrameRate: options.maxSourceFrameRate,
+      targetLatencyMs: options.targetLatencyMs,
       renderClock: options.renderClock,
     });
   }, [
@@ -158,10 +164,12 @@ function VideoPipeChannelSession({
     options.maxSourceCodedWidth,
     options.maxSourceCodedHeight,
     options.maxSourceFrameRate,
+    options.targetLatencyMs,
     options.renderClock,
   ]);
 
   useEffect(() => {
+    let cancelled = false;
     const startupOptions = startupOptionsRef.current;
     const renderer = createSharedVideoViewportRenderer({
       getCanvasIds: () => tileIdsRef.current.map((tileId) => canvasIdForTileRef.current(tileId)),
@@ -174,50 +182,78 @@ function VideoPipeChannelSession({
     });
     const firstTileId = tileIdsRef.current[0] ?? channelGroup.channel.channelId;
     const firstCanvasId = canvasIdForTileRef.current(firstTileId);
-    const offscreenRenderTarget = createOffscreenRenderTarget(
-      startupOptions.offscreenCanvas === true,
-      firstCanvasId,
-      channelGroup.channel,
-      tileIdsRef.current.length,
-    );
-    const controller = new VideoPipePlayerController({
-      tileId: `tile-${channelGroup.channel.channelId}`,
-      channel: channelGroup.channel,
-      canvasId: firstCanvasId,
-      renderer,
-      authToken,
-      serverCertificateHash,
-      adaptiveRenderFrameRate: startupOptions.adaptiveRenderFrameRate,
-      adaptiveSourceFrameRate: startupOptions.adaptiveSourceFrameRate,
-      batchFrameCount: startupOptions.batchFrameCount,
-      targetBatches: startupOptions.targetBatches,
-      targetLatencyMs: startupOptions.targetLatencyMs ?? 150,
-      maxHighFrameRateRenderFrameRate: startupOptions.maxHighFrameRateRenderFrameRate,
-      maxHighSourceFrameRate: startupOptions.maxHighSourceFrameRate,
-      maxRenderFrameRate: startupOptions.maxRenderFrameRate,
-      maxSourceCodedWidth: startupOptions.maxSourceCodedWidth,
-      maxSourceCodedHeight: startupOptions.maxSourceCodedHeight,
-      maxSourceFrameRate: startupOptions.maxSourceFrameRate,
-      chaosDisconnectAfterFrames: startupOptions.chaosDisconnectAfterFrames,
-      chaosFrameDelayMs: startupOptions.chaosFrameDelayMs,
-      chaosDropEveryNFrames: startupOptions.chaosDropEveryNFrames,
-      metadataEnabled: metadataEnabledByTileRef.current[firstTileId] !== false,
-      offscreenRenderTarget,
-      renderClock: startupOptions.renderClock,
-      onState: (nextState) => onStateRef.current(tileIdsRef.current, nextState),
-    });
-    controllerRef.current = controller;
-    controller.start();
+    let controller: VideoPipePlayerController | undefined;
+    let matrixRenderTargetLease: MatrixRenderTargetLease | undefined;
+
+    void (async () => {
+      const offscreenRenderTarget = createOffscreenRenderTarget(
+        startupOptions.offscreenCanvas === true,
+        firstCanvasId,
+        channelGroup.channel,
+        tileIdsRef.current.length,
+      );
+      matrixRenderTargetLease = await createMatrixRenderTarget(
+        startupOptions.matrixCompositor === true && !offscreenRenderTarget,
+        matrixCanvasId,
+        () => tileIdsRef.current.map((tileId) => canvasIdForTileRef.current(tileId)),
+        firstCanvasId,
+        channelGroup.channel,
+        tileIdsRef.current.length,
+      );
+      if (cancelled) {
+        matrixRenderTargetLease?.port.close();
+        matrixRenderTargetLease?.release();
+        return;
+      }
+
+      controller = new VideoPipePlayerController({
+        tileId: `tile-${channelGroup.channel.channelId}`,
+        channel: channelGroup.channel,
+        canvasId: firstCanvasId,
+        renderer,
+        authToken,
+        serverCertificateHash,
+        adaptiveRenderFrameRate: startupOptions.adaptiveRenderFrameRate,
+        adaptiveSourceFrameRate: startupOptions.adaptiveSourceFrameRate,
+        batchFrameCount: startupOptions.batchFrameCount,
+        targetBatches: startupOptions.targetBatches,
+        targetLatencyMs: startupOptions.targetLatencyMs ?? 75,
+        maxHighFrameRateRenderFrameRate: startupOptions.maxHighFrameRateRenderFrameRate,
+        maxHighSourceFrameRate: startupOptions.maxHighSourceFrameRate,
+        maxRenderFrameRate: startupOptions.maxRenderFrameRate,
+        maxSourceCodedWidth: startupOptions.maxSourceCodedWidth,
+        maxSourceCodedHeight: startupOptions.maxSourceCodedHeight,
+        maxSourceFrameRate: startupOptions.maxSourceFrameRate,
+        chaosDisconnectAfterFrames: startupOptions.chaosDisconnectAfterFrames,
+        chaosFrameDelayMs: startupOptions.chaosFrameDelayMs,
+        chaosDropEveryNFrames: startupOptions.chaosDropEveryNFrames,
+        metadataEnabled: metadataEnabledByTileRef.current[firstTileId] !== false,
+        matrixRenderTarget: matrixRenderTargetLease
+          ? {
+            canvasId: matrixRenderTargetLease.canvasId,
+            port: matrixRenderTargetLease.port,
+          }
+          : undefined,
+        offscreenRenderTarget,
+        renderClock: startupOptions.renderClock,
+        onState: (nextState) => onStateRef.current(tileIdsRef.current, nextState),
+      });
+      controllerRef.current = controller;
+      controller.start();
+    })();
 
     return () => {
+      cancelled = true;
       controllerRef.current = undefined;
-      controller.stop();
+      controller?.stop();
+      matrixRenderTargetLease?.release();
     };
   }, [
     authToken,
     channelGroup.channel,
     channelGroup.tileIds.length,
     matrixCanvasId,
+    options.matrixCompositor,
     options.offscreenCanvas,
     serverCertificateHash,
   ]);
@@ -248,6 +284,31 @@ export function createVideoPipeViewportSessionKey(options: VideoPipeViewportRunt
     options.chaosFrameDelayMs ?? "none",
     options.chaosDropEveryNFrames ?? "none",
   ].join(":");
+}
+
+async function createMatrixRenderTarget(
+  enabled: boolean,
+  matrixCanvasId: string,
+  getCanvasIds: () => string[],
+  canvasId: string,
+  channel: VideoPipeChannel,
+  tileCount: number,
+): Promise<MatrixRenderTargetLease | undefined> {
+  if (!enabled || tileCount !== 1 || typeof document === "undefined") {
+    return undefined;
+  }
+
+  const surfaceSize = resolveTileSurfaceSize(canvasId, channel.codec.codedWidth, channel.codec.codedHeight);
+  try {
+    return await createOffscreenMatrixRenderTarget(matrixCanvasId, getCanvasIds, {
+      canvasId,
+      canvasWidth: surfaceSize.width,
+      canvasHeight: surfaceSize.height,
+      outputColorSpace: "srgb",
+    });
+  } catch {
+    return undefined;
+  }
 }
 
 function createOffscreenRenderTarget(
