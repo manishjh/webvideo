@@ -12,6 +12,13 @@ export interface TransportEndpointDescriptor {
   requestedTransport: BrowserTransportMode;
   allowHttpFallback: boolean;
   serverCertificateHash?: string;
+  targetLatencyMs?: number;
+  desiredEgressFrameRate?: number;
+  desiredMaxCodedWidth?: number;
+  desiredMaxCodedHeight?: number;
+  chaosDisconnectAfterFrames?: number;
+  chaosFrameDelayMs?: number;
+  chaosDropEveryNFrames?: number;
   frameCount?: number;
   streamMode?: "bounded" | "continuous" | "continuous-binary" | "continuous-moq";
 }
@@ -40,6 +47,13 @@ export interface TransportConnectionHandle {
   webTransportReady: boolean;
   webTransportBytesReceived: number;
   webTransportMessagesReceived: number;
+}
+
+export interface SelectedVideoSourceDescriptor {
+  channelId: ChannelId;
+  streamId: StreamId;
+  sourceRtspUrl: string;
+  codec: VideoCodecConfiguration & { profile?: string; frameRate?: number };
 }
 
 export interface VideoTransportMessage {
@@ -109,6 +123,26 @@ export interface TimedMetadataRecord {
   tags: Record<string, string>;
 }
 
+export interface VideoMetadataOverlaySnapshot {
+  active: boolean;
+  text: string;
+  eventId: string;
+  eventType: string;
+  batchStartTimestampUs: number;
+  batchEndTimestampUs: number;
+  startTimestampUs: number;
+  endTimestampUs: number;
+  driftUs: number;
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  sourceResolution?: string;
+  sourceTimestampUnixTimeMs?: number;
+  serverTimestampUnixTimeMs?: number;
+  sequenceNumber?: number;
+}
+
 export interface TimedMetadataBatch {
   streamId: StreamId;
   batchStartTimestampUs: number;
@@ -156,12 +190,22 @@ export interface RenderFrameResult {
   renderedSequenceNumber: number;
   overlayPrimitiveCount: number;
   renderBackend: RenderBackend;
+  matrixPresentMode?: string;
+  matrixPresentPath?: string;
+  matrixFlushCount?: number;
+  matrixPresentCount?: number;
+  matrixDrawCount?: number;
+  matrixExternalImportCount?: number;
+  matrixBindGroupCount?: number;
+  matrixVideoFrameCopyCount?: number;
+  matrixLastDirtySlotCount?: number;
   gpuPresentation?: string;
   gpuUploadSource?: string;
   gpuAdapterVendor?: string;
   gpuAdapterArchitecture?: string;
   gpuReadbackError?: string;
   webGpuDisabledReason?: string;
+  matrixFallbackReason?: string;
 }
 
 export interface StageTimingEvent {

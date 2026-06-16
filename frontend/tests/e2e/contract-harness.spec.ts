@@ -25,20 +25,21 @@ test.describe("contract harness page", () => {
     await expect(page.getByTestId("behavior-row-viewer-starts-live-session")).toContainText("transport-connect");
     await expect(page.getByTestId("behavior-row-browser-session-uses-rtsp-captured-payloads")).toContainText("annexb-payloads-present");
     await expect(page.getByTestId("behavior-row-player-enforces-bounded-latency")).toContainText("late-frame-drop");
-    await expect(page.getByTestId("scenario-row-viewer-starts-live-stream")).toContainText("cctv-lobby-720p");
-    await expect(page.getByTestId("scenario-row-player-recovers-from-stream-discontinuity")).toContainText("cctv-entrance-720p");
-    await expect(page.getByTestId("scenario-row-tile-wall-renders-independent-channels")).toContainText("cctv-floor-1080p");
-    await expect(page.getByTestId("scenario-row-high-resolution-4k-channel-is-declared")).toContainText("cctv-parking-4k");
+    await expect(page.getByTestId("scenario-row-viewer-starts-live-stream")).toContainText("download-13535786-4k60");
+    await expect(page.getByTestId("scenario-row-player-recovers-from-stream-discontinuity")).toContainText("download-15116604-4k30");
+    await expect(page.getByTestId("scenario-row-tile-wall-renders-independent-channels")).toContainText("download-15139494-4k60");
+    await expect(page.getByTestId("scenario-row-high-resolution-4k-channel-is-declared")).toContainText("download-15116604-4k30");
+    await expect(page.getByTestId("scenario-row-high-stress-4k60-crowd-channel-is-declared")).toContainText("cctv-road-crowd-4k60");
   });
 
   test("runs the RTSP-backed player flow end to end in the browser harness", async ({ page }) => {
     const sessionRequestPromise = page.waitForRequest((request) => (
       request.method() === "POST"
-      && request.url().includes("/api/demo/channels/channel-001/sessions")
+      && request.url().includes("/api/demo/channels/channel-13535786/sessions")
     ));
     const sessionResponsePromise = page.waitForResponse((response) => (
       response.request().method() === "POST"
-      && response.url().includes("/api/demo/channels/channel-001/sessions")
+      && response.url().includes("/api/demo/channels/channel-13535786/sessions")
     ));
 
     await page.goto("/contract-harness.html");
@@ -53,8 +54,8 @@ test.describe("contract harness page", () => {
       enableMetadata: true,
     });
     expect(sessionPayload).toMatchObject({
-      channelId: "channel-001",
-      streamId: "camera-001",
+      channelId: "channel-13535786",
+      streamId: "camera-13535786",
       sourceMode: "rtsp-h264-capture",
       sourceVerified: true,
       accessUnitFormat: "annexb-h264",
@@ -65,8 +66,8 @@ test.describe("contract harness page", () => {
 
     await expect(page.getByTestId("sim-status")).toHaveText("completed");
     await expect(page.getByTestId("sim-session-id")).toContainText("player-");
-    await expect(page.getByTestId("sim-channel-id")).toHaveText("channel-001");
-    await expect(page.getByTestId("sim-stream-id")).toHaveText("camera-001");
+    await expect(page.getByTestId("sim-channel-id")).toHaveText("channel-13535786");
+    await expect(page.getByTestId("sim-stream-id")).toHaveText("camera-13535786");
     await expect(page.getByTestId("sim-sink-id")).toContainText("sink-");
     await expect(page.getByTestId("sim-transport-mode")).toHaveText("webtransport-quic -> webtransport-quic");
     await expect(page.getByTestId("sim-webtransport-bytes")).not.toHaveText("0");
@@ -92,8 +93,8 @@ test.describe("contract harness page", () => {
 
     const harnessState = await page.evaluate(() => window.__webvideoHarnessState);
     expect(harnessState).toMatchObject({
-      channelId: "channel-001",
-      streamId: "camera-001",
+      channelId: "channel-13535786",
+      streamId: "camera-13535786",
       requestedTransport: "webtransport-quic",
       activeTransport: "webtransport-quic",
       webTransportReady: true,
@@ -150,8 +151,8 @@ test.describe("contract harness page", () => {
       };
     });
 
-    expect(surface.width).toBe(1280);
-    expect(surface.height).toBe(720);
+    expect(surface.width).toBe(1920);
+    expect(surface.height).toBe(1080);
     expect(surface.hidden).toBe(false);
     expect(surface.lastSequence).toBe("108");
     expect(surface.overlayCount).toBe("1");

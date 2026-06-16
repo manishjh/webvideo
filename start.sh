@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RUN_DIR="$ROOT_DIR/.run"
+RUN_DIR="${WEBVIDEO_RUN_DIR:-$ROOT_DIR/.run}"
 BACKEND_LOG="$RUN_DIR/backend.log"
 FRONTEND_LOG="$RUN_DIR/frontend.log"
 RTSP_SERVER_LOG="$RUN_DIR/rtsp-server.log"
@@ -12,26 +12,48 @@ FRONTEND_PORT="${FRONTEND_PORT:-4173}"
 RTSP_PORT="${RTSP_PORT:-8554}"
 RTP_PORT="${RTP_PORT:-5004}"
 RTCP_PORT="${RTCP_PORT:-5005}"
+GO2RTC_API_PORT="${GO2RTC_API_PORT:-1984}"
 WEBTRANSPORT_PORT="${WEBTRANSPORT_PORT:-9443}"
+WEBVIDEO_RTSP_SERVER="${WEBVIDEO_RTSP_SERVER:-go2rtc}"
 START_RTSP="${START_RTSP:-auto}"
-START_4K_RTSP="${START_4K_RTSP:-0}"
+START_4K_RTSP="${START_4K_RTSP:-1}"
+START_4K_STRESS_RTSP="${START_4K_STRESS_RTSP:-$START_4K_RTSP}"
 START_WEBTRANSPORT="${START_WEBTRANSPORT:-1}"
+WEBVIDEO_RTSP_SOURCE_VARIANTS="${WEBVIDEO_RTSP_SOURCE_VARIANTS:-0}"
 SETUP_RTSP_TOOLS="${SETUP_RTSP_TOOLS:-auto}"
 SETUP_QUIC_TOOLS="${SETUP_QUIC_TOOLS:-auto}"
 SETUP_RTSP_TOOLS_ONLY="${SETUP_RTSP_TOOLS_ONLY:-0}"
 SETUP_QUIC_TOOLS_ONLY="${SETUP_QUIC_TOOLS_ONLY:-0}"
 SETUP_SAMPLE_FOOTAGE_ONLY="${SETUP_SAMPLE_FOOTAGE_ONLY:-0}"
-WEBVIDEO_SAMPLE_FOOTAGE="${WEBVIDEO_SAMPLE_FOOTAGE:-0}"
+if [[ "$WEBVIDEO_RTSP_SERVER" == "go2rtc" ]]; then
+  WEBVIDEO_SAMPLE_FOOTAGE="${WEBVIDEO_SAMPLE_FOOTAGE:-1}"
+else
+  WEBVIDEO_SAMPLE_FOOTAGE="${WEBVIDEO_SAMPLE_FOOTAGE:-0}"
+fi
+START_RTSP_ONLY="${START_RTSP_ONLY:-0}"
 WEBVIDEO_RTSP_COPY_INPUTS="${WEBVIDEO_RTSP_COPY_INPUTS:-auto}"
-DEMO_CHANNEL_ID="${DEMO_CHANNEL_ID:-channel-001}"
+WEBVIDEO_RTSP_FPS="${WEBVIDEO_RTSP_FPS:-30}"
+WEBVIDEO_RTSP_ADAPTIVE_FPS="${WEBVIDEO_RTSP_ADAPTIVE_FPS:-15}"
+WEBVIDEO_RTSP_4K_FPS="${WEBVIDEO_RTSP_4K_FPS:-15}"
+WEBVIDEO_RTSP_4K_STRESS_FPS="${WEBVIDEO_RTSP_4K_STRESS_FPS:-60}"
+WEBVIDEO_RTSP_4K_STRESS_ADAPTIVE_FPS="${WEBVIDEO_RTSP_4K_STRESS_ADAPTIVE_FPS:-24}"
+WEBVIDEO_RTSP_4K_STRESS_LOW_FPS="${WEBVIDEO_RTSP_4K_STRESS_LOW_FPS:-15}"
+WEBVIDEO_RTSP_EMERGENCY_FPS="${WEBVIDEO_RTSP_EMERGENCY_FPS:-5}"
+WEBVIDEO_RTSP_ULTRA_LOW_FPS="${WEBVIDEO_RTSP_ULTRA_LOW_FPS:-2}"
+WEBVIDEO_BACKEND_RTSP_TRANSPORT="${WEBVIDEO_BACKEND_RTSP_TRANSPORT:-tcp}"
+WEBVIDEO_FRONTEND_MODE="${WEBVIDEO_FRONTEND_MODE:-production}"
+MEDIAMTX_WRITE_QUEUE_SIZE="${MEDIAMTX_WRITE_QUEUE_SIZE:-8192}"
+DEMO_CHANNEL_ID="${DEMO_CHANNEL_ID:-channel-4k-crowd}"
 BACKEND_PROJECT="$ROOT_DIR/backend/src/WebVideo.Backend.DemoHost/WebVideo.Backend.DemoHost.csproj"
 BACKEND_DLL="$ROOT_DIR/backend/src/WebVideo.Backend.DemoHost/bin/Debug/net10.0/WebVideo.Backend.DemoHost.dll"
 RTSP_TOOLS_DIR="$ROOT_DIR/.tools/rtsp"
-SAMPLE_FOOTAGE_DIR="$RTSP_TOOLS_DIR/footage"
+SAMPLE_FOOTAGE_DIR="${WEBVIDEO_SAMPLE_FOOTAGE_DIR:-$RTSP_TOOLS_DIR/footage}"
 QUIC_TOOLS_DIR="$ROOT_DIR/.tools/quic"
 QUIC_LIB_DIR="$QUIC_TOOLS_DIR/lib"
 RTSP_CONFIG="$RUN_DIR/mediamtx.yml"
+GO2RTC_CONFIG="$RUN_DIR/go2rtc.yaml"
 MEDIAMTX_BIN="${MEDIAMTX_BIN:-}"
+GO2RTC_BIN="${GO2RTC_BIN:-}"
 FFMPEG_BIN="${FFMPEG_BIN:-}"
 
 mkdir -p "$RUN_DIR" "$RTSP_TOOLS_DIR" "$SAMPLE_FOOTAGE_DIR" "$QUIC_TOOLS_DIR" "$QUIC_LIB_DIR"
@@ -52,12 +74,18 @@ fi
 
 export DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
 export DOTNET_CLI_HOME="$ROOT_DIR/.tools/dotnet-home"
+export BACKEND_PORT
+export FRONTEND_PORT
+export WEBTRANSPORT_PORT
+export VITE_WEBTRANSPORT_PORT="$WEBTRANSPORT_PORT"
 export ASPNETCORE_URLS="http://127.0.0.1:${BACKEND_PORT}"
 export MSBUILDDISABLENODEREUSE=1
 export WEBVIDEO_WEBTRANSPORT_PORT="$WEBTRANSPORT_PORT"
 export WEBVIDEO_ENABLE_WEBTRANSPORT="$START_WEBTRANSPORT"
 export WEBVIDEO_DEV_CERT_PATH="$RUN_DIR/webtransport-devcert.pfx"
 export WEBVIDEO_DEV_CERT_PASSWORD="${WEBVIDEO_DEV_CERT_PASSWORD:-webvideo-dev}"
+export WEBVIDEO_DEMO_SOURCE_VARIANTS="$WEBVIDEO_RTSP_SOURCE_VARIANTS"
+export WEBVIDEO_BACKEND_RTSP_TRANSPORT
 
 cleanup() {
   local exit_code=$?
@@ -171,6 +199,19 @@ wait_for_log() {
   return 1
 }
 
+write_rtsp_pid_files() {
+  if [[ -n "${RTSP_SERVER_PID:-}" ]]; then
+    printf '%s\n' "$RTSP_SERVER_PID" >"$RUN_DIR/rtsp-server.pid"
+  fi
+
+  : >"$RUN_DIR/rtsp-publishers.pids"
+  for publisher_pid in "${RTSP_PUBLISHER_PIDS[@]:-}"; do
+    if [[ -n "$publisher_pid" ]]; then
+      printf '%s\n' "$publisher_pid" >>"$RUN_DIR/rtsp-publishers.pids"
+    fi
+  done
+}
+
 require_downloader() {
   if command -v curl >/dev/null 2>&1; then
     DOWNLOADER="curl"
@@ -235,61 +276,17 @@ should_copy_rtsp_input() {
   esac
 }
 
-download_if_missing() {
-  local url=$1
-  local output=$2
-  local label=$3
-
-  if [[ -s "$output" ]]; then
-    return 0
-  fi
-
-  local tmp="${output}.tmp"
-  rm -f "$tmp"
-  echo "Downloading $label into $SAMPLE_FOOTAGE_DIR ..."
-  download_file "$url" "$tmp"
-  mv "$tmp" "$output"
-}
-
-normalize_sample_footage() {
+require_sample_footage_file() {
   local input=$1
-  local output=$2
-  local size=$3
-  local rate=$4
-  local bitrate=$5
-  local label=$6
+  local label=$2
 
-  if [[ -s "$output" ]]; then
+  if [[ -s "$input" ]]; then
     return 0
   fi
 
-  local width="${size%x*}"
-  local height="${size#*x}"
-  local tmp="${output}.tmp.mp4"
-  rm -f "$tmp"
-  echo "Normalizing $label to a 30 second H.264 sample ..."
-  "$FFMPEG_BIN" \
-    -hide_banner \
-    -y \
-    -stream_loop -1 \
-    -i "$input" \
-    -t 30 \
-    -vf "scale=${width}:${height}:force_original_aspect_ratio=decrease,pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2,setsar=1" \
-    -r "$rate" \
-    -an \
-    -c:v libx264 \
-    -preset veryfast \
-    -tune zerolatency \
-    -profile:v baseline \
-    -g "$rate" \
-    -keyint_min "$rate" \
-    -sc_threshold 0 \
-    -b:v "$bitrate" \
-    -pix_fmt yuv420p \
-    -movflags +faststart \
-    "$tmp" \
-    >/dev/null 2>&1
-  mv "$tmp" "$output"
+  echo "Missing $label sample footage at $input." >&2
+  echo "Place the MP4 at that path or override the matching WEBVIDEO_*_INPUT variable." >&2
+  return 1
 }
 
 prepare_sample_footage_inputs() {
@@ -297,37 +294,29 @@ prepare_sample_footage_inputs() {
     return 0
   fi
 
-  local sample_base="https://www.c-mor.com/video-surveillance-demo/sample-recordings-of-the-video-surveillance-system-c-mor"
-  local lobby_source="$SAMPLE_FOOTAGE_DIR/source-cctv-lobby-720p.mp4"
-  local entrance_source="$SAMPLE_FOOTAGE_DIR/source-cctv-entrance-720p.mp4"
-  local floor_source="$SAMPLE_FOOTAGE_DIR/source-cctv-floor-1080p.mp4"
-  local parking_source="$SAMPLE_FOOTAGE_DIR/source-cctv-parking-1080p.mp4"
-  local lobby_sample="$SAMPLE_FOOTAGE_DIR/cctv-lobby-720p-30s.mp4"
-  local entrance_sample="$SAMPLE_FOOTAGE_DIR/cctv-entrance-720p-30s.mp4"
-  local floor_sample="$SAMPLE_FOOTAGE_DIR/cctv-floor-1080p-30s.mp4"
-  local parking_sample="$SAMPLE_FOOTAGE_DIR/cctv-parking-4k-30s.mp4"
+  : "${WEBVIDEO_CCTV_4K_CROWD_INPUT:=$SAMPLE_FOOTAGE_DIR/cctv-road-crowd-4k60-clean-v2-60fps-30s.mp4}"
+  : "${WEBVIDEO_DOWNLOAD_13535786_INPUT:=$SAMPLE_FOOTAGE_DIR/downloads/13535786_3840_2160_60fps.mp4}"
+  : "${WEBVIDEO_DOWNLOAD_15116604_INPUT:=$SAMPLE_FOOTAGE_DIR/downloads/15116604_3840_2160_30fps.mp4}"
+  : "${WEBVIDEO_DOWNLOAD_15139494_INPUT:=$SAMPLE_FOOTAGE_DIR/downloads/15139494_3840_2160_60fps.mp4}"
+  : "${WEBVIDEO_DOWNLOAD_15300856_INPUT:=$SAMPLE_FOOTAGE_DIR/downloads/15300856_3840_2160_60fps.mp4}"
+  : "${WEBVIDEO_DOWNLOAD_15956743_INPUT:=$SAMPLE_FOOTAGE_DIR/downloads/15956743_3840_2160_60fps.mp4}"
+  : "${WEBVIDEO_DOWNLOAD_16147856_INPUT:=$SAMPLE_FOOTAGE_DIR/downloads/16147856_3840_2160_24fps.mp4}"
 
-  download_if_missing "${sample_base}?download=27:motion-detection-entrance-area" "$lobby_source" "CCTV lobby source sample"
-  download_if_missing "${sample_base}?download=29:motion-detection-outside-entrance" "$entrance_source" "CCTV entrance source sample"
-  download_if_missing "${sample_base}?download=28:motion-detection-warehouse-door" "$floor_source" "CCTV floor source sample"
-  normalize_sample_footage "$lobby_source" "$lobby_sample" "1280x720" "30" "4000k" "CCTV lobby"
-  normalize_sample_footage "$entrance_source" "$entrance_sample" "1280x720" "30" "4000k" "CCTV entrance"
-  normalize_sample_footage "$floor_source" "$floor_sample" "1920x1080" "30" "7000k" "CCTV floor"
+  export WEBVIDEO_CCTV_4K_CROWD_INPUT
+  export WEBVIDEO_DOWNLOAD_13535786_INPUT
+  export WEBVIDEO_DOWNLOAD_15116604_INPUT
+  export WEBVIDEO_DOWNLOAD_15139494_INPUT
+  export WEBVIDEO_DOWNLOAD_15300856_INPUT
+  export WEBVIDEO_DOWNLOAD_15956743_INPUT
+  export WEBVIDEO_DOWNLOAD_16147856_INPUT
 
-  : "${WEBVIDEO_CCTV_LOBBY_INPUT:=$lobby_sample}"
-  : "${WEBVIDEO_CCTV_ENTRANCE_INPUT:=$entrance_sample}"
-  : "${WEBVIDEO_CCTV_FLOOR_INPUT:=$floor_sample}"
-
-  if is_truthy "$START_4K_RTSP"; then
-    download_if_missing "${sample_base}?download=26:motion-detection-computer-room" "$parking_source" "CCTV parking source sample"
-    normalize_sample_footage "$parking_source" "$parking_sample" "3840x2160" "15" "14000k" "CCTV parking 4K"
-    : "${WEBVIDEO_CCTV_4K_INPUT:=$parking_sample}"
-  fi
-
-  export WEBVIDEO_CCTV_LOBBY_INPUT
-  export WEBVIDEO_CCTV_ENTRANCE_INPUT
-  export WEBVIDEO_CCTV_FLOOR_INPUT
-  export WEBVIDEO_CCTV_4K_INPUT
+  require_sample_footage_file "$WEBVIDEO_CCTV_4K_CROWD_INPUT" "CCTV Road Crowd 4K60"
+  require_sample_footage_file "$WEBVIDEO_DOWNLOAD_13535786_INPUT" "Clip 13535786 4K60"
+  require_sample_footage_file "$WEBVIDEO_DOWNLOAD_15116604_INPUT" "Clip 15116604 4K30"
+  require_sample_footage_file "$WEBVIDEO_DOWNLOAD_15139494_INPUT" "Clip 15139494 4K60"
+  require_sample_footage_file "$WEBVIDEO_DOWNLOAD_15300856_INPUT" "Clip 15300856 4K60"
+  require_sample_footage_file "$WEBVIDEO_DOWNLOAD_15956743_INPUT" "Clip 15956743 4K60"
+  require_sample_footage_file "$WEBVIDEO_DOWNLOAD_16147856_INPUT" "Clip 16147856 4K24"
 }
 
 normalize_arch() {
@@ -376,6 +365,29 @@ raise SystemExit(1)
 PY
 }
 
+resolve_go2rtc_asset_url() {
+  local arch=$1
+
+  python3 - "$arch" <<'PY'
+import json
+import sys
+import urllib.request
+
+arch = sys.argv[1]
+asset_name = f"go2rtc_linux_{arch}"
+with urllib.request.urlopen("https://api.github.com/repos/AlexxIT/go2rtc/releases/latest", timeout=60) as response:
+    release = json.load(response)
+
+for asset in release.get("assets", []):
+    if asset.get("name") == asset_name:
+        print(asset["browser_download_url"])
+        raise SystemExit(0)
+
+print(f"No go2rtc release asset matched {asset_name}", file=sys.stderr)
+raise SystemExit(1)
+PY
+}
+
 ensure_mediamtx() {
   if [[ -n "$MEDIAMTX_BIN" ]]; then
     return 0
@@ -404,6 +416,34 @@ ensure_mediamtx() {
   tar -xzf "$archive" -C "$RTSP_TOOLS_DIR" mediamtx
   chmod +x "$local_bin"
   MEDIAMTX_BIN="$local_bin"
+}
+
+ensure_go2rtc() {
+  if [[ -n "$GO2RTC_BIN" ]]; then
+    return 0
+  fi
+
+  if command -v go2rtc >/dev/null 2>&1; then
+    GO2RTC_BIN="$(command -v go2rtc)"
+    return 0
+  fi
+
+  local local_bin="$RTSP_TOOLS_DIR/go2rtc"
+  if [[ -x "$local_bin" ]]; then
+    GO2RTC_BIN="$local_bin"
+    return 0
+  fi
+
+  ensure_linux_tool_host
+  local arch
+  arch="$(normalize_arch)"
+  local asset_url
+  asset_url="$(resolve_go2rtc_asset_url "$arch")"
+
+  echo "Downloading go2rtc into $RTSP_TOOLS_DIR ..."
+  download_file "$asset_url" "$local_bin"
+  chmod +x "$local_bin"
+  GO2RTC_BIN="$local_bin"
 }
 
 ensure_ffmpeg() {
@@ -447,23 +487,47 @@ ensure_ffmpeg() {
 }
 
 ensure_rtsp_tools() {
+  case "$WEBVIDEO_RTSP_SERVER" in
+    go2rtc|mediamtx)
+      ;;
+    *)
+      echo "Unsupported WEBVIDEO_RTSP_SERVER=$WEBVIDEO_RTSP_SERVER. Expected go2rtc or mediamtx." >&2
+      return 1
+      ;;
+  esac
+
   if [[ "$SETUP_RTSP_TOOLS" == "0" || "$SETUP_RTSP_TOOLS" == "false" ]]; then
-    if [[ -z "$MEDIAMTX_BIN" ]] && command -v mediamtx >/dev/null 2>&1; then
+    if [[ "$WEBVIDEO_RTSP_SERVER" == "mediamtx" && -z "$MEDIAMTX_BIN" ]] && command -v mediamtx >/dev/null 2>&1; then
       MEDIAMTX_BIN="$(command -v mediamtx)"
+    fi
+    if [[ "$WEBVIDEO_RTSP_SERVER" == "go2rtc" && -z "$GO2RTC_BIN" ]] && command -v go2rtc >/dev/null 2>&1; then
+      GO2RTC_BIN="$(command -v go2rtc)"
     fi
     if [[ -z "$FFMPEG_BIN" ]] && command -v ffmpeg >/dev/null 2>&1; then
       FFMPEG_BIN="$(command -v ffmpeg)"
     fi
 
-    if [[ -z "$MEDIAMTX_BIN" || -z "$FFMPEG_BIN" ]]; then
-      echo "RTSP tool setup is disabled, but mediamtx or ffmpeg is missing." >&2
+    if [[ "$WEBVIDEO_RTSP_SERVER" == "mediamtx" && -z "$MEDIAMTX_BIN" ]]; then
+      echo "RTSP tool setup is disabled, but mediamtx is missing." >&2
+      return 1
+    fi
+    if [[ "$WEBVIDEO_RTSP_SERVER" == "go2rtc" && -z "$GO2RTC_BIN" ]]; then
+      echo "RTSP tool setup is disabled, but go2rtc is missing." >&2
+      return 1
+    fi
+    if [[ -z "$FFMPEG_BIN" ]]; then
+      echo "RTSP tool setup is disabled, but ffmpeg is missing." >&2
       return 1
     fi
 
     return 0
   fi
 
-  ensure_mediamtx
+  if [[ "$WEBVIDEO_RTSP_SERVER" == "go2rtc" ]]; then
+    ensure_go2rtc
+  else
+    ensure_mediamtx
+  fi
   ensure_ffmpeg
 }
 
@@ -539,6 +603,80 @@ PY
   fi
 }
 
+create_rtsp_concat_loop_input() {
+  local path=$1
+  local input=$2
+  local repeats="${WEBVIDEO_RTSP_CONCAT_REPEATS:-20}"
+  local concat_file="$RUN_DIR/rtsp-${path}.ffconcat"
+
+  if ! [[ "$repeats" =~ ^[0-9]+$ ]] || [[ "$repeats" -lt 1 ]]; then
+    repeats=20
+  fi
+
+  {
+    printf 'ffconcat version 1.0\n'
+    for _ in $(seq 1 "$repeats"); do
+      printf "file '%s'\n" "$input"
+    done
+  } >"$concat_file"
+
+  printf '%s\n' "$concat_file"
+}
+
+yaml_quote() {
+  python3 - "$1" <<'PY'
+import json
+import sys
+
+print(json.dumps(sys.argv[1]))
+PY
+}
+
+write_go2rtc_config_header() {
+  local quoted_ffmpeg_bin
+  quoted_ffmpeg_bin="$(yaml_quote "$FFMPEG_BIN")"
+
+  cat >"$GO2RTC_CONFIG" <<EOF
+log:
+  level: info
+api:
+  listen: "127.0.0.1:${GO2RTC_API_PORT}"
+rtsp:
+  listen: "127.0.0.1:${RTSP_PORT}"
+webrtc:
+  listen: ""
+ffmpeg:
+  bin: ${quoted_ffmpeg_bin}
+  global: "-hide_banner -loglevel warning"
+  mp4loop: "-re -stream_loop -1 -fflags +genpts -i {input}"
+  lavfi: "-re -f lavfi -i {input}"
+streams:
+EOF
+}
+
+append_go2rtc_stream() {
+  local path=$1
+  local size=$2
+  local rate=$3
+  local bitrate=$4
+  local label=$5
+  local input=${6:-}
+  local source
+
+  if should_copy_rtsp_input "$input"; then
+    source="ffmpeg:${input}#input=mp4loop#video=copy#audio=copy"
+    echo "Serving $label with go2rtc H.264 stream copy from $input." >>"$RTSP_PUBLISHER_LOG"
+  elif [[ -n "$input" ]]; then
+    source="ffmpeg:${input}#input=mp4loop#video=h264#audio=copy#raw=-r ${rate} -preset ultrafast -tune zerolatency -profile:v baseline -g ${rate} -keyint_min ${rate} -sc_threshold 0 -b:v ${bitrate} -pix_fmt yuv420p"
+    echo "Serving $label with go2rtc ffmpeg H.264 transcode from $input." >>"$RTSP_PUBLISHER_LOG"
+  else
+    source="ffmpeg:testsrc2=size=${size}:rate=${rate}#input=lavfi#video=h264#audio=copy#raw=-preset ultrafast -tune zerolatency -profile:v baseline -g ${rate} -keyint_min ${rate} -sc_threshold 0 -b:v ${bitrate} -pix_fmt yuv420p"
+    echo "Serving $label with go2rtc generated H.264 test pattern." >>"$RTSP_PUBLISHER_LOG"
+  fi
+
+  printf '  %s: %s\n' "$(yaml_quote "live/${path}")" "$(yaml_quote "$source")" >>"$GO2RTC_CONFIG"
+}
+
 publish_rtsp_source() {
   local path=$1
   local size=$2
@@ -548,13 +686,18 @@ publish_rtsp_source() {
   local input=${6:-}
 
   if should_copy_rtsp_input "$input"; then
+    local concat_input
+    concat_input="$(create_rtsp_concat_loop_input "$path" "$input")"
     echo "Publishing $label with H.264 stream copy from $input."
     "$FFMPEG_BIN" \
       -hide_banner \
       -loglevel warning \
       -re \
+      -fflags +genpts \
+      -f concat \
+      -safe 0 \
       -stream_loop -1 \
-      -i "$input" \
+      -i "$concat_input" \
       -map 0:v:0 \
       -an \
       -c:v copy \
@@ -578,12 +721,6 @@ publish_rtsp_source() {
     ffmpeg_filters+=("scale=${width}:${height}:force_original_aspect_ratio=decrease")
     ffmpeg_filters+=("pad=${width}:${height}:(ow-iw)/2:(oh-ih)/2")
     ffmpeg_filters+=("setsar=1")
-  fi
-
-  if "$FFMPEG_BIN" -hide_banner -filters 2>/dev/null | grep -qE '(^|[[:space:]])drawtext([[:space:]]|$)'; then
-    ffmpeg_filters+=("drawtext=text='${label} %{pts\\:hms}':x=24:y=24:fontsize=32:fontcolor=white:box=1:boxcolor=black@0.55")
-  else
-    echo "ffmpeg build does not include drawtext; publishing $path without timestamp overlay."
   fi
 
   local ffmpeg_filter_args=()
@@ -626,6 +763,14 @@ publish_rtsp_source() {
   wait_for_log "$RTSP_SERVER_LOG" "path live/${path}.*stream is available and online" "$label publisher"
 }
 
+register_rtsp_source() {
+  if [[ "$WEBVIDEO_RTSP_SERVER" == "go2rtc" ]]; then
+    append_go2rtc_stream "$@"
+  else
+    publish_rtsp_source "$@"
+  fi
+}
+
 start_rtsp_source() {
   if [[ "$START_RTSP" == "0" || "$START_RTSP" == "false" ]]; then
     echo "Local RTSP sources disabled by START_RTSP=$START_RTSP."
@@ -635,11 +780,15 @@ start_rtsp_source() {
   ensure_rtsp_tools
   prepare_sample_footage_inputs
 
-  cat >"$RTSP_CONFIG" <<EOF
+  if [[ "$WEBVIDEO_RTSP_SERVER" == "go2rtc" ]]; then
+    write_go2rtc_config_header
+  else
+    cat >"$RTSP_CONFIG" <<EOF
 logLevel: info
+writeQueueSize: ${MEDIAMTX_WRITE_QUEUE_SIZE}
 rtsp: yes
 rtspAddress: :${RTSP_PORT}
-rtspTransports: [udp, tcp]
+rtspTransports: [tcp]
 rtpAddress: :${RTP_PORT}
 rtcpAddress: :${RTCP_PORT}
 rtmp: no
@@ -651,19 +800,30 @@ paths:
   all_others:
 EOF
 
-  "$MEDIAMTX_BIN" "$RTSP_CONFIG" >"$RTSP_SERVER_LOG" 2>&1 &
-  RTSP_SERVER_PID=$!
+    "$MEDIAMTX_BIN" "$RTSP_CONFIG" >"$RTSP_SERVER_LOG" 2>&1 &
+    RTSP_SERVER_PID=$!
 
-  wait_for_tcp "127.0.0.1" "$RTSP_PORT" "local RTSP server"
-
-  publish_rtsp_source "cctv-lobby-720p" "1280x720" "30" "4000k" "CCTV Lobby" "${WEBVIDEO_CCTV_LOBBY_INPUT:-}"
-  publish_rtsp_source "cctv-entrance-720p" "1280x720" "30" "4000k" "CCTV Entrance" "${WEBVIDEO_CCTV_ENTRANCE_INPUT:-}"
-  publish_rtsp_source "cctv-floor-1080p" "1920x1080" "30" "7000k" "CCTV Floor" "${WEBVIDEO_CCTV_FLOOR_INPUT:-}"
-
-  if is_truthy "$START_4K_RTSP"; then
-    publish_rtsp_source "cctv-parking-4k" "3840x2160" "15" "14000k" "CCTV Parking 4K" "${WEBVIDEO_CCTV_4K_INPUT:-}"
+    wait_for_tcp "127.0.0.1" "$RTSP_PORT" "local RTSP server"
   fi
 
+  register_rtsp_source "cctv-road-crowd-4k60" "3840x2160" "60" "28000k" "CCTV Road Crowd 4K60" "${WEBVIDEO_CCTV_4K_CROWD_INPUT:-}"
+  register_rtsp_source "download-13535786-4k60" "3840x2160" "60" "33000k" "Clip 13535786 4K60" "${WEBVIDEO_DOWNLOAD_13535786_INPUT:-}"
+  register_rtsp_source "download-15116604-4k30" "3840x2160" "30" "72000k" "Clip 15116604 4K30" "${WEBVIDEO_DOWNLOAD_15116604_INPUT:-}"
+  register_rtsp_source "download-15139494-4k60" "3840x2160" "60" "32000k" "Clip 15139494 4K60" "${WEBVIDEO_DOWNLOAD_15139494_INPUT:-}"
+  register_rtsp_source "download-15300856-4k60" "3840x2160" "59.94" "64000k" "Clip 15300856 4K60" "${WEBVIDEO_DOWNLOAD_15300856_INPUT:-}"
+  register_rtsp_source "download-15956743-4k60" "3840x2160" "59.94" "38000k" "Clip 15956743 4K60" "${WEBVIDEO_DOWNLOAD_15956743_INPUT:-}"
+  register_rtsp_source "download-16147856-4k24" "3840x2160" "23.98" "17000k" "Clip 16147856 4K24" "${WEBVIDEO_DOWNLOAD_16147856_INPUT:-}"
+
+  if [[ "$WEBVIDEO_RTSP_SERVER" == "go2rtc" ]]; then
+    "$GO2RTC_BIN" -c "$GO2RTC_CONFIG" >"$RTSP_SERVER_LOG" 2>&1 &
+    RTSP_SERVER_PID=$!
+    wait_for_tcp "127.0.0.1" "$RTSP_PORT" "local go2rtc RTSP server"
+  fi
+
+  export WEBVIDEO_CHANNEL_4K_CROWD_RTSP_URL="${WEBVIDEO_CHANNEL_4K_CROWD_RTSP_URL:-rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-road-crowd-4k60}"
+  export WEBVIDEO_CHANNEL_4K_CROWD_DISPLAY_NAME="${WEBVIDEO_CHANNEL_4K_CROWD_DISPLAY_NAME:-CCTV Road Crowd 4K60}"
+  export WEBVIDEO_CHANNEL_4K_CROWD_SUMMARY="${WEBVIDEO_CHANNEL_4K_CROWD_SUMMARY:-Crowd-heavy road junction 4K60 feed retained from the original demo set.}"
+  export WEBVIDEO_CHANNEL_4K_CROWD_FRAMERATE="${WEBVIDEO_CHANNEL_4K_CROWD_FRAMERATE:-60}"
   export WEBVIDEO_RTSP_CAPTURE=1
   export WEBVIDEO_RTSP_CAPTURE_REQUIRED=1
   export WEBVIDEO_FFMPEG_BIN="$FFMPEG_BIN"
@@ -675,11 +835,17 @@ trap cleanup INT TERM EXIT
 : >"$FRONTEND_LOG"
 : >"$RTSP_SERVER_LOG"
 : >"$RTSP_PUBLISHER_LOG"
+rm -f "$RUN_DIR/rtsp-server.pid" "$RUN_DIR/rtsp-publishers.pids"
 
 if [[ "$SETUP_RTSP_TOOLS_ONLY" == "1" || "$SETUP_RTSP_TOOLS_ONLY" == "true" ]]; then
   ensure_rtsp_tools
   echo "RTSP tools are ready:"
-  echo "  mediamtx: $MEDIAMTX_BIN"
+  echo "  server:   $WEBVIDEO_RTSP_SERVER"
+  if [[ "$WEBVIDEO_RTSP_SERVER" == "go2rtc" ]]; then
+    echo "  go2rtc:   $GO2RTC_BIN"
+  else
+    echo "  mediamtx: $MEDIAMTX_BIN"
+  fi
   echo "  ffmpeg:   $FFMPEG_BIN"
   exit 0
 fi
@@ -689,12 +855,13 @@ if [[ "$SETUP_SAMPLE_FOOTAGE_ONLY" == "1" || "$SETUP_SAMPLE_FOOTAGE_ONLY" == "tr
   WEBVIDEO_SAMPLE_FOOTAGE=1
   prepare_sample_footage_inputs
   echo "Sample footage is ready:"
-  echo "  lobby:    ${WEBVIDEO_CCTV_LOBBY_INPUT:-}"
-  echo "  entrance: ${WEBVIDEO_CCTV_ENTRANCE_INPUT:-}"
-  echo "  floor:    ${WEBVIDEO_CCTV_FLOOR_INPUT:-}"
-  if [[ -n "${WEBVIDEO_CCTV_4K_INPUT:-}" ]]; then
-    echo "  4K:       $WEBVIDEO_CCTV_4K_INPUT"
-  fi
+  echo "  4K crowd:  ${WEBVIDEO_CCTV_4K_CROWD_INPUT:-}"
+  echo "  13535786:  ${WEBVIDEO_DOWNLOAD_13535786_INPUT:-}"
+  echo "  15116604:  ${WEBVIDEO_DOWNLOAD_15116604_INPUT:-}"
+  echo "  15139494:  ${WEBVIDEO_DOWNLOAD_15139494_INPUT:-}"
+  echo "  15300856:  ${WEBVIDEO_DOWNLOAD_15300856_INPUT:-}"
+  echo "  15956743:  ${WEBVIDEO_DOWNLOAD_15956743_INPUT:-}"
+  echo "  16147856:  ${WEBVIDEO_DOWNLOAD_16147856_INPUT:-}"
   exit 0
 fi
 
@@ -706,16 +873,44 @@ if [[ "$SETUP_QUIC_TOOLS_ONLY" == "1" || "$SETUP_QUIC_TOOLS_ONLY" == "true" ]]; 
 fi
 
 start_rtsp_source
+write_rtsp_pid_files
+
+if [[ "$START_RTSP_ONLY" == "1" || "$START_RTSP_ONLY" == "true" ]]; then
+  echo
+  echo "RTSP source stack is running."
+  echo "Server: $WEBVIDEO_RTSP_SERVER"
+  echo "RTSP:   rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-road-crowd-4k60"
+  echo "Logs:"
+  echo "  $RTSP_SERVER_LOG"
+  echo "  $RTSP_PUBLISHER_LOG"
+  echo
+  echo "Press Ctrl+C to stop."
+
+  if [[ -n "${RTSP_SERVER_PID:-}" ]]; then
+    wait "$RTSP_SERVER_PID"
+  else
+    while true; do
+      sleep 3600
+    done
+  fi
+fi
+
 ensure_quic_runtime
 
 "$DOTNET_BIN" build "$BACKEND_PROJECT" -nodeReuse:false -maxcpucount:1 >>"$BACKEND_LOG" 2>&1
 
 "$DOTNET_BIN" "$BACKEND_DLL" \
-  >"$BACKEND_LOG" 2>&1 &
+  >>"$BACKEND_LOG" 2>&1 &
 BACKEND_PID=$!
 
-"$NPM_BIN" --prefix "$ROOT_DIR/frontend" run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT" \
-  >"$FRONTEND_LOG" 2>&1 &
+if [[ "$WEBVIDEO_FRONTEND_MODE" == "dev" || "$WEBVIDEO_FRONTEND_MODE" == "development" ]]; then
+  "$NPM_BIN" --prefix "$ROOT_DIR/frontend" run dev -- --host 127.0.0.1 --port "$FRONTEND_PORT" \
+    >>"$FRONTEND_LOG" 2>&1 &
+else
+  "$NPM_BIN" --prefix "$ROOT_DIR/frontend" run build >>"$FRONTEND_LOG" 2>&1
+  "$NPM_BIN" --prefix "$ROOT_DIR/frontend" run preview -- --host 127.0.0.1 --port "$FRONTEND_PORT" \
+    >>"$FRONTEND_LOG" 2>&1 &
+fi
 FRONTEND_PID=$!
 
 wait_for_http "http://127.0.0.1:${BACKEND_PORT}/healthz" "backend"
@@ -723,23 +918,33 @@ wait_for_http "http://127.0.0.1:${FRONTEND_PORT}/live-demo.html" "frontend"
 
 echo
 echo "WebVideo demo is running."
+echo "Frontend mode:  $WEBVIDEO_FRONTEND_MODE"
 echo "VMS client:     http://127.0.0.1:${FRONTEND_PORT}/vms.html"
 if command -v chrome-webgpu >/dev/null 2>&1; then
   echo "WebGPU Chrome:  chrome-webgpu http://127.0.0.1:${FRONTEND_PORT}/vms.html"
 else
-  echo "WebGPU Chrome:  launch Chrome with Vulkan,VulkanFromANGLE,DefaultANGLEVulkan for the fast path"
+  echo "WebGPU Chrome:  launch Chrome with --enable-unsafe-webgpu --ignore-gpu-blocklist --enable-features=Vulkan,VulkanFromANGLE"
 fi
 echo "Frontend page: http://127.0.0.1:${FRONTEND_PORT}/live-demo.html?channel=${DEMO_CHANNEL_ID}"
-echo "Tile wall:     http://127.0.0.1:${FRONTEND_PORT}/tile-wall.html?channels=channel-001,channel-002,channel-003"
+echo "Tile wall:     http://127.0.0.1:${FRONTEND_PORT}/tile-wall.html?channels=channel-4k-crowd,channel-13535786,channel-15139494"
+echo "4K tile wall:  http://127.0.0.1:${FRONTEND_PORT}/tile-wall.html?channels=channel-4k-crowd,channel-13535786,channel-15139494,channel-15300856&frames=1"
 echo "Backend channels: http://127.0.0.1:${BACKEND_PORT}/api/demo/channels"
 echo "WebTransport:    https://127.0.0.1:${WEBTRANSPORT_PORT}/live/${DEMO_CHANNEL_ID}"
-echo "RTSP sources:"
-echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-lobby-720p"
-echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-entrance-720p"
-echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-floor-1080p"
-if is_truthy "$START_4K_RTSP"; then
-  echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-parking-4k"
+echo "RTSP source server: $WEBVIDEO_RTSP_SERVER"
+echo "Backend RTSP reader transport: ${WEBVIDEO_BACKEND_RTSP_TRANSPORT}"
+if is_truthy "$WEBVIDEO_RTSP_SOURCE_VARIANTS"; then
+  echo "Source variants: enabled"
+else
+  echo "Source variants: disabled; set WEBVIDEO_RTSP_SOURCE_VARIANTS=1 to publish the full ladder"
 fi
+echo "RTSP sources:"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/cctv-road-crowd-4k60"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/download-13535786-4k60"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/download-15116604-4k30"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/download-15139494-4k60"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/download-15300856-4k60"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/download-15956743-4k60"
+echo "  rtsp://127.0.0.1:${RTSP_PORT}/live/download-16147856-4k24"
 echo "Logs:"
 echo "  $BACKEND_LOG"
 echo "  $FRONTEND_LOG"

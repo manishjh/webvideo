@@ -52,7 +52,7 @@ function bind(testId: string, value: string): void {
 
 function getRequestedChannelId(): string {
   const params = new URLSearchParams(window.location.search);
-  return params.get("channel")?.trim() || params.get("stream")?.trim() || "channel-001";
+  return params.get("channel")?.trim() || params.get("stream")?.trim() || "channel-4k-crowd";
 }
 
 function getRequestedFrameCount(): number | undefined {

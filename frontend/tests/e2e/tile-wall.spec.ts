@@ -4,7 +4,7 @@ const requireHardwareWebGpu = process.env.WEBVIDEO_REQUIRE_HARDWARE_WEBGPU === "
 
 test.describe("tile wall page", () => {
   test("opens multiple independent channel tiles and renders each stream", async ({ page }) => {
-    const requestedChannels = ["channel-001", "channel-002", "channel-003"];
+    const requestedChannels = ["channel-4k-crowd", "channel-15116604", "channel-16147856"];
     const sessionRequests: string[] = [];
     page.on("request", (request) => {
       if (request.method() === "POST" && request.url().includes("/api/demo/channels/")) {
@@ -53,11 +53,11 @@ test.describe("tile wall page", () => {
       }
     }
 
-    expect(state?.tiles["channel-001"]?.streamId).toBe("camera-001");
-    expect(state?.tiles["channel-002"]?.streamId).toBe("camera-002");
-    expect(state?.tiles["channel-003"]?.streamId).toBe("camera-003");
-    expect(state?.tiles["channel-003"]?.width).toBe(1920);
-    expect(state?.tiles["channel-003"]?.height).toBe(1080);
+    expect(state?.tiles["channel-4k-crowd"]?.streamId).toBe("camera-4k-crowd");
+    expect(state?.tiles["channel-15116604"]?.streamId).toBe("camera-15116604");
+    expect(state?.tiles["channel-16147856"]?.streamId).toBe("camera-16147856");
+    expect(state?.tiles["channel-15116604"]?.width).toBe(3840);
+    expect(state?.tiles["channel-15116604"]?.height).toBe(2160);
     for (const channelId of requestedChannels) {
       expect(sessionRequests.some((url) => url.includes(`/api/demo/channels/${channelId}/sessions`))).toBe(true);
     }

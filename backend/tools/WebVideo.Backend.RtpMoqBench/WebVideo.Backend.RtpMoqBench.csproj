@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>WebVideo.Backend.RtpMoqBench</AssemblyName>
+    <RootNamespace>WebVideo.Backend.RtpMoqBench</RootNamespace>
+    <EnablePreviewFeatures>true</EnablePreviewFeatures>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\WebVideo.Backend.DemoHost\WebVideo.Backend.DemoHost.csproj" />
+  </ItemGroup>
+</Project>

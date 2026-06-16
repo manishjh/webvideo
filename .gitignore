@@ -3,6 +3,7 @@
 bin/
 obj/
 node_modules/
+frontend/dist/
 playwright-report/
 test-results/
 .vite/

@@ -1,19 +1,21 @@
 import { expect, test } from "@playwright/test";
 
 const requireHardwareWebGpu = process.env.WEBVIDEO_REQUIRE_HARDWARE_WEBGPU === "1";
+const rtspPort = process.env.RTSP_PORT ?? "8554";
+const webTransportPort = process.env.WEBTRANSPORT_PORT ?? "9443";
 
 test.describe("live demo page", () => {
   test("opens a client-initiated channel session and renders visible playback", async ({ page }) => {
     const sessionRequestPromise = page.waitForRequest((request) => (
       request.method() === "POST"
-      && request.url().includes("/api/demo/channels/channel-001/sessions")
+      && request.url().includes("/api/demo/channels/channel-4k-crowd/sessions")
     ));
     const sessionResponsePromise = page.waitForResponse((response) => (
       response.request().method() === "POST"
-      && response.url().includes("/api/demo/channels/channel-001/sessions")
+      && response.url().includes("/api/demo/channels/channel-4k-crowd/sessions")
     ));
 
-    await page.goto("/live-demo.html?channel=channel-001");
+    await page.goto("/live-demo.html?channel=channel-4k-crowd");
     const sessionRequest = await sessionRequestPromise;
     const sessionResponse = await sessionResponsePromise;
     const sessionPayload = await sessionResponse.json();
@@ -35,11 +37,11 @@ test.describe("live demo page", () => {
 
     await expect(page.getByTestId("page-title")).toHaveText("WebVideo Live Demo");
     await expect(page.getByTestId("demo-status")).toHaveText("completed");
-    await expect(page.getByTestId("demo-channel-id")).toHaveText("channel-001");
-    await expect(page.getByTestId("demo-stream-id")).toHaveText("camera-001");
-    await expect(page.getByTestId("demo-display-name")).toHaveText("CCTV Lobby 720p");
-    await expect(page.getByTestId("demo-source-rtsp")).toHaveText("rtsp://127.0.0.1:8554/live/cctv-lobby-720p");
-    await expect(page.getByTestId("demo-quic-url")).toHaveText("https://127.0.0.1:9443/live/channel-001");
+    await expect(page.getByTestId("demo-channel-id")).toHaveText("channel-4k-crowd");
+    await expect(page.getByTestId("demo-stream-id")).toHaveText("camera-4k-crowd");
+    await expect(page.getByTestId("demo-display-name")).toHaveText("CCTV Road Crowd 4K60");
+    await expect(page.getByTestId("demo-source-rtsp")).toHaveText(`rtsp://127.0.0.1:${rtspPort}/live/cctv-road-crowd-4k60`);
+    await expect(page.getByTestId("demo-quic-url")).toHaveText(`https://127.0.0.1:${webTransportPort}/live/channel-4k-crowd`);
     await expect(page.getByTestId("demo-sink-id")).toContainText("sink-");
     await expect(page.getByTestId("demo-transport-mode")).toHaveText("webtransport-quic -> webtransport-quic");
     await expect(page.getByTestId("demo-webtransport-bytes")).not.toHaveText("0");
@@ -51,7 +53,7 @@ test.describe("live demo page", () => {
     await expect(page.getByTestId("demo-source-diagnostics")).toContainText("captured 8 Annex B H.264 access units");
     await expect(page.getByTestId("demo-rendered-count")).toHaveText("8");
     await expect(page.getByTestId("demo-last-sequence")).toHaveText("108");
-    await expect(page.getByTestId("demo-overlay-count")).toHaveText("1");
+    await expect(page.getByTestId("demo-overlay-count")).toHaveText(requireHardwareWebGpu ? "1" : "0");
     await expect(page.getByTestId("demo-sequence-trace")).toHaveText("101, 102, 103, 104, 105, 106, 107, 108");
 
     const canvas = page.getByTestId("live-demo-canvas");
@@ -86,10 +88,10 @@ test.describe("live demo page", () => {
       };
     });
 
-    expect(sample.width).toBe(1280);
+    expect(sample.width).toBe(3840);
     expect(sample.hidden).toBe(false);
     expect(sample.lastSequence).toBe("108");
-    expect(sample.overlayCount).toBe("1");
+    expect(sample.overlayCount).toBe(requireHardwareWebGpu ? "1" : "0");
     if (requireHardwareWebGpu) {
       expect(sample.renderBackend).toBe("webgpu");
       expect(sample.gpuPresentation).toBe("webgpu-canvas");
@@ -103,8 +105,8 @@ test.describe("live demo page", () => {
     }
     expect(sample.webGpuError).toBe("");
     expect(sample.state).toMatchObject({
-      channelId: "channel-001",
-      streamId: "camera-001",
+      channelId: "channel-4k-crowd",
+      streamId: "camera-4k-crowd",
       requestedTransport: "webtransport-quic",
       activeTransport: "webtransport-quic",
       webTransportReady: true,

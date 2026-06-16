@@ -1,4 +1,4 @@
-import { Activity, MonitorPlay, Plus, Square, X } from "lucide-react";
+import { Activity, MonitorPlay, Plus, Square } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { ReactElement } from "react";
 import type { BrowserDemoChannelSummary } from "../testing/browserDemoApi";
@@ -7,9 +7,13 @@ import {
   loadWebTransportCertificateHash,
 } from "../testing/browserDemoApi";
 import {
-  VmsTileController,
-  type VmsTileRuntimeState,
-} from "./playerController";
+  createVideoPipeViewportSessionKey,
+  VideoPipeViewport,
+  type VideoPipeChannelGroup,
+  type VideoPipeRenderClock,
+  type VideoPipeRuntimeState,
+} from "../video-pipe";
+import { VmsTile, type LiveFanoutMetric } from "./VmsTile";
 
 declare global {
   interface Window {
@@ -17,42 +21,73 @@ declare global {
       status: string;
       channels: BrowserDemoChannelSummary[];
       activeChannels: string[];
-      tiles: Record<string, VmsTileRuntimeState>;
+      activeTiles: ActiveTileInstance[];
+      metadataEnabledByTile: Record<string, boolean>;
+      tiles: Record<string, VideoPipeRuntimeState>;
       serverMetrics: Record<string, LiveFanoutMetric>;
     };
   }
 }
 
-interface RuntimeOptions {
+export interface RuntimeOptions {
+  adaptiveRenderFrameRate: boolean;
+  adaptiveSourceFrameRate: boolean;
   batchFrameCount: number;
+  matrixCompositor: boolean;
+  maxHighFrameRateRenderFrameRate?: number;
+  maxHighSourceFrameRate?: number;
+  maxRenderFrameRate?: number;
+  maxSourceCodedWidth?: number;
+  maxSourceCodedHeight?: number;
+  maxSourceFrameRate?: number;
+  chaosDisconnectAfterFrames?: number;
+  chaosFrameDelayMs?: number;
+  chaosDropEveryNFrames?: number;
+  offscreenCanvas: boolean;
+  renderClock: VideoPipeRenderClock;
   targetBatches?: number;
 }
 
-interface LiveFanoutSubscriberMetric {
-  pendingFrames: number;
-  framesRead: number;
-  framesDropped: number;
+interface ActiveTileInstance {
+  tileId: string;
+  channelId: string;
+  instanceNumber: number;
 }
 
-interface LiveFanoutMetric {
-  streamId: string;
-  processRunning: boolean;
-  subscriberCount: number;
-  framesRead: number;
-  bytesRead: number;
-  subscriberFramesDropped: number;
-  subscribers: LiveFanoutSubscriberMetric[];
-}
+const MaxActiveTiles = 4;
 
 export function VmsApp(): ReactElement {
   const [channels, setChannels] = useState<BrowserDemoChannelSummary[]>([]);
-  const [activeChannels, setActiveChannels] = useState<string[]>([]);
-  const [tiles, setTiles] = useState<Record<string, VmsTileRuntimeState>>({});
+  const [activeTiles, setActiveTiles] = useState<ActiveTileInstance[]>([]);
+  const [metadataEnabledByTile, setMetadataEnabledByTile] = useState<Record<string, boolean>>({});
+  const [tiles, setTiles] = useState<Record<string, VideoPipeRuntimeState>>({});
   const [serverMetrics, setServerMetrics] = useState<Record<string, LiveFanoutMetric>>({});
   const [catalogStatus, setCatalogStatus] = useState("loading");
   const [error, setError] = useState<string>();
   const [certificateHash, setCertificateHash] = useState<string>();
+  const nextTileSerialRef = useRef(2);
   const runtimeOptions = useMemo(readRuntimeOptions, []);
+  const viewportOptions = useMemo(
+    () => createViewportOptions(runtimeOptions, activeTiles.length),
+    [activeTiles.length, runtimeOptions],
+  );
+  const viewportSessionKey = useMemo(
+    () => createVideoPipeViewportSessionKey(viewportOptions),
+    [viewportOptions],
+  );
+  const useDirectTileRender = useMemo(
+    () => shouldUseDirectTileRender(runtimeOptions, activeTiles, tiles),
+    [activeTiles, runtimeOptions, tiles],
+  );
+  const activeChannels = useMemo(() => activeTiles.map((tile) => tile.channelId), [activeTiles]);
+  const tileCountsByChannel = useMemo(
+    () => countTilesByChannel(activeTiles),
+    [activeTiles],
+  );
+  const diagnosticTiles = useMemo(
+    () => createDiagnosticTileMap(activeTiles, tiles),
+    [activeTiles, tiles],
+  );
 
   useEffect(() => {
     let cancelled = false;
@@ -89,14 +124,16 @@ export function VmsApp(): ReactElement {
     window.__webvideoVmsState = {
       status: catalogStatus,
       channels,
+      activeTiles,
       activeChannels,
-      tiles,
+      metadataEnabledByTile,
+      tiles: diagnosticTiles,
       serverMetrics,
     };
-  }, [activeChannels, catalogStatus, channels, serverMetrics, tiles]);
+  }, [activeChannels, activeTiles, catalogStatus, channels, diagnosticTiles, metadataEnabledByTile, serverMetrics]);
 
   useEffect(() => {
-    if (activeChannels.length === 0) {
+    if (activeTiles.length === 0) {
       setServerMetrics({});
       return;
     }
@@ -111,7 +148,7 @@ export function VmsApp(): ReactElement {
 
         const metrics = await response.json() as LiveFanoutMetric[];
         if (!cancelled) {
-          setServerMetrics(Object.fromEntries(metrics.map((metric) => [metric.streamId, metric])));
+          setServerMetrics(indexLiveFanoutMetrics(metrics));
         }
       } catch {
         // Server diagnostics are best-effort; playback should not depend on the metrics endpoint.
@@ -126,33 +163,77 @@ export function VmsApp(): ReactElement {
       cancelled = true;
       window.clearInterval(interval);
     };
-  }, [activeChannels.length]);
+  }, [activeTiles.length]);
 
   function addChannel(channelId: string): void {
-    setActiveChannels((current) => current.includes(channelId) ? current : [...current, channelId]);
+    setActiveTiles((current) => {
+      if (current.length >= MaxActiveTiles) {
+        return current;
+      }
+
+      const existingForChannel = current.filter((tile) => tile.channelId === channelId);
+      const tileId = existingForChannel.length > 0
+        ? `${channelId}-${nextTileSerialRef.current++}`
+        : channelId;
+      const instanceNumber = existingForChannel.reduce(
+        (currentMax, tile) => Math.max(currentMax, tile.instanceNumber),
+        0,
+      ) + 1;
+
+      return [
+        ...current,
+        {
+          tileId,
+          channelId,
+          instanceNumber,
+        },
+      ];
+    });
   }
 
-  function closeChannel(channelId: string): void {
-    setActiveChannels((current) => current.filter((candidate) => candidate !== channelId));
+  function setTileMetadataEnabled(tileId: string, enabled: boolean): void {
+    setMetadataEnabledByTile((current) => ({
+      ...current,
+      [tileId]: enabled,
+    }));
+  }
+
+  function closeTile(tileId: string): void {
+    setActiveTiles((current) => current.filter((candidate) => candidate.tileId !== tileId));
+    setMetadataEnabledByTile((current) => {
+      const next = { ...current };
+      delete next[tileId];
+      return next;
+    });
     setTiles((current) => {
       const next = { ...current };
-      delete next[channelId];
+      delete next[tileId];
       return next;
     });
   }
 
-  function updateTile(channelId: string, state: VmsTileRuntimeState): void {
-    setTiles((current) => ({
-      ...current,
-      [channelId]: state,
-    }));
+  function updateChannelTiles(tileIds: string[], state: VideoPipeRuntimeState): void {
+    setTiles((current) => {
+      const next = { ...current };
+      for (const tileId of tileIds) {
+        next[tileId] = {
+          ...state,
+          tileId: `tile-${tileId}`,
+        };
+      }
+
+      return next;
+    });
   }
 
-  const activeSet = new Set(activeChannels);
-  const activeChannelModels = activeChannels
-    .map((channelId) => channels.find((channel) => channel.channelId === channelId))
-    .filter((channel): channel is BrowserDemoChannelSummary => Boolean(channel));
-  const completedTiles = activeChannels.filter((channelId) => tiles[channelId]?.status === "playing" || tiles[channelId]?.status === "holding").length;
+  const activeChannelGroups = createActiveChannelGroups(activeTiles, channels);
+  const activeTileModels = activeTiles
+    .map((tile) => ({
+      tile,
+      channel: channels.find((channel) => channel.channelId === tile.channelId),
+    }))
+    .filter((entry): entry is { tile: ActiveTileInstance; channel: BrowserDemoChannelSummary } => Boolean(entry.channel));
+  const completedTiles = activeTiles.filter((tile) => tiles[tile.tileId]?.status === "playing" || tiles[tile.tileId]?.status === "holding").length;
 
   return (
     <main className="vms-shell">
@@ -176,7 +257,7 @@ export function VmsApp(): ReactElement {
                 aria-label={`Add ${channel.displayName}`}
                 className="icon-button"
                 data-testid={`add-channel-${channel.channelId}`}
-                disabled={activeSet.has(channel.channelId) || catalogStatus !== "ready"}
+                disabled={catalogStatus !== "ready" || activeTiles.length >= MaxActiveTiles}
                 title="Add channel"
                 type="button"
                 onClick={() => addChannel(channel.channelId)}
@@ -202,25 +283,50 @@ export function VmsApp(): ReactElement {
         </div>
         </header>
 
-        {activeChannelModels.length === 0 ? (
+        {activeTileModels.length === 0 ? (
           <div className="empty-state" data-testid="vms-empty-state">
             <Square size={18} aria-hidden="true" />
             <span>No active tiles</span>
           </div>
         ) : (
-          <div className="vms-grid" data-testid="vms-grid">
-            {activeChannelModels.map((channel) => (
-              <VmsTile
-                certificateHash={certificateHash}
-                channel={channel}
-                key={channel.channelId}
-                options={runtimeOptions}
-                serverMetrics={serverMetrics[channel.streamId]}
-                state={tiles[channel.channelId]}
-                onClose={() => closeChannel(channel.channelId)}
-                onState={(state) => updateTile(channel.channelId, state)}
-              />
-            ))}
+          <div className={useDirectTileRender ? "vms-grid-shell direct-render" : "vms-grid-shell"}>
+            <VideoPipeViewport
+              canvasIdForTile={canvasIdForTile}
+              channelGroups={activeChannelGroups}
+              metadataEnabledByTile={metadataEnabledByTile}
+              matrixCanvasClassName="vms-matrix-canvas"
+              matrixCanvasId="vms-matrix-canvas"
+              matrixCanvasTestId="vms-matrix-canvas"
+              options={viewportOptions}
+              serverCertificateHash={certificateHash}
+              onState={updateChannelTiles}
+            >
+              <div className="vms-grid" data-testid="vms-grid">
+                {activeTileModels.map(({ tile, channel }) => (
+                  <VmsTile
+                    canvasResetKey={canvasResetKeyForTile(
+                      tile,
+                      tileCountsByChannel.get(tile.channelId) ?? 1,
+                      viewportOptions.offscreenCanvas,
+                      viewportSessionKey,
+                    )}
+                    channel={channel}
+                    instanceNumber={tile.instanceNumber}
+                    key={tile.tileId}
+                    serverMetrics={selectLiveFanoutMetric(
+                      serverMetrics,
+                      channel.streamId,
+                      tiles[tile.tileId]?.sourceRtspUrl,
+                    )}
+                    state={tiles[tile.tileId]}
+                    tileId={tile.tileId}
+                    metadataEnabled={metadataEnabledByTile[tile.tileId] !== false}
+                    onMetadataEnabledChange={(enabled) => setTileMetadataEnabled(tile.tileId, enabled)}
+                    onClose={() => closeTile(tile.tileId)}
+                  />
+                ))}
+              </div>
+            </VideoPipeViewport>
           </div>
         )}
       </section>
@@ -228,127 +334,142 @@ export function VmsApp(): ReactElement {
   );
 }
 
-interface VmsTileProps {
-  certificateHash?: string;
-  channel: BrowserDemoChannelSummary;
-  options: RuntimeOptions;
-  serverMetrics?: LiveFanoutMetric;
-  state?: VmsTileRuntimeState;
-  onClose: () => void;
-  onState: (state: VmsTileRuntimeState) => void;
+function countTilesByChannel(activeTiles: ActiveTileInstance[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const tile of activeTiles) {
+    counts.set(tile.channelId, (counts.get(tile.channelId) ?? 0) + 1);
+  }
+
+  return counts;
 }
 
-function VmsTile({
-  certificateHash,
-  channel,
-  options,
-  serverMetrics,
-  state,
-  onClose,
-  onState,
-}: VmsTileProps): ReactElement {
-  const canvasId = `vms-canvas-${channel.channelId}`;
-  const controllerRef = useRef<VmsTileController | undefined>(undefined);
-  const onStateRef = useRef(onState);
+function canvasResetKeyForTile(
+  tile: ActiveTileInstance,
+  channelTileCount: number,
+  offscreenCanvasEnabled: boolean,
+  viewportSessionKey: string,
+): string {
+  const renderMode = offscreenCanvasEnabled && channelTileCount === 1 ? "offscreen" : "shared";
+  return `${tile.tileId}:${renderMode}:${channelTileCount}:${viewportSessionKey}`;
+}
 
-  useEffect(() => {
-    onStateRef.current = onState;
-  }, [onState]);
+function createDiagnosticTileMap(
+  activeTiles: ActiveTileInstance[],
+  tiles: Record<string, VideoPipeRuntimeState>,
+): Record<string, VideoPipeRuntimeState> {
+  const diagnosticTiles: Record<string, VideoPipeRuntimeState> = {};
+  const channelAliases = new Set<string>();
 
-  useEffect(() => {
-    const controller = new VmsTileController({
-      tileId: `tile-${channel.channelId}`,
+  for (const tile of activeTiles) {
+    const state = tiles[tile.tileId];
+    if (state) {
+      diagnosticTiles[tile.tileId] = state;
+    }
+
+    if (state && !channelAliases.has(tile.channelId)) {
+      diagnosticTiles[tile.channelId] = state;
+      channelAliases.add(tile.channelId);
+    }
+  }
+
+  return diagnosticTiles;
+}
+
+function createActiveChannelGroups(
+  activeTiles: ActiveTileInstance[],
+  channels: BrowserDemoChannelSummary[],
+): VideoPipeChannelGroup[] {
+  const groups: VideoPipeChannelGroup[] = [];
+  for (const channelId of new Set(activeTiles.map((tile) => tile.channelId))) {
+    const channel = channels.find((candidate) => candidate.channelId === channelId);
+    if (!channel) {
+      continue;
+    }
+
+    groups.push({
       channel,
-      canvasId,
-      authToken: "demo-token",
-      serverCertificateHash: certificateHash,
-      batchFrameCount: options.batchFrameCount,
-      targetBatches: options.targetBatches,
-      targetLatencyMs: 150,
-      onState: (nextState) => onStateRef.current(nextState),
+      tileIds: activeTiles
+        .filter((tile) => tile.channelId === channelId)
+        .map((tile) => tile.tileId),
     });
-    controllerRef.current = controller;
-    controller.start();
+  }
 
-    return () => {
-      controller.stop();
-      controllerRef.current = undefined;
-    };
-  }, [canvasId, certificateHash, channel, options.batchFrameCount, options.targetBatches]);
-
-  const metrics = state?.metrics;
-  return (
-    <article className="vms-tile" data-testid={`tile-${channel.channelId}`}>
-      <header className="tile-bar">
-        <div>
-          <h2>{channel.displayName}</h2>
-          <span data-testid="tile-stream">{channel.channelId} / {channel.streamId}</span>
-        </div>
-        <button
-          aria-label={`Close ${channel.displayName}`}
-          className="icon-button danger"
-          data-testid="tile-close"
-          title="Close stream"
-          type="button"
-          onClick={onClose}
-        >
-          <X size={17} aria-hidden="true" />
-        </button>
-      </header>
-      <div className="video-surface">
-        <canvas
-          data-testid={`tile-canvas-${channel.channelId}`}
-          height={channel.codec.codedHeight}
-          id={canvasId}
-          width={channel.codec.codedWidth}
-        />
-      </div>
-      <div className="tile-stats">
-        <Metric label="Status" testId="tile-status" value={state?.status ?? "starting"} />
-        <Metric label="Transport" testId="tile-transport" value={state?.activeTransport ?? "pending"} />
-        <Metric label="Bytes" testId="tile-bytes" value={formatNumber(metrics?.bytesReceived)} />
-        <Metric label="Messages" testId="tile-messages" value={formatNumber(metrics?.messagesReceived)} />
-        <Metric label="Queue" testId="tile-server-queue" value={formatNumber(maxPendingFrames(serverMetrics))} />
-        <Metric label="Server drops" testId="tile-server-drops" value={formatNumber(serverMetrics?.subscriberFramesDropped)} />
-        <Metric label="Client drops" testId="tile-client-drops" value={formatNumber(metrics?.framesDropped)} />
-        <Metric label="Seq gaps" testId="tile-sequence-gaps" value={formatNumber(metrics?.sequenceGapFrames)} />
-        <Metric label="Hitches" testId="tile-frame-hitches" value={formatNumber(metrics?.frameHitches)} />
-        <Metric label="Decode" testId="tile-decode" value={state?.decodeBackend ?? "pending"} />
-        <Metric label="Render" testId="tile-render" value={state?.renderBackend ?? "pending"} />
-        <Metric label="GPU path" testId="tile-gpu-path" value={formatGpuPath(state)} />
-        <Metric label="GPU adapter" testId="tile-gpu-adapter" value={formatGpuAdapter(state)} />
-        <Metric label="Source FPS" testId="tile-source-fps" value={formatFps(state?.sourceFrameRate)} />
-        <Metric label="Frames" testId="tile-frames" value={formatNumber(metrics?.framesRendered)} />
-        <Metric label="Render FPS" testId="tile-render-fps" value={formatFps(metrics?.renderFps)} />
-        <Metric label="Frame p95" testId="tile-frame-interval-p95" value={formatMs(metrics?.frameInterval.p95Ms)} />
-        <Metric label="Connections" testId="tile-connections" value={formatNumber(state?.connectionOpenCount)} />
-        <Metric label="Protocol ends" testId="tile-protocol-ends" value={formatNumber(state?.protocolEndFrameCount)} />
-        <Metric label="S2R latest" testId="tile-metric-source-to-render-latest" value={formatMs(metrics?.sourceToRender.latestMs)} />
-        <Metric label="S2R p95" testId="tile-metric-source-to-render-p95" value={formatMs(metrics?.sourceToRender.p95Ms)} />
-        <Metric label="Server p95" testId="tile-metric-server-to-render-p95" value={formatMs(metrics?.serverToRender.p95Ms)} />
-        <Metric label="Receive p95" testId="tile-metric-receive-to-render-p95" value={formatMs(metrics?.receiveToRender.p95Ms)} />
-        <Metric label="Decode p95" testId="tile-metric-decode-p95" value={formatMs(metrics?.decode.p95Ms)} />
-        <Metric label="Render p95" testId="tile-metric-render-p95" value={formatMs(metrics?.render.p95Ms)} />
-        <Metric label="Error" testId="tile-error" value={state?.error ?? state?.gpuReadbackError ?? "none"} />
-      </div>
-    </article>
-  );
+  return groups;
 }
 
-function Metric({ label, testId, value }: { label: string; testId: string; value: string }): ReactElement {
-  return (
-    <div className="metric">
-      <span>{label}</span>
-      <strong data-testid={testId}>{value}</strong>
-    </div>
-  );
+function canvasIdForTile(tileId: string): string {
+  return `vms-canvas-${tileId}`;
+}
+
+function indexLiveFanoutMetrics(metrics: LiveFanoutMetric[]): Record<string, LiveFanoutMetric> {
+  const indexed: Record<string, LiveFanoutMetric> = {};
+  for (const metric of metrics) {
+    indexed[liveFanoutMetricKey(metric.streamId, metric.rtspUrl)] = metric;
+    const existingAlias = indexed[metric.streamId];
+    if (!existingAlias || compareLiveFanoutMetrics(metric, existingAlias) > 0) {
+      indexed[metric.streamId] = metric;
+    }
+  }
+
+  return indexed;
+}
+
+function selectLiveFanoutMetric(
+  indexed: Record<string, LiveFanoutMetric>,
+  streamId: string,
+  rtspUrl: string | undefined,
+): LiveFanoutMetric | undefined {
+  return indexed[liveFanoutMetricKey(streamId, rtspUrl)] ?? indexed[streamId];
+}
+
+function liveFanoutMetricKey(streamId: string, rtspUrl: string | undefined): string {
+  return `${streamId}\n${rtspUrl ?? ""}`;
+}
+
+function compareLiveFanoutMetrics(left: LiveFanoutMetric, right: LiveFanoutMetric): number {
+  if (left.subscriberCount !== right.subscriberCount) {
+    return left.subscriberCount - right.subscriberCount;
+  }
+
+  return left.framesRead - right.framesRead;
 }
 
 function readRuntimeOptions(): RuntimeOptions {
   const params = new URLSearchParams(window.location.search);
+  const adaptiveRenderFrameRate = !["0", "false"].includes((params.get("adaptiveRender") ?? "1").toLowerCase());
+  const adaptiveSourceFrameRate = ["1", "true", "yes", "on"].includes((params.get("adaptiveSource") ?? "0").toLowerCase());
   const batchFrameCount = readPositiveInt(params.get("batchFrames"), 4);
   const targetBatches = readOptionalPositiveInt(params.get("targetBatches"));
-  return { batchFrameCount, targetBatches };
+  const matrixCompositor = !["0", "false"].includes((params.get("matrix") ?? "1").toLowerCase());
+  const maxHighFrameRateRenderFrameRate = readOptionalRenderFrameRate(params.get("maxHighFpsRenderFps"));
+  const maxHighSourceFrameRate = readOptionalRenderFrameRate(params.get("maxHighSourceFps"));
+  const maxRenderFrameRate = readOptionalRenderFrameRate(params.get("maxRenderFps"));
+  const maxSourceCodedWidth = readOptionalPositiveInt(params.get("maxSourceWidth"));
+  const maxSourceCodedHeight = readOptionalPositiveInt(params.get("maxSourceHeight"));
+  const maxSourceFrameRate = readOptionalRenderFrameRate(params.get("maxSourceFps"));
+  const chaosDisconnectAfterFrames = readOptionalPositiveInt(params.get("chaosDisconnectAfterFrames"));
+  const chaosFrameDelayMs = readOptionalPositiveInt(params.get("chaosFrameDelayMs"));
+  const chaosDropEveryNFrames = readOptionalPositiveInt(params.get("chaosDropEveryNFrames"));
+  const offscreenCanvas = ["1", "true", "yes", "on"].includes((params.get("offscreen") ?? "0").toLowerCase());
+  const renderClock = readRenderClock(params.get("renderClock"));
+  return {
+    batchFrameCount,
+    adaptiveRenderFrameRate,
+    adaptiveSourceFrameRate,
+    matrixCompositor,
+    maxHighFrameRateRenderFrameRate,
+    maxHighSourceFrameRate,
+    maxRenderFrameRate,
+    maxSourceCodedWidth,
+    maxSourceCodedHeight,
+    maxSourceFrameRate,
+    chaosDisconnectAfterFrames,
+    chaosFrameDelayMs,
+    chaosDropEveryNFrames,
+    offscreenCanvas,
+    renderClock,
+    targetBatches,
+  };
 }
 
 function readPositiveInt(value: string | null, fallback: number): number {
@@ -361,41 +482,82 @@ function readOptionalPositiveInt(value: string | null): number | undefined {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : undefined;
 }
 
-function formatNumber(value: number | undefined): string {
-  return value === undefined ? "0" : String(Math.round(value));
-}
-
-function formatMs(value: number | undefined): string {
-  return `${(value ?? 0).toFixed(1)} ms`;
-}
-
-function formatFps(value: number | undefined): string {
-  return `${(value ?? 0).toFixed(1)} fps`;
-}
-
-function formatGpuPath(state: VmsTileRuntimeState | undefined): string {
-  if (state?.webGpuDisabledReason) {
-    return `disabled (${state.webGpuDisabledReason})`;
+function readOptionalRenderFrameRate(value: string | null): number | undefined {
+  if (value === null || value.trim() === "") {
+    return undefined;
   }
 
-  if (!state?.gpuPresentation && !state?.gpuUploadSource) {
-    return "pending";
+  const parsed = Number.parseFloat(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) {
+    return 0;
   }
 
-  return `${state.gpuUploadSource ?? "unknown"} / ${state.gpuPresentation ?? "unknown"}`;
+  return parsed;
 }
 
-function formatGpuAdapter(state: VmsTileRuntimeState | undefined): string {
-  if (!state?.gpuAdapterVendor && !state?.gpuAdapterArchitecture) {
-    return "pending";
+function readRenderClock(value: string | null): VideoPipeRenderClock {
+  const normalized = (value ?? "frame-arrival").toLowerCase();
+  return ["raf", "animation-frame"].includes(normalized) ? "animation-frame" : "frame-arrival";
+}
+
+export function createViewportOptions(
+  options: RuntimeOptions,
+  tileCount: number,
+): RuntimeOptions {
+  if (
+    options.maxRenderFrameRate !== undefined
+    || options.maxHighFrameRateRenderFrameRate !== undefined
+    || options.maxHighSourceFrameRate !== undefined
+    || options.maxSourceCodedWidth !== undefined
+    || options.maxSourceCodedHeight !== undefined
+    || options.maxSourceFrameRate !== undefined
+  ) {
+    return {
+      ...options,
+      offscreenCanvas: tileCount <= 1 && options.offscreenCanvas,
+      maxHighFrameRateRenderFrameRate: normalizeRenderFrameRate(options.maxHighFrameRateRenderFrameRate),
+      maxHighSourceFrameRate: normalizeRenderFrameRate(options.maxHighSourceFrameRate),
+      maxRenderFrameRate: normalizeRenderFrameRate(options.maxRenderFrameRate),
+      maxSourceCodedWidth: normalizePositiveInteger(options.maxSourceCodedWidth),
+      maxSourceCodedHeight: normalizePositiveInteger(options.maxSourceCodedHeight),
+      maxSourceFrameRate: normalizeRenderFrameRate(options.maxSourceFrameRate),
+    };
   }
 
-  return `${state.gpuAdapterVendor || "unknown"} ${state.gpuAdapterArchitecture || "unknown"}`;
+  return {
+    ...options,
+    offscreenCanvas: tileCount <= 1 && options.offscreenCanvas,
+    maxHighFrameRateRenderFrameRate: undefined,
+    maxHighSourceFrameRate: undefined,
+    maxRenderFrameRate: undefined,
+    maxSourceCodedWidth: undefined,
+    maxSourceCodedHeight: undefined,
+    maxSourceFrameRate: undefined,
+  };
 }
 
-function maxPendingFrames(metrics: LiveFanoutMetric | undefined): number | undefined {
-  return metrics?.subscribers.reduce(
-    (currentMax, subscriber) => Math.max(currentMax, subscriber.pendingFrames),
-    0,
-  );
+function normalizeRenderFrameRate(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+function normalizePositiveInteger(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+}
+
+export function shouldUseDirectTileRender(
+  options: Pick<RuntimeOptions, "matrixCompositor" | "offscreenCanvas">,
+  activeTiles: readonly Pick<ActiveTileInstance, "tileId">[],
+  tiles: Record<string, Pick<VideoPipeRuntimeState, "gpuPresentation" | "matrixFallbackReason" | "renderBackend" | "webGpuDisabledReason"> | undefined>,
+): boolean {
+  if (!options.matrixCompositor || options.offscreenCanvas) {
+    return true;
+  }
+
+  return activeTiles.some((tile) => {
+    const state = tiles[tile.tileId];
+    return state?.renderBackend === "canvas2d-fallback"
+      || state?.gpuPresentation === "canvas2d-fallback"
+      || Boolean(state?.matrixFallbackReason)
+      || Boolean(state?.webGpuDisabledReason);
+  });
 }

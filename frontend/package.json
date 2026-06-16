@@ -3,7 +3,9 @@
   "private": true,
   "type": "module",
   "scripts": {
+    "build": "vite build",
     "dev": "vite",
+    "preview": "vite preview",
     "test:unit": "vitest run",
     "test:typecheck": "tsc -p tsconfig.json --noEmit",
     "test:watch": "vitest",

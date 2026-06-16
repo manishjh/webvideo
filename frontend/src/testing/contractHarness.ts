@@ -140,7 +140,7 @@ function shouldRunSimulatedPlayerFlow(): boolean {
 }
 
 async function runSimulatedPlayerFlow(): Promise<void> {
-  const channelId = "channel-001";
+  const channelId = "channel-13535786";
 
   bindText("sim-status", "requesting-channel");
   bindText("sim-channel-id", channelId);
@@ -355,7 +355,7 @@ async function bootHarness(): Promise<void> {
       overlayCounts: [],
       status: "idle",
       telemetryStages: [],
-      channelId: "channel-001",
+      channelId: "channel-13535786",
     };
     return;
   }
@@ -371,7 +371,7 @@ async function bootHarness(): Promise<void> {
       overlayCounts: [],
       status: "error",
       telemetryStages: [],
-      channelId: "channel-001",
+      channelId: "channel-13535786",
       error: message,
     };
   }

@@ -32,7 +32,7 @@ Current baseline:
 - `.NET 10` backend contracts and deterministic in-memory coordinators
 - ASP.NET demo host for RTSP-backed browser stream payloads and local WebTransport/QUIC
 - TypeScript browser contracts plus WebTransport, WebCodecs, scheduler, hardware WebGPU render services, and Canvas2D fallback for software-adapter cases
-- Vitest and Playwright suites for contract, live demo, tile wall, VMS continuous playback, opt-in 60 second soak, opt-in mixed 4K/1080p/720p soak, and opt-in 4K browser-flow coverage
+- Vitest and Playwright suites for contract, live demo, tile wall, VMS continuous playback, opt-in 60 second soak, opt-in mixed 4K/1080p soak, and opt-in 4K browser-flow coverage; local 4K RTSP sources are served by default through `start.sh`, while Playwright/profiling uses `test-start.sh` to enable sample footage with 4K/source variants opt-in
 - future service splits are documented separately in [Future Options](./future-options.md)
 
 ## 2. Phase Plan
@@ -55,14 +55,14 @@ Tasks:
 - render a visible browser demo page and contract harness
 - render a visible multi-channel tile wall with one client-initiated channel session per tile
 - render a React VMS client with long-lived WebTransport streams, add/remove channel tiles, and per-tile health metrics
-- expose an opt-in 4K channel smoke for high-resolution browser validation
+- expose default local 4K RTSP channels plus opt-in high-resolution browser smoke tests
 
 Exit criteria:
 
 - backend tests pass
 - frontend unit and contract tests pass
 - Playwright validates the contract harness, live demo, tile wall, VMS continuous playback, and opt-in long-running VMS soak
-- opt-in 4K Playwright validates one 3840x2160 browser session when `WEBVIDEO_E2E_4K=1 START_4K_RTSP=1`
+- opt-in 4K Playwright validates one 3840x2160 browser session when `WEBVIDEO_E2E_4K=1`
 
 ### Phase 1: Define protocol and timing model
 
@@ -86,7 +86,7 @@ Exit criteria:
 
 Goal:
 
-- confirm WebTransport -> WebCodecs -> WebGPU works on target browsers/devices; the local Playwright harness currently verifies this loop against `start.sh`
+- confirm WebTransport -> WebCodecs -> WebGPU works on target browsers/devices; the local Playwright harness currently verifies this loop against `test-start.sh`
 
 Tasks:
 
@@ -96,7 +96,7 @@ Tasks:
 - measure receive, decode, render, and visible presentation timing
 - hardware WebGPU validation with Linux Vulkan/ANGLE flags, WebGPU external textures from WebCodecs `VideoFrame`, and WebGPU canvas presentation
 - software WebGPU adapter detection that avoids slow SwiftShader rendering and uses Canvas2D fallback instead
-- opt-in 4K source and browser smoke path
+- default 4K source path and opt-in 4K browser smoke path
 - per-tile VMS diagnostics for render FPS, source FPS, latency summaries, backend queue/drop counters, client drops, skipped sequence frames, frame hitches, and frame interval p95
 - opt-in mixed-resolution VMS soak for `channel-4k`, `channel-003`, and `channel-001`
 
@@ -106,7 +106,7 @@ Exit criteria:
 - baseline metrics visible in browser
 - default headless Playwright passes
 - `WEBVIDEO_TEST_PROFILE=hardware-long scripts/test-all.sh` passes for the 60 second hardware VMS soak
-- `WEBVIDEO_E2E_4K=1 START_4K_RTSP=1 scripts/test-frontend-e2e.sh` passes for the high-resolution smoke
+- `WEBVIDEO_E2E_4K=1 scripts/test-frontend-e2e.sh` passes for the high-resolution smoke
 - `WEBVIDEO_PLAYWRIGHT_CHROME_WEBGPU=1 scripts/test-frontend-e2e.sh` passes on a Vulkan-capable Chrome install
 
 ### Phase 3: Build live camera path
@@ -125,13 +125,13 @@ Tasks:
 - minimal scheduler with late-frame dropping
 - dynamic channel registry or camera configuration API for arbitrary RTSP sources
 - continuous session lifecycle, backpressure, reconnect, and keyframe recovery
-- hot-path optimization for mixed 4K/1080p/720p viewing, including main-thread work reduction, decode/render backpressure control, and explicit live frame shedding
+- hot-path optimization for mixed 4K/1080p viewing, including main-thread work reduction, decode/render backpressure control, and explicit live frame shedding
 
 Exit criteria:
 
 - arbitrary-duration live stream reaches latency target on development network
 - queue depth, drops, sequence gaps, frame hitches, and latency metrics are visible and tied to failure reasons
-- mixed 4K/1080p/720p playback stays within agreed FPS, hitch, and source-to-render budgets for a multi-minute run
+- mixed 4K/1080p playback stays within agreed FPS, hitch, and source-to-render budgets for a multi-minute run
 
 ### Phase 4: Add metadata overlays
 
@@ -252,9 +252,11 @@ Reason:
 
 Current status:
 
-- VMS media work still runs largely on the main browser thread.
-- The 180 second mixed 4K/1080p/720p stress run shows visible hitches, skipped sequence ranges, backend stale-frame drops, and source-to-render spikes even on the hardware WebGPU path.
-- Moving transport parsing, decode coordination, and scheduling away from React/main-thread work is a near-term optimization target.
+- VMS transport parsing, decode submission, scheduling, and render orchestration still run largely on the main browser thread.
+- An experimental Dedicated Worker decoder path is available with `?decodeWorker=1`; default playback stays on the stable main-thread WebCodecs path until the opt-in browser test proves the worker `VideoFrame` handoff renders reliably.
+- Worker movement must not imply software decode. The target remains WebCodecs hardware decode and WebGPU hardware render; workers are only for CPU-side orchestration that otherwise competes with React/layout/input/compositor scheduling.
+- The 180 second mixed 4K/1080p stress run shows visible hitches, skipped sequence ranges, backend stale-frame drops, and source-to-render spikes even on the hardware WebGPU path.
+- Moving WebTransport read/parsing and live scheduling away from React/main-thread work is the safer near-term optimization target. Worker decode and worker WebGPU/OffscreenCanvas remain follow-up candidates after measurement.
 
 ### Decision: metadata format
 
@@ -299,7 +301,7 @@ Mitigation:
 
 - keep the `hardware-mixed-4k-long` profile as a diagnostic stress path
 - expose client drops, sequence gaps, frame hitches, and backend stale-frame drops in the VMS UI
-- optimize scheduling and queue policy before treating `4K + 1080p + 720p` as a product-grade target
+- optimize scheduling and queue policy before treating `4K + 1080p` as a product-grade target
 
 ### Timestamp drift risk
 

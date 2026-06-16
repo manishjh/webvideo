@@ -5,7 +5,16 @@ using WebVideo.Backend.DemoHost;
 AppContext.SetSwitch("Microsoft.AspNetCore.Server.Kestrel.Experimental.WebTransportAndH3Datagrams", true);
 
 var builder = WebApplication.CreateBuilder(args);
+if (!IsTruthy(Environment.GetEnvironmentVariable("WEBVIDEO_BACKEND_VERBOSE_HTTP_LOGS")))
+{
+    builder.Logging.AddFilter("Microsoft.AspNetCore.Hosting.Diagnostics", LogLevel.Warning);
+    builder.Logging.AddFilter("Microsoft.AspNetCore.Routing.EndpointMiddleware", LogLevel.Warning);
+    builder.Logging.AddFilter("Microsoft.AspNetCore.Http.Result", LogLevel.Warning);
+}
+
 var backendPort = GetInt32EnvironmentVariable("BACKEND_PORT", 8080);
+var frontendPort = GetInt32EnvironmentVariable("FRONTEND_PORT", 4173);
+var rtspPort = GetInt32EnvironmentVariable("RTSP_PORT", 8554);
 var webTransportPort = GetInt32EnvironmentVariable("WEBVIDEO_WEBTRANSPORT_PORT", 9443);
 var webTransportEnabled = !IsFalse(Environment.GetEnvironmentVariable("WEBVIDEO_ENABLE_WEBTRANSPORT"));
 var webTransportCertificatePath = Environment.GetEnvironmentVariable("WEBVIDEO_DEV_CERT_PATH");
@@ -44,7 +53,7 @@ builder.WebHost.ConfigureKestrel(options =>
     }
 });
 
-builder.Services.AddSingleton(_ => new BrowserDemoStreamCatalog(RtspH264AccessUnitCapture.FromEnvironment()));
+builder.Services.AddSingleton(_ => new BrowserDemoStreamCatalog(RtspH264AccessUnitCapture.FromEnvironment(), webTransportPort, rtspPort));
 builder.Services.AddSingleton(_ =>
 {
     var ffmpegPath = Environment.GetEnvironmentVariable("WEBVIDEO_FFMPEG_BIN");
@@ -53,14 +62,17 @@ builder.Services.AddSingleton(_ =>
         ffmpegPath = "ffmpeg";
     }
 
-    return new ContinuousRtspStreamFanout(ffmpegPath);
+    var rtspTransport = Environment.GetEnvironmentVariable("WEBVIDEO_BACKEND_RTSP_TRANSPORT");
+    return new ContinuousRtspStreamFanout(ffmpegPath, rtspTransport: rtspTransport);
 });
 builder.Services.AddCors(options =>
 {
+    var frontendOrigin = $"http://127.0.0.1:{frontendPort}";
+    var localhostFrontendOrigin = $"http://localhost:{frontendPort}";
     options.AddPolicy(
         "local-dev",
         policy => policy
-            .WithOrigins("http://127.0.0.1:4173", "http://localhost:4173")
+            .WithOrigins(frontendOrigin, localhostFrontendOrigin)
             .AllowAnyHeader()
             .AllowAnyMethod());
 });
@@ -89,6 +101,27 @@ app.MapGet(
 app.MapGet(
     "/api/demo/live/metrics",
     (ContinuousRtspStreamFanout liveFanout) => Results.Ok(liveFanout.GetMetrics()));
+
+app.MapGet(
+    "/api/demo/live/egress-metrics",
+    () => Results.Ok(BrowserDemoWebTransportEndpoint.GetEgressMetrics()));
+
+app.MapGet(
+    "/api/demo/live/process-metrics",
+    () =>
+    {
+        using var process = System.Diagnostics.Process.GetCurrentProcess();
+        return Results.Ok(new
+        {
+            processId = Environment.ProcessId,
+            totalProcessorTimeMs = process.TotalProcessorTime.TotalMilliseconds,
+            workingSetBytes = process.WorkingSet64,
+            privateMemoryBytes = process.PrivateMemorySize64,
+            gcHeapBytes = GC.GetTotalMemory(forceFullCollection: false),
+            threadCount = process.Threads.Count,
+            utcNow = DateTimeOffset.UtcNow
+        });
+    });
 
 app.MapGet(
     "/api/demo/webtransport/certificate-hash",
@@ -158,5 +191,11 @@ static int GetInt32EnvironmentVariable(string name, int fallback)
 static bool IsFalse(string? value)
     => string.Equals(value, "0", StringComparison.OrdinalIgnoreCase)
         || string.Equals(value, "false", StringComparison.OrdinalIgnoreCase);
+
+static bool IsTruthy(string? value)
+    => string.Equals(value, "1", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(value, "true", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase)
+        || string.Equals(value, "on", StringComparison.OrdinalIgnoreCase);
 
 public partial class Program;
