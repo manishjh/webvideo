@@ -1,5 +1,6 @@
 export {
   LiveDecodedFrameQueue,
+  resolveAdaptiveRenderDurationPressureSeverity,
   resolveEffectiveRenderFrameRate,
   resolveEffectiveSourceEgressFrameRate,
   resolveEffectiveSourceFrameRate,
@@ -11,6 +12,12 @@ export {
   AdaptiveRenderCadence,
   AdaptiveRenderFrameGovernor,
 } from "./adaptiveRenderGovernor";
+export {
+  resolveLiveDecodeBacklogBudgetFrames,
+  resolveLiveHardDecodeBacklogFrames,
+  resolveLiveRenderQueueBudgetFrames,
+  resolveLiveStaleFrameDropThresholdMs,
+} from "./liveLatencyPolicy";
 export type { AdaptiveRenderGovernorSnapshot } from "./adaptiveRenderGovernor";
 export type {
   VideoPipeChannel,
@@ -24,6 +31,8 @@ export {
   addSample,
   createMetricSnapshot,
   createVmsCounterState,
+  FrameServiceBudgetMs,
+  recordRenderBudgetSample,
   recordRenderedFrame,
   recordSequenceGap,
   summarizeLatency,
@@ -36,7 +45,10 @@ export type {
 export { createSharedVideoViewportRenderer } from "./sharedViewport";
 export type { SharedVideoViewportRendererOptions } from "./sharedViewport";
 export { SharedVideoTileRenderer } from "./sharedTileRenderer";
-export { VideoPipeViewport } from "./VideoPipeViewport";
+export {
+  createVideoPipeViewportSessionKey,
+  VideoPipeViewport,
+} from "./VideoPipeViewport";
 export type {
   VideoPipeChannelGroup,
   VideoPipeViewportProps,

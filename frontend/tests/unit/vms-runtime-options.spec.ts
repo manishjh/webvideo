@@ -1,14 +1,18 @@
 import { describe, expect, it } from "vitest";
+import { createVideoPipeViewportSessionKey } from "../../src/video-pipe";
 import {
   createViewportOptions,
+  shouldUseDirectTileRender,
   type RuntimeOptions,
 } from "../../src/vms/VmsApp";
 
 function createBaseOptions(): RuntimeOptions {
   return {
     adaptiveRenderFrameRate: true,
+    adaptiveSourceFrameRate: false,
     batchFrameCount: 4,
     matrixCompositor: true,
+    offscreenCanvas: false,
     renderClock: "frame-arrival",
   };
 }
@@ -16,34 +20,50 @@ function createBaseOptions(): RuntimeOptions {
 describe("VMS runtime options", () => {
   it("requests a viewport-sized source for single-tile playback", () => {
     expect(createViewportOptions(createBaseOptions(), 1)).toMatchObject({
+      offscreenCanvas: false,
       maxHighFrameRateRenderFrameRate: undefined,
       maxRenderFrameRate: undefined,
       maxHighSourceFrameRate: undefined,
-      maxSourceCodedWidth: 1920,
-      maxSourceCodedHeight: 1080,
+      maxSourceCodedWidth: undefined,
+      maxSourceCodedHeight: undefined,
       maxSourceFrameRate: undefined,
     });
   });
 
-  it("requests low-rate source variants when the wall is dense", () => {
+  it("keeps explicit per-tile offscreen rendering for single-tile experiments", () => {
+    expect(createViewportOptions({ ...createBaseOptions(), offscreenCanvas: true }, 1)).toMatchObject({
+      offscreenCanvas: true,
+    });
+  });
+
+  it("keeps native source policy for the fixed 2x2 wall", () => {
     expect(createViewportOptions(createBaseOptions(), 5)).toMatchObject({
-      maxHighFrameRateRenderFrameRate: 15,
-      maxRenderFrameRate: 15,
-      maxHighSourceFrameRate: 15,
-      maxSourceCodedWidth: 1280,
-      maxSourceCodedHeight: 720,
-      maxSourceFrameRate: 15,
+      offscreenCanvas: false,
+      maxHighFrameRateRenderFrameRate: undefined,
+      maxRenderFrameRate: undefined,
+      maxHighSourceFrameRate: undefined,
+      maxSourceCodedWidth: undefined,
+      maxSourceCodedHeight: undefined,
+      maxSourceFrameRate: undefined,
     });
   });
 
-  it("requests 1080p source variants for medium-density views", () => {
+  it("uses the shared wall canvas instead of per-tile offscreen for medium-density views", () => {
     expect(createViewportOptions(createBaseOptions(), 3)).toMatchObject({
-      maxHighFrameRateRenderFrameRate: 24,
-      maxHighSourceFrameRate: 24,
-      maxSourceCodedWidth: 1920,
-      maxSourceCodedHeight: 1080,
+      offscreenCanvas: false,
+      maxHighFrameRateRenderFrameRate: undefined,
+      maxHighSourceFrameRate: undefined,
+      maxSourceCodedWidth: undefined,
+      maxSourceCodedHeight: undefined,
       maxSourceFrameRate: undefined,
     });
+  });
+
+  it("keeps the viewport session key stable when wall density keeps the same source policy", () => {
+    const singleTileKey = createVideoPipeViewportSessionKey(createViewportOptions(createBaseOptions(), 1));
+    const multiTileKey = createVideoPipeViewportSessionKey(createViewportOptions(createBaseOptions(), 3));
+
+    expect(multiTileKey).toBe(singleTileKey);
   });
 
   it("keeps explicit render caps from the URL", () => {
@@ -55,6 +75,7 @@ describe("VMS runtime options", () => {
       maxSourceCodedWidth: 3840,
       maxSourceCodedHeight: 2160,
     }, 9)).toMatchObject({
+      offscreenCanvas: false,
       maxHighFrameRateRenderFrameRate: 60,
       maxHighSourceFrameRate: 60,
       maxRenderFrameRate: 30,
@@ -62,5 +83,65 @@ describe("VMS runtime options", () => {
       maxSourceCodedHeight: 2160,
       maxSourceFrameRate: undefined,
     });
+  });
+
+  it("keeps the shared matrix canvas active for the single-tile viewport path", () => {
+    expect(shouldUseDirectTileRender(
+      createBaseOptions(),
+      [{ tileId: "channel-001" }],
+      {
+        "channel-001": {
+          renderBackend: "webgpu",
+          gpuPresentation: "webgpu-canvas",
+        },
+      },
+    )).toBe(false);
+  });
+
+  it("uses direct tile rendering for the explicit per-tile offscreen experiment", () => {
+    expect(shouldUseDirectTileRender(
+      { ...createBaseOptions(), offscreenCanvas: true },
+      [{ tileId: "channel-001" }],
+      {},
+    )).toBe(true);
+  });
+
+  it("keeps the matrix canvas active for a healthy multi-tile wall", () => {
+    expect(shouldUseDirectTileRender(
+      createBaseOptions(),
+      [{ tileId: "channel-001" }, { tileId: "channel-002" }],
+      {
+        "channel-001": {
+          renderBackend: "webgpu",
+          gpuPresentation: "webgpu-canvas",
+        },
+        "channel-002": {
+          renderBackend: "webgpu",
+          gpuPresentation: "webgpu-canvas",
+        },
+      },
+    )).toBe(false);
+  });
+
+  it("uses direct tile canvases when matrix composition is disabled by URL", () => {
+    expect(shouldUseDirectTileRender(
+      { ...createBaseOptions(), matrixCompositor: false },
+      [{ tileId: "channel-001" }],
+      {},
+    )).toBe(true);
+  });
+
+  it("uses direct tile canvases when runtime falls back from the matrix", () => {
+    expect(shouldUseDirectTileRender(
+      createBaseOptions(),
+      [{ tileId: "channel-001" }],
+      {
+        "channel-001": {
+          renderBackend: "webgpu",
+          gpuPresentation: "webgpu-canvas",
+          matrixFallbackReason: "matrix-disabled",
+        },
+      },
+    )).toBe(true);
   });
 });

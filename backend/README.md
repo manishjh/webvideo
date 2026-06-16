@@ -32,6 +32,7 @@ The backend coordinators are implemented as deterministic in-memory services. Th
 - WebTransport frame serialization and the local browser channel endpoint
 - optional FFmpeg-backed RTSP H.264 capture enabled by `start.sh`
 - continuous RTSP H.264 fanout for VMS WebTransport streams using a MoQ-shaped video object envelope
+- go2rtc-backed local RTSP source serving by default, with mediaMTX plus ffmpeg publishers retained as a fallback launcher mode
 - live fanout diagnostics for per-stream process state, bytes, frames, queue depth, and stale-frame drops
 - declared 720p, 1080p, and opt-in 4K channel shapes for local browser stress testing
 - environment overrides for predefined demo channel RTSP URLs, display names, dimensions, frame rates, profile names, and summaries

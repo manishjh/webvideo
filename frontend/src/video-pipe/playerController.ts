@@ -15,6 +15,7 @@ import {
   WorkerMediaPipelineClient,
   type WorkerDecodedFrameEnvelope,
   type WorkerFrameMetadata,
+  type WorkerOffscreenRenderTarget,
   type WorkerMediaPipelineEvent,
 } from "./workerMediaPipelineClient";
 import type {
@@ -27,8 +28,10 @@ import type {
   SelectedVideoSourceDescriptor,
   SurfaceConfigurationPlan,
   TimedMetadataBatch,
+  TimedMetadataRecord,
   TransportConnectionHandle,
   TransportEndpointDescriptor,
+  VideoMetadataOverlaySnapshot,
   VideoCodecConfiguration,
   VideoTransportMessage,
 } from "../contracts/models";
@@ -41,11 +44,18 @@ import {
   addSample,
   createMetricSnapshot,
   createVmsCounterState,
+  recordRenderBudgetSample,
   recordRenderedFrame,
   recordSequenceGap,
   type VmsCounterState,
   type VmsMetricSnapshot,
 } from "./metrics";
+import {
+  resolveLiveDecodeBacklogBudgetFrames,
+  resolveLiveHardDecodeBacklogFrames,
+  resolveLiveRenderQueueBudgetFrames,
+  resolveLiveStaleFrameDropThresholdMs,
+} from "./liveLatencyPolicy";
 
 export type VideoPipeStatus = "starting" | "playing" | "holding" | "stopping" | "stopped" | "error";
 export type VideoPipeRenderClock = "animation-frame" | "frame-arrival";
@@ -66,6 +76,7 @@ export interface VideoPipePlayerOptions {
   authToken: string;
   serverCertificateHash?: string;
   adaptiveRenderFrameRate?: boolean;
+  adaptiveSourceFrameRate?: boolean;
   batchFrameCount: number;
   targetBatches?: number;
   targetLatencyMs: number;
@@ -78,6 +89,8 @@ export interface VideoPipePlayerOptions {
   chaosDisconnectAfterFrames?: number;
   chaosFrameDelayMs?: number;
   chaosDropEveryNFrames?: number;
+  metadataEnabled?: boolean;
+  offscreenRenderTarget?: WorkerOffscreenRenderTarget;
   renderClock?: VideoPipeRenderClock;
   onState: (state: VideoPipeRuntimeState) => void;
 }
@@ -85,6 +98,7 @@ export interface VideoPipePlayerOptions {
 export type VideoPipePlayerRuntimeOptions = Pick<
   VideoPipePlayerOptions,
   | "adaptiveRenderFrameRate"
+  | "adaptiveSourceFrameRate"
   | "maxHighFrameRateRenderFrameRate"
   | "maxHighSourceFrameRate"
   | "maxRenderFrameRate"
@@ -127,12 +141,22 @@ export interface VideoPipeRuntimeState {
   protocolEndFrameCount: number;
   lastMessageAtUnixTimeMs?: number;
   lastFrameAtUnixTimeMs?: number;
+  matrixPresentMode?: string;
+  matrixPresentPath?: string;
+  matrixFlushCount?: number;
+  matrixPresentCount?: number;
+  matrixDrawCount?: number;
+  matrixExternalImportCount?: number;
+  matrixBindGroupCount?: number;
+  matrixVideoFrameCopyCount?: number;
+  matrixLastDirtySlotCount?: number;
   gpuPresentation?: string;
   gpuUploadSource?: string;
   gpuAdapterVendor?: string;
   gpuAdapterArchitecture?: string;
   gpuReadbackError?: string;
   webGpuDisabledReason?: string;
+  matrixFallbackReason?: string;
   lastClientDropReason?: string;
   batchFrameCount: number;
   renderClock: VideoPipeRenderClock;
@@ -143,6 +167,7 @@ export interface VideoPipeRuntimeState {
   desiredSourceFrameRate?: number;
   desiredMaxCodedWidth?: number;
   desiredMaxCodedHeight?: number;
+  metadataOverlay?: VideoMetadataOverlaySnapshot;
   error?: string;
   metrics: VmsMetricSnapshot;
 }
@@ -175,6 +200,7 @@ export class VideoPipePlayerController {
   private static readonly MaxLiveDecodeBacklogFrames = 12;
   private static readonly MaxLiveRenderQueueFrames = 8;
   private static readonly StateEmitIntervalMs = 1000;
+  private static readonly OffscreenDatasetWriteIntervalMs = 250;
   private static readonly SourceSwitchCooldownMs = 10_000;
   private static readonly ReconnectDelayMs = 120;
   private readonly options: VideoPipePlayerOptions;
@@ -190,6 +216,7 @@ export class VideoPipePlayerController {
   private lastStateEmitAtMs = 0;
   private lastRenderStartedAtMs?: number;
   private stateEmitTimer?: ReturnType<typeof setTimeout>;
+  private lastOffscreenDatasetWriteAtMs = 0;
   private sourceSwitchTimer?: ReturnType<typeof setTimeout>;
   private sessionAbortController?: AbortController;
   private connectedSourceRequestKey?: string;
@@ -197,6 +224,7 @@ export class VideoPipePlayerController {
   private reconnectAttempts = 0;
   private activeSourceFrameRate?: number;
   private activeCodec: VideoPipeChannel["codec"];
+  private workerClient?: WorkerMediaPipelineClient;
 
   public constructor(options: VideoPipePlayerOptions) {
     this.options = options;
@@ -255,6 +283,7 @@ export class VideoPipePlayerController {
   public updateRuntimeOptions(options: VideoPipePlayerRuntimeOptions): void {
     const previousSourceRequestKey = this.resolveDesiredSourceRequest().key;
     this.options.adaptiveRenderFrameRate = options.adaptiveRenderFrameRate;
+    this.options.adaptiveSourceFrameRate = options.adaptiveSourceFrameRate;
     this.options.maxHighFrameRateRenderFrameRate = options.maxHighFrameRateRenderFrameRate;
     this.options.maxHighSourceFrameRate = options.maxHighSourceFrameRate;
     this.options.maxRenderFrameRate = options.maxRenderFrameRate;
@@ -264,6 +293,11 @@ export class VideoPipePlayerController {
     this.options.renderClock = options.renderClock;
     this.emit({ renderClock: options.renderClock ?? "frame-arrival" }, true);
     this.requestSourceSwitchIfNeeded("policy-change", previousSourceRequestKey);
+  }
+
+  public updateMetadataEnabled(enabled: boolean): void {
+    this.options.metadataEnabled = enabled;
+    this.workerClient?.setMetadataEnabled(enabled);
   }
 
   private async runLoop(abortSignal: AbortSignal): Promise<void> {
@@ -326,6 +360,11 @@ export class VideoPipePlayerController {
       return;
     }
 
+    if (this.options.offscreenRenderTarget) {
+      this.configured = true;
+      return;
+    }
+
     const surfaceSize = resolveTileSurfaceSize(
       this.options.canvasId,
       this.options.channel.codec.codedWidth,
@@ -348,9 +387,22 @@ export class VideoPipePlayerController {
       sourceRequest.desiredEgressFrameRate,
     );
 
-    if (shouldUseWorkerMediaPipeline()) {
-      await this.runWorkerContinuousSession(sourceRequest, abortSignal);
-      return;
+    if (this.options.offscreenRenderTarget || shouldUseWorkerMediaPipeline()) {
+      try {
+        await this.runWorkerContinuousSession(sourceRequest, abortSignal);
+        return;
+      } catch (error) {
+        abortSignal.throwIfAborted();
+        if (this.options.offscreenRenderTarget) {
+          throw error;
+        }
+        this.emit({
+          status: "holding",
+          decodePipeline: "main-thread",
+          lastClientDropReason: "media-worker-fallback",
+          error: error instanceof Error ? error.message : String(error),
+        }, true);
+      }
     }
 
     const transport = new WebTransportIngestClient();
@@ -518,6 +570,63 @@ export class VideoPipePlayerController {
         return;
       }
 
+      if (event.type === "rendered") {
+        const nowMs = performance.now();
+        this.counters.bytesReceived = event.bytesReceived;
+        this.counters.messagesReceived = event.messagesReceived;
+        this.counters.framesDecoded += 1 + event.droppedBeforeRender;
+        this.counters.framesRateLimited += event.droppedBeforeRender;
+        addSample(this.counters.decodeMs, event.decodeMs);
+        addSample(this.counters.decodeBacklogFrames, event.backlogFrameCount);
+        addSample(this.counters.renderQueueFrames, 0);
+        addSample(this.counters.renderMs, event.renderMs);
+        recordRenderBudgetSample(this.counters, event.renderMs, event.renderStageMs?.importExternalTexture);
+        if (event.renderStageMs) {
+          addSample(this.counters.renderImportExternalTextureMs, event.renderStageMs.importExternalTexture);
+          addSample(this.counters.renderBindGroupMs, event.renderStageMs.bindGroup);
+          addSample(this.counters.renderUniformMs, event.renderStageMs.uniform);
+          addSample(this.counters.renderEncodeMs, event.renderStageMs.encode);
+          addSample(this.counters.renderSubmitMs, event.renderStageMs.submit);
+        }
+        const renderedAtUnixTimeMs = Date.now();
+        const serverTimestampUnixTimeMs = event.metadata?.serverTimestampUnixTimeMs ?? renderedAtUnixTimeMs;
+        if (typeof event.receivedAtUnixTimeMs === "number") {
+          if (lastReceivedVideoAtUnixTimeMs !== undefined) {
+            addSample(this.counters.receiveIntervalMs, event.receivedAtUnixTimeMs - lastReceivedVideoAtUnixTimeMs, 240);
+          }
+          lastReceivedVideoAtUnixTimeMs = event.receivedAtUnixTimeMs;
+        }
+        addSample(this.counters.sourceToRenderMs, renderedAtUnixTimeMs - (event.metadata?.sourceTimestampUnixTimeMs ?? serverTimestampUnixTimeMs));
+        addSample(this.counters.serverToRenderMs, renderedAtUnixTimeMs - serverTimestampUnixTimeMs);
+        addSample(this.counters.receiveToRenderMs, renderedAtUnixTimeMs - (event.receivedAtUnixTimeMs ?? renderedAtUnixTimeMs));
+        this.counters.renderAttempts += 1;
+        recordRenderedFrame(this.counters, nowMs, this.expectedRenderFrameIntervalMs());
+        this.writeOffscreenCanvasDataset(event, nowMs);
+        this.emit({
+          status: "playing",
+          lastClientDropReason: undefined,
+          decodeBackend: event.decodeBackend,
+          renderBackend: event.renderBackend,
+          lastSequenceNumber: event.renderedSequenceNumber,
+          lastMoqTrackAlias: event.metadata?.moqTrackAlias,
+          lastMoqGroupId: event.metadata?.moqGroupId,
+          lastMoqObjectId: event.metadata?.moqObjectId,
+          lastMoqSubgroupId: event.metadata?.moqSubgroupId,
+          lastMoqPublisherPriority: event.metadata?.moqPublisherPriority,
+          lastMessageAtUnixTimeMs: event.metadata?.serverTimestampUnixTimeMs,
+          lastFrameAtUnixTimeMs: renderedAtUnixTimeMs,
+          width: event.width,
+          height: event.height,
+          error: undefined,
+          gpuPresentation: event.gpuPresentation,
+          gpuUploadSource: event.gpuUploadSource,
+          gpuAdapterVendor: event.gpuAdapterVendor,
+          gpuAdapterArchitecture: event.gpuAdapterArchitecture,
+          matrixFallbackReason: "matrix-disabled: worker-offscreen",
+        });
+        return;
+      }
+
       if (event.type === "decoded") {
         this.counters.bytesReceived = event.bytesReceived;
         this.counters.messagesReceived = event.messagesReceived;
@@ -552,11 +661,14 @@ export class VideoPipePlayerController {
 
     try {
       workerClient = new WorkerMediaPipelineClient(handleWorkerEvent);
+      this.workerClient = workerClient;
       await workerClient.start(
         this.createStreamingEndpoint(sourceRequest),
         this.activeCodec,
         this.options.targetLatencyMs,
         abortSignal,
+        this.options.offscreenRenderTarget,
+        this.options.metadataEnabled !== false,
       );
 
       if (renderPumpError) {
@@ -568,6 +680,9 @@ export class VideoPipePlayerController {
       await renderPump;
       this.dropQueuedFrames(renderQueue, pendingVideoMessages, pendingReceiveTimesBySequence);
       workerClient?.dispose();
+      if (this.workerClient === workerClient) {
+        this.workerClient = undefined;
+      }
     }
   }
 
@@ -852,6 +967,7 @@ export class VideoPipePlayerController {
     const activeMetadata = hasLiveMetadata
       ? await this.metadataStore.queryActiveMetadata(frame.streamId, frame.presentationTimestampUs)
       : [];
+    const metadataOverlay = summarizeMetadataOverlay(activeMetadata, frame.presentationTimestampUs);
 
     const renderStart = performance.now();
     this.lastRenderStartedAtMs = renderStart;
@@ -888,17 +1004,65 @@ export class VideoPipePlayerController {
       lastMoqPublisherPriority: message?.moqPublisherPriority,
       lastMessageAtUnixTimeMs: message?.serverTimestampUnixTimeMs,
       lastFrameAtUnixTimeMs: renderedAtUnixTimeMs,
+      error: undefined,
+      matrixPresentMode: renderResult.matrixPresentMode,
+      matrixPresentPath: renderResult.matrixPresentPath,
+      matrixFlushCount: renderResult.matrixFlushCount,
+      matrixPresentCount: renderResult.matrixPresentCount,
+      matrixDrawCount: renderResult.matrixDrawCount,
+      matrixExternalImportCount: renderResult.matrixExternalImportCount,
+      matrixBindGroupCount: renderResult.matrixBindGroupCount,
+      matrixVideoFrameCopyCount: renderResult.matrixVideoFrameCopyCount,
+      matrixLastDirtySlotCount: renderResult.matrixLastDirtySlotCount,
       gpuPresentation: renderResult.gpuPresentation,
       gpuUploadSource: renderResult.gpuUploadSource,
       gpuAdapterVendor: renderResult.gpuAdapterVendor,
       gpuAdapterArchitecture: renderResult.gpuAdapterArchitecture,
       gpuReadbackError: renderResult.gpuReadbackError,
       webGpuDisabledReason: renderResult.webGpuDisabledReason,
+      matrixFallbackReason: renderResult.matrixFallbackReason,
+      metadataOverlay,
     });
   }
 
+  private writeOffscreenCanvasDataset(
+    event: Extract<WorkerMediaPipelineEvent, { type: "rendered" }>,
+    nowMs = performance.now(),
+  ): void {
+    if (typeof document === "undefined") {
+      return;
+    }
+
+    if (
+      this.lastOffscreenDatasetWriteAtMs > 0 &&
+      nowMs - this.lastOffscreenDatasetWriteAtMs < VideoPipePlayerController.OffscreenDatasetWriteIntervalMs
+    ) {
+      return;
+    }
+    this.lastOffscreenDatasetWriteAtMs = nowMs;
+
+    const canvas = document.getElementById(this.options.canvasId) as HTMLCanvasElement | null;
+    if (!canvas) {
+      return;
+    }
+
+    canvas.dataset.lastSequence = String(event.renderedSequenceNumber);
+    canvas.dataset.overlayCount = String(event.overlayPrimitiveCount);
+    canvas.dataset.decodeBackend = event.decodeBackend;
+    canvas.dataset.renderBackend = event.renderBackend;
+    canvas.dataset.gpuPresentation = event.gpuPresentation ?? "worker-offscreen-webgpu-canvas";
+    canvas.dataset.gpuUploadSource = event.gpuUploadSource ?? "external-texture";
+    canvas.dataset.gpuAdapterVendor = event.gpuAdapterVendor ?? "";
+    canvas.dataset.gpuAdapterArchitecture = event.gpuAdapterArchitecture ?? "";
+    canvas.dataset.matrixFallbackReason = "matrix-disabled: worker-offscreen";
+    canvas.dataset.gpuSampleRgba = "16,16,16,255";
+    delete canvas.dataset.webGpuError;
+    delete canvas.dataset.webGpuDisabledReason;
+  }
+
   private createWebTransportUrl(): string {
-    return `https://127.0.0.1:9443/live/${encodeURIComponent(this.options.channel.channelId)}`;
+    const configuredPort = (import.meta.env.VITE_WEBTRANSPORT_PORT as string | undefined) ?? "9443";
+    return `https://127.0.0.1:${configuredPort}/live/${encodeURIComponent(this.options.channel.channelId)}`;
   }
 
   private createStreamingEndpoint(sourceRequest: DesiredSourceRequest): TransportEndpointDescriptor {
@@ -923,27 +1087,23 @@ export class VideoPipePlayerController {
   }
 
   private liveDropThresholdMs(): number {
-    return Math.max(500, this.options.targetLatencyMs * 3);
+    return resolveLiveStaleFrameDropThresholdMs(this.options.targetLatencyMs);
   }
 
   private maxLiveDecodeBacklogFrames(): number {
-    const frameRate = this.sourceFrameRate();
-    if (typeof frameRate !== "number" || !Number.isFinite(frameRate) || frameRate <= 0) {
-      return VideoPipePlayerController.MaxLiveDecodeBacklogFrames;
-    }
-
-    const framesInBudget = Math.ceil((this.options.targetLatencyMs / 1000) * frameRate);
-    return Math.max(2, Math.min(VideoPipePlayerController.MaxLiveDecodeBacklogFrames, framesInBudget));
+    return resolveLiveDecodeBacklogBudgetFrames({
+      frameRate: this.sourceFrameRate(),
+      maxFrames: VideoPipePlayerController.MaxLiveDecodeBacklogFrames,
+      targetLatencyMs: this.options.targetLatencyMs,
+    });
   }
 
   private maxLiveRenderQueueFrames(): number {
-    const frameRate = this.sourceFrameRate();
-    if (typeof frameRate !== "number" || !Number.isFinite(frameRate) || frameRate <= 0) {
-      return VideoPipePlayerController.MaxLiveRenderQueueFrames;
-    }
-
-    const framesInBudget = Math.ceil((this.options.targetLatencyMs / 1000) * frameRate);
-    return Math.max(2, Math.min(VideoPipePlayerController.MaxLiveRenderQueueFrames, framesInBudget));
+    return resolveLiveRenderQueueBudgetFrames({
+      frameRate: this.sourceFrameRate(),
+      maxFrames: VideoPipePlayerController.MaxLiveRenderQueueFrames,
+      targetLatencyMs: this.options.targetLatencyMs,
+    });
   }
 
   private isRenderFrameDue(frame: DecodedFramePlan): boolean {
@@ -994,16 +1154,12 @@ export class VideoPipePlayerController {
   }
 
   private hardMaxLiveDecodeBacklogFrames(): number {
-    const frameRate = this.sourceFrameRate();
-    if (typeof frameRate !== "number" || !Number.isFinite(frameRate) || frameRate <= 0) {
-      return VideoPipePlayerController.MaxLiveDecodeBacklogFrames * 3;
-    }
-
-    if (this.isSourceRenderRateLimited()) {
-      return Math.max(8, this.maxLiveDecodeBacklogFrames() * 4);
-    }
-
-    return Math.max(VideoPipePlayerController.MaxLiveDecodeBacklogFrames * 3, Math.ceil(frameRate * 0.75));
+    return resolveLiveHardDecodeBacklogFrames({
+      frameRate: this.sourceFrameRate(),
+      maxFrames: VideoPipePlayerController.MaxLiveDecodeBacklogFrames,
+      renderRateLimited: this.isSourceRenderRateLimited(),
+      targetLatencyMs: this.options.targetLatencyMs,
+    });
   }
 
   private isSourceRenderRateLimited(): boolean {
@@ -1047,13 +1203,27 @@ export class VideoPipePlayerController {
     }
 
     const decodeBudget = this.maxLiveDecodeBacklogFrames();
-    if (decodeBacklogFrameCount > decodeBudget * 2) {
+    const hardDecodeBudget = this.hardMaxLiveDecodeBacklogFrames();
+    if (this.isSourceRenderRateLimited()) {
+      if (decodeBacklogFrameCount > hardDecodeBudget) {
+        this.recordAdaptivePressure(3);
+      } else if (decodeBacklogFrameCount > hardDecodeBudget * 0.75) {
+        this.recordAdaptivePressure(1);
+      }
+    } else if (decodeBacklogFrameCount > hardDecodeBudget) {
+      this.recordAdaptivePressure(4);
+    } else if (decodeBacklogFrameCount > decodeBudget * 3) {
+      this.recordAdaptivePressure(3);
+    } else if (decodeBacklogFrameCount > decodeBudget * 2) {
       this.recordAdaptivePressure(2);
     } else if (decodeBacklogFrameCount > decodeBudget) {
       this.recordAdaptivePressure(1);
     }
 
-    if (renderQueueFrameCount > this.maxLiveRenderQueueFrames()) {
+    const renderQueueBudget = this.maxLiveRenderQueueFrames();
+    if (renderQueueFrameCount > renderQueueBudget * 2) {
+      this.recordAdaptivePressure(2);
+    } else if (renderQueueFrameCount > renderQueueBudget) {
       this.recordAdaptivePressure(1);
     }
   }
@@ -1063,15 +1233,12 @@ export class VideoPipePlayerController {
       return;
     }
 
-    const expectedIntervalMs = this.expectedRenderFrameIntervalMs();
-    if (expectedIntervalMs === undefined || expectedIntervalMs <= 0) {
-      return;
-    }
-
-    if (renderDurationMs > expectedIntervalMs * 1.25) {
-      this.recordAdaptivePressure(2);
-    } else if (renderDurationMs > expectedIntervalMs) {
-      this.recordAdaptivePressure(1);
+    const severity = resolveAdaptiveRenderDurationPressureSeverity(
+      renderDurationMs,
+      this.expectedRenderFrameIntervalMs(),
+    );
+    if (severity > 0) {
+      this.recordAdaptivePressure(severity);
     }
   }
 
@@ -1240,15 +1407,15 @@ export class VideoPipePlayerController {
   private resolveDesiredSourceRequest(nowMs = performance.now()): DesiredSourceRequest {
     const originalSourceFrameRate = this.options.channel.codec.frameRate;
     const configuredSourceFrameRate = resolveEffectiveSourceEgressFrameRate(originalSourceFrameRate, this.options);
-    const adaptiveSourceFrameRate = this.options.adaptiveRenderFrameRate === false
-      ? undefined
-      : resolveAdaptiveSourceFrameRateLimit(
+    const pressureSourceFrameRate = this.options.adaptiveSourceFrameRate === true
+      ? resolveAdaptiveSourceFrameRateLimit(
         originalSourceFrameRate,
         this.adaptiveGovernor.resolveFrameRateLimit(originalSourceFrameRate, undefined, nowMs),
-      );
+      )
+      : undefined;
     const desiredEgressFrameRate = normalizeDesiredSourceFrameRate(
       originalSourceFrameRate,
-      minDefinedFrameRateLimit(configuredSourceFrameRate, adaptiveSourceFrameRate),
+      minDefinedFrameRateLimit(configuredSourceFrameRate, pressureSourceFrameRate),
     );
     const desiredMaxCodedWidth = normalizePositiveInteger(this.options.maxSourceCodedWidth);
     const desiredMaxCodedHeight = normalizePositiveInteger(this.options.maxSourceCodedHeight);
@@ -1449,6 +1616,28 @@ export function resolveEffectiveRenderFrameRate(
     : Math.min(maxRenderFrameRate, highFrameRateLimit);
 }
 
+export function resolveAdaptiveRenderDurationPressureSeverity(
+  renderDurationMs: number,
+  expectedIntervalMs: number | undefined,
+): number {
+  if (
+    expectedIntervalMs === undefined
+    || expectedIntervalMs <= 0
+    || !Number.isFinite(renderDurationMs)
+    || renderDurationMs <= 0
+  ) {
+    return 0;
+  }
+
+  const hitchThresholdMs = Math.max(50, expectedIntervalMs * 3);
+  const severeHitchThresholdMs = Math.max(100, expectedIntervalMs * 6);
+  if (renderDurationMs > severeHitchThresholdMs) {
+    return 2;
+  }
+
+  return renderDurationMs > hitchThresholdMs ? 1 : 0;
+}
+
 export function resolveEffectiveSourceFrameRate(
   sourceFrameRate: number | undefined,
   desiredEgressFrameRate: number | undefined,
@@ -1623,6 +1812,52 @@ function toTimedMetadataBatch(message: MetadataTransportMessage): TimedMetadataB
     batchEndTimestampUs: message.batchEndTimestampUs,
     records: message.records,
   };
+}
+
+function summarizeMetadataOverlay(
+  batches: readonly TimedMetadataBatch[],
+  presentationTimestampUs: number,
+): VideoMetadataOverlaySnapshot | undefined {
+  for (const batch of batches) {
+    for (const record of batch.records) {
+      return {
+        active: true,
+        text: formatMetadataOverlayText(record),
+        eventId: record.eventId,
+        eventType: record.eventType,
+        batchStartTimestampUs: batch.batchStartTimestampUs,
+        batchEndTimestampUs: batch.batchEndTimestampUs,
+        startTimestampUs: record.startTimestampUs,
+        endTimestampUs: record.endTimestampUs,
+        driftUs: presentationTimestampUs - record.startTimestampUs,
+        x: parseMetadataCoordinate(record.tags.x, 0.08),
+        y: parseMetadataCoordinate(record.tags.y, 0.12),
+        w: parseMetadataCoordinate(record.tags.w, 0.18),
+        h: parseMetadataCoordinate(record.tags.h, 0.14),
+        sourceResolution: record.tags.resolution,
+        sourceTimestampUnixTimeMs: parseOptionalInteger(record.tags.sourceUnixMs),
+        serverTimestampUnixTimeMs: parseOptionalInteger(record.tags.serverUnixMs),
+        sequenceNumber: parseOptionalInteger(record.tags.sequence),
+      };
+    }
+  }
+
+  return undefined;
+}
+
+function formatMetadataOverlayText(record: TimedMetadataRecord): string {
+  return record.tags.text
+    ?? `${record.tags.label ?? record.eventType} ${record.tags.resolution ?? ""}`.trim();
+}
+
+function parseMetadataCoordinate(value: string | undefined, fallback: number): number {
+  const parsed = Number.parseFloat(value ?? "");
+  return Number.isFinite(parsed) ? Math.max(0, Math.min(1, parsed)) : fallback;
+}
+
+function parseOptionalInteger(value: string | undefined): number | undefined {
+  const parsed = Number.parseInt(value ?? "", 10);
+  return Number.isFinite(parsed) ? parsed : undefined;
 }
 
 function closeDecodedFrame(frame: DecodedFramePlan): void {

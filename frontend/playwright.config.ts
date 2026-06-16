@@ -27,8 +27,8 @@ export default defineConfig({
     ? {}
     : {
       webServer: {
-        command: "cd .. && START_RTSP=1 WEBVIDEO_SAMPLE_FOOTAGE=1 ./start.sh",
-        url: `${baseURL}/live-demo.html?channel=channel-001`,
+        command: "cd .. && START_RTSP=1 WEBVIDEO_SAMPLE_FOOTAGE=1 ./test-start.sh",
+        url: `${baseURL}/live-demo.html?channel=channel-4k-crowd`,
         reuseExistingServer: false,
         timeout: 120_000,
       },

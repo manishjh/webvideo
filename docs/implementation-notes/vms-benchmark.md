@@ -11,12 +11,18 @@ The latest valid production-bundle checks:
 | Shape | Result | Notes |
 |---|---|---|
 | 9 tiles, forced 30 fps, channels `001/002/003` repeated | Passed | Steady-state 29.5-30.8 fps, zero client drops, zero sequence gaps, zero source switches, S2R p95 mostly 42-46 ms, browser task about 31%, server CPU about 25%. |
+| Matrix auto-present with throttled-rAF fallback, duplicate crowd plus floor | Passed | Profile `.run/profiles/vms-profile-3streams-1781511251544.json` kept the adaptive recovery shape stable at 1080p24/1080p15, zero VideoFrame copies, zero sequence gaps, no backend drops, matrix presents recovered from the bad rAF-throttled 1/sec behavior to about 23.6/sec steady-state, and crowd S2R p95 was about 41 ms after warm-up. |
+| Forced 3x1080p60 raw-capacity run with adaptive disabled | Overload target | Profile `.run/profiles/vms-profile-3streams-1781511349488.json` held 60 fps sources with no source switches, but browser task rose to about 72% steady-state, matrix imports were about 98/sec, draws about 148/sec, render FPS settled around 43-46 fps per tile, decode backlog reached about 30 frames, and S2R p95 reached about 475-534 ms. This proves the current browser-side per-frame API path is the limit before backend or network. |
+| Render-on-present matrix compositor, duplicate 1080p60 crowd | Passed | Profile `.run/profiles/vms-profile-2streams-1781514348224.json` kept two duplicate 1080p60 crowd tiles on one shared matrix canvas, with visual hashes changing every sample, zero client drops, zero sequence gaps, steady-state matrix presents about 57/sec, 114 draws/sec, render FPS about 52.4 per tile, and S2R p95 about 129 ms. |
+| Full 4K60 duplicate crowd plus 1080p floor, matrix external-texture failure path | Diagnostic pass, not product-grade | Profile `.run/profiles/vms-profile-3streams-1781514376500.json` captured Chrome failing `importExternalTexture` on a 4K `VideoFrame` with "doesn't have back resource". The matrix compositor now disables and hides the stale overlay, visual hashes keep changing through fallback, but browser task is about 87%, crowd render FPS is about 36, S2R p95 is about 774 ms, and drops/gaps appear. Next optimization target: avoid tripping this 4K external-texture failure through source selection, in-session renegotiation, or a safer 4K matrix path. |
 | Duplicate 4K60 crowd plus 1080p floor, full caps opened | Improved but not product-grade | Adaptive/source-switch hysteresis reduced steady-state source switches from about 6 to 2 and S2R p95 from about 163 ms to 104 ms when the crowd source settled at `cctv-road-crowd-1080p24`. Full 4K60 still exposes render/API pressure and visible hitches. |
 | Post backing-texture compositor sanity, duplicate crowd plus floor | Passed | 20 second production-bundle profile at `.run/profiles/vms-profile-3streams-1781509812621.json`: ready before capture, steady-state duplicate crowd rendered about 24.8 fps at 1080p24, floor rendered about 15.6 fps at 1080p15, zero client drops, zero sequence gaps, zero source switches, S2R p95 35 ms for crowd and 50 ms for floor. |
 | `WEBVIDEO_VMS_MATRIX_TEXTURE=copy` on duplicate 4K60 stress | Worse | CPU moved from `importExternalTexture` to `copyExternalImageToTexture`; crowd S2R p95 reached about 440 ms and severe hitches increased. |
 | `WEBVIDEO_VMS_MATRIX_FLUSH=raf` on duplicate 4K60 stress | Worse | Browser task fell, but render p95 and source-to-render latency rose; RAF batching is still diagnostic-only. |
 
-The dominant frontend CPU-profile signatures under stress are browser-native WebGPU calls (`importExternalTexture`, `copyExternalImageToTexture` when forced, `createBindGroup`, `getCurrentTexture`, `queue.submit`) plus smaller transport parse and matrix flush costs. The matrix compositor now keeps a persistent WebGPU backing texture, redraws only dirty tile regions on normal frame-arrival flushes, and then copies the backing texture to the WebGPU canvas. This keeps microtask latency without RAF batching while avoiding repeated external-texture imports and bind-group creation for unchanged tiles. The next serious optimization work should focus on deeper compositor counters, in-session source-control protocol work, and eventual page/session-level WebTransport multiplexing.
+The dominant frontend CPU-profile signatures under stress are browser-native WebGPU calls (`importExternalTexture`, `copyExternalImageToTexture` when forced, `createBindGroup`, `getCurrentTexture`, `queue.submit`) plus smaller transport parse and matrix flush costs. The matrix compositor now keeps a persistent WebGPU backing texture, stages the latest frames on arrival, redraws dirty tile regions only on the visible present tick, and uses `matrixPresent=auto` to coalesce canvas presents. Auto mode prefers `requestAnimationFrame` but has a short timer fallback because profiling showed rAF can be throttled to roughly 1 Hz in some Playwright/headed/occlusion paths. Matrix profile JSON now reports flushes, visible presents, draws, external imports, bind groups, VideoFrame copy counts, and visible-frame hash changes, which makes present starvation, stale overlays, and per-frame API pressure visible. The next serious optimization work should focus on reducing external-texture/import and bind-group pressure, preventing 4K `VideoFrame` back-resource import failures, in-session source-control protocol work, shader/pipeline changes that batch more tile draws per bind group, and eventual page/session-level WebTransport multiplexing.
+
+WASM is not a current fast-path answer for H.264 here. When hardware WebCodecs is active, replacing decode with WASM would move decode back onto CPU and lose the browser's hardware path. WASM may still be useful later for deterministic protocol parsing or bitstream utilities if JavaScript parsing becomes hot, but the current raw 3x1080p60 profile is dominated by browser-native WebGPU/WebCodecs lifecycle calls, not JavaScript parser code.
 
 ## Latest External-Texture Matrix Snapshot
 
@@ -79,7 +85,7 @@ Run shape:
 - browser path: RTSP-over-TCP publish -> continuous backend fanout -> WebTransport/QUIC MoQ-shaped video objects -> WebCodecs Annex B decode -> WebGPU external texture render
 - source publishing: prepared sample MP4s are looped with `ffmpeg -c:v copy`
 - live queue: six encoded frames per subscriber, with stale frames dropped instead of buffering seconds of old video
-- sample window: approximately 20 seconds with two simultaneous 720p tiles plus one 1080p tile
+- sample window: approximately 20 seconds with three simultaneous 1080p tiles
 
 | Channel | Frames | Dropped | FPS | Bytes | Messages | Source-to-render p95 | Server-to-render p95 | Receive-to-render p95 | Decode p95 | Render p95 |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -100,7 +106,7 @@ Run shape:
 - GPU path: `external-texture` / `webgpu-canvas`
 - GPU adapter: NVIDIA Turing
 - duration: 180 seconds
-- source rates: 4K at 15 fps by design, 1080p/720p at 30 fps
+- source rates: 4K at 15 fps by design, 1080p at 30 fps
 
 Final sample from the 180 second run:
 

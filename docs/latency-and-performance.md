@@ -170,8 +170,11 @@ Fallback policy:
 - detect and reject SwiftShader/software WebGPU adapters for live video
 - use the explicit Canvas2D renderer when Chrome only exposes a software adapter
 - expose the active render path and GPU adapter in the VMS UI and Playwright diagnostics
+- when the shared matrix compositor hits a browser/driver import failure, hide the matrix canvas before falling back to per-tile rendering so a stale shared canvas cannot cover live fallback video
 
 The Canvas2D path is a compatibility fallback, not the performance target. In local testing, Chrome's Linux SwiftShader WebGPU path was slower and more jitter-prone than the Canvas2D fallback.
+
+Current 4K stress note: Chrome can fail `GPUDevice.importExternalTexture()` for a 4K `VideoFrame` with a "doesn't have back resource" error under duplicate 4K60 load. The current code fails open visually by disabling/hiding the matrix overlay and falling back to direct tile rendering, but the fallback profile is not product-grade: browser task rises sharply and latency/drops appear. The production fix should avoid entering that failure path through controlled source renegotiation, safer 4K matrix import policy, or a dedicated high-resolution compositor strategy.
 
 ### Scheduling
 
@@ -304,7 +307,7 @@ Collect at minimum:
 - active render path and GPU adapter details
 - metadata delay and expiry counts
 
-For the local VMS pipeline, `scripts/profile-vms.sh` is the non-gating profiling entrypoint. It runs the real `start.sh` RTSP + WebTransport + WebCodecs + WebGPU path, samples the duplicate 4K60 stress shape by default, reports duplicate tile IDs independently, includes a warm-up-discarded `steadyState` summary, and writes JSON timelines to `.run/profiles/`. Set `WEBVIDEO_PROFILE_CPU=1` to also emit Chrome page `.cpuprofile` artifacts with top self-time summaries. When worker media paths are enabled, the harness auto-attaches to worker targets and writes `.workers.cpuprofiles.json` artifacts so page-thread improvements cannot hide worker CPU regressions. Set `WEBVIDEO_PROFILE_CAPTURE_UNREADY=1` when profiling a failure-mode run that may not reach the normal clean-readiness predicate.
+For the local VMS pipeline, `scripts/profile-vms.sh` is the non-gating profiling entrypoint. It runs the real RTSP + WebTransport + WebCodecs + WebGPU path through `test-start.sh`, so sample footage and source variants are enabled for stress profiles while manual `start.sh` stays product-like. The profile samples the duplicate 4K60 stress shape by default, reports duplicate tile IDs independently, includes a warm-up-discarded `steadyState` summary, and writes JSON timelines to `.run/profiles/`. Set `WEBVIDEO_PROFILE_CPU=1` to also emit Chrome page `.cpuprofile` artifacts with top self-time summaries. When worker media paths are enabled, the harness auto-attaches to worker targets and writes `.workers.cpuprofiles.json` artifacts so page-thread improvements cannot hide worker CPU regressions. Set `WEBVIDEO_PROFILE_CAPTURE_UNREADY=1` when profiling a failure-mode run that may not reach the normal clean-readiness predicate.
 
 The current local hardware profiles show the important split:
 
@@ -312,10 +315,13 @@ The current local hardware profiles show the important split:
 - 9-tile forced 30 fps wall (`channel-001`, `channel-002`, `channel-003` repeated three times) remains the current sweet-spot proof: after warm-up it rendered about 29.5-30.8 fps per tile with zero client drops, zero sequence gaps, zero source switches, browser task around 31%, server CPU around 25%, and source-to-render p95 around 42-46 ms.
 - 3-tile 4K60 stress shape (`channel-4k-crowd`, duplicate `channel-4k-crowd`, `channel-003`) is still not product-grade at full 4K60. After adding slower adaptive recovery/source-switch hysteresis, the short failure-mode profile improved from about six steady-state source switches, five severe hitches, and 163 ms S2R p95 to about two source switches, two severe hitches, and 104 ms S2R p95 when the crowd stream settled on the 1080p24 recovery variant. It can still climb back to 4K60 and expose render/API pressure, so this remains a stress target rather than a claimed capacity.
 - Duplicate views share one WebTransport/WebCodecs session per channel. The matrix compositor ref-counts retained `VideoFrame` objects so duplicate views can redraw the same decoded frame through external textures without cloning or copying it into separate retained source textures; duplicate external-texture imports are cached within a matrix flush. Normal frame-arrival flushes update only dirty tile regions in the matrix backing texture, so unchanged duplicates do not force repeated imports or draws.
+- Matrix auto-present is now measured separately from tile render. The compositor updates the backing texture on frame arrival, then coalesces the visible canvas present. Auto mode uses `requestAnimationFrame` when it is healthy and a short timer fallback when rAF is throttled. The profile JSON includes matrix flush/present/draw/import/bind-group counters; use those counters to distinguish decode/network backlog from visible-present starvation.
 - Startup can still show transient hitches while Chrome/WebGPU/WebCodecs warm up, so profile summaries must inspect both full-run and warm-up-discarded `steadyState`.
 - `matrixFlush=raf` remains a diagnostic switch, not the default. In the current frame-arrival render loop it can feed back into adaptive pressure after stress removal; the proven default is the microtask compositor flush.
 
-That points the next optimization at page/session-level transport multiplexing, a real source-control path for non-destructive variant switching, tighter worker handoff policy, reducing startup warm-up hitches, adding deeper compositor diagnostics, and comparing external-texture versus forced-copy behavior across longer and denser stream shapes. Workerizing transport/MoQ parse and decode orchestration is now measurable with `?mediaWorker=1`, but it is not yet the default fast path.
+That points the next optimization at fewer per-frame WebGPU API calls, page/session-level transport multiplexing, a real source-control path for non-destructive variant switching, tighter worker handoff policy, and reducing startup warm-up hitches. Workerizing transport/MoQ parse and decode orchestration is now measurable with `?mediaWorker=1`, but it is not yet the default fast path. WASM decode is not a preferred fast path while hardware WebCodecs is working; it would be a fallback or parser utility, not the way to beat native H.264 decode.
+
+The player policy should stay close to established low-latency media-player practice: keep queues bounded, preserve only the newest live frame when overloaded, drop stale work before it inflates latency, update retained render targets as frames arrive, and present at display cadence. FFmpeg/VLC-style players rely on small packet/frame queues, clocks, and late-frame drop/skip policy for live playback; our browser equivalent is bounded WebTransport/decode/render queues, WebCodecs hardware decode, WebGPU retained matrix composition, and adaptive source/render caps.
 
 ## 8. Failure and Degradation Policies
 
@@ -328,7 +334,7 @@ That points the next optimization at page/session-level transport multiplexing, 
 - request/keyframe recovery on decode corruption
 - reduce overlay complexity under GPU pressure
 
-The current local mixed 4K/1080p/720p run is a diagnostic stress path. It proves the hardware WebGPU path can be selected, but it also exposes browser-side hitches, skipped sequence ranges, and backend stale-frame drops under load. Do not treat that profile as product-grade until its multi-minute FPS, hitch, and source-to-render budgets are stable.
+The current local mixed 4K/1080p run is a diagnostic stress path. It proves the hardware WebGPU path can be selected, but it also exposes browser-side hitches, skipped sequence ranges, and backend stale-frame drops under load. Do not treat that profile as product-grade until its multi-minute FPS, hitch, and source-to-render budgets are stable.
 
 ### Playback
 

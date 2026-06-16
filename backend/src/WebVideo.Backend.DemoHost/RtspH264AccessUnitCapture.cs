@@ -6,6 +6,8 @@ public sealed record RtspCapturedAccessUnit(byte[] Payload, bool HasVideoSlice, 
 
 public sealed class RtspH264AccessUnitCapture
 {
+    internal const string WebCodecsSafeH264AnnexBBitstreamFilter = "dump_extra=freq=keyframe,h264_metadata=aud=insert";
+
     private readonly string _ffmpegPath;
     private readonly TimeSpan _timeout;
 
@@ -117,7 +119,7 @@ public sealed class RtspH264AccessUnitCapture
             "-map", "0:v:0",
             "-an",
             "-c:v", "copy",
-            "-bsf:v", "h264_metadata=aud=insert",
+            "-bsf:v", WebCodecsSafeH264AnnexBBitstreamFilter,
             "-frames:v", frameCount.ToString(System.Globalization.CultureInfo.InvariantCulture),
             "-f", "h264",
             "pipe:1"

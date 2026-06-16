@@ -3,6 +3,7 @@ import {
   addSample,
   createMetricSnapshot,
   createVmsCounterState,
+  recordRenderBudgetSample,
   recordRenderedFrame,
   recordSequenceGap,
   summarizeLatency,
@@ -42,6 +43,12 @@ describe("VMS metrics", () => {
     state.messagesReceived = 12;
     addSample(state.decodeMs, 5);
     addSample(state.renderMs, 3);
+    addSample(state.renderImportExternalTextureMs, 0.5);
+    addSample(state.renderBindGroupMs, 0.75);
+    addSample(state.renderUniformMs, 0.25);
+    addSample(state.renderEncodeMs, 1.5);
+    addSample(state.renderSubmitMs, 0.4);
+    recordRenderBudgetSample(state, 12, 11);
     addSample(state.transportMs, 12);
     addSample(state.receiveIntervalMs, 16);
     addSample(state.rafIntervalMs, 17);
@@ -59,6 +66,8 @@ describe("VMS metrics", () => {
     expect(snapshot.sequenceGapFrames).toBe(7);
     expect(snapshot.frameHitches).toBe(0);
     expect(snapshot.severeFrameHitches).toBe(0);
+    expect(snapshot.recentFrameHitches).toBe(0);
+    expect(snapshot.recentSevereFrameHitches).toBe(0);
     expect(snapshot.batchesCompleted).toBe(3);
     expect(snapshot.bytesReceived).toBe(4096);
     expect(snapshot.messagesReceived).toBe(12);
@@ -72,11 +81,40 @@ describe("VMS metrics", () => {
     expect(snapshot.receiveToRender.count).toBe(240);
     expect(snapshot.decode.latestMs).toBe(5);
     expect(snapshot.render.latestMs).toBe(3);
+    expect(snapshot.renderImportExternalTexture.latestMs).toBe(0.5);
+    expect(snapshot.renderBindGroup.latestMs).toBe(0.75);
+    expect(snapshot.renderUniform.latestMs).toBe(0.25);
+    expect(snapshot.renderEncode.latestMs).toBe(1.5);
+    expect(snapshot.renderSubmit.latestMs).toBe(0.4);
+    expect(snapshot.renderBudgetOverrun120Fps).toBe(1);
+    expect(snapshot.renderBudgetOverrun100Fps).toBe(1);
+    expect(snapshot.renderBudgetOverrun60Fps).toBe(0);
+    expect(snapshot.renderImportBudgetOverrun120Fps).toBe(1);
+    expect(snapshot.renderImportBudgetOverrun100Fps).toBe(1);
+    expect(snapshot.renderImportBudgetOverrun60Fps).toBe(0);
     expect(snapshot.transport.latestMs).toBe(12);
     expect(snapshot.receiveInterval.latestMs).toBe(16);
     expect(snapshot.rafInterval.latestMs).toBe(17);
     expect(snapshot.decodeBacklog.latestMs).toBe(2);
     expect(snapshot.renderQueue.latestMs).toBe(1);
+  });
+
+  it("counts render service budget misses for 120fps, 100fps, and 60fps targets", () => {
+    const state = createVmsCounterState(1000);
+
+    recordRenderBudgetSample(state, 7, 7);
+    recordRenderBudgetSample(state, 9, 9);
+    recordRenderBudgetSample(state, 12, 12);
+    recordRenderBudgetSample(state, 20, 20);
+
+    const snapshot = createMetricSnapshot(state, 2000);
+
+    expect(snapshot.renderBudgetOverrun120Fps).toBe(3);
+    expect(snapshot.renderBudgetOverrun100Fps).toBe(2);
+    expect(snapshot.renderBudgetOverrun60Fps).toBe(1);
+    expect(snapshot.renderImportBudgetOverrun120Fps).toBe(3);
+    expect(snapshot.renderImportBudgetOverrun100Fps).toBe(2);
+    expect(snapshot.renderImportBudgetOverrun60Fps).toBe(1);
   });
 
   it("counts frame hitches from source-frame cadence", () => {
@@ -90,6 +128,8 @@ describe("VMS metrics", () => {
 
     expect(snapshot.frameHitches).toBe(2);
     expect(snapshot.severeFrameHitches).toBe(1);
+    expect(snapshot.recentFrameHitches).toBe(2);
+    expect(snapshot.recentSevereFrameHitches).toBe(1);
     expect(snapshot.frameInterval.p95Ms).toBe(160);
   });
 
@@ -105,5 +145,28 @@ describe("VMS metrics", () => {
 
     expect(snapshot.frameHitches).toBe(3);
     expect(snapshot.severeFrameHitches).toBe(1);
+    expect(snapshot.recentFrameHitches).toBe(3);
+    expect(snapshot.recentSevereFrameHitches).toBe(1);
+  });
+
+  it("keeps recent hitch counts separate from lifetime hitch totals", () => {
+    const state = createVmsCounterState(1000);
+
+    recordRenderedFrame(state, 2000, 33.333);
+    recordRenderedFrame(state, 2080, 33.333);
+    recordRenderedFrame(state, 2240, 33.333);
+
+    const activeWindowSnapshot = createMetricSnapshot(state, 60_000);
+    const cooledOffSnapshot = createMetricSnapshot(state, 63_000);
+
+    expect(activeWindowSnapshot.frameHitches).toBe(2);
+    expect(activeWindowSnapshot.severeFrameHitches).toBe(1);
+    expect(activeWindowSnapshot.recentFrameHitches).toBe(2);
+    expect(activeWindowSnapshot.recentSevereFrameHitches).toBe(1);
+
+    expect(cooledOffSnapshot.frameHitches).toBe(2);
+    expect(cooledOffSnapshot.severeFrameHitches).toBe(1);
+    expect(cooledOffSnapshot.recentFrameHitches).toBe(0);
+    expect(cooledOffSnapshot.recentSevereFrameHitches).toBe(0);
   });
 });

@@ -17,7 +17,7 @@ Target requirement:
 - preserve the option to archive and proxy camera streams without unnecessary decode/re-encode
 - keep the branch point and timing model explicit enough to test
 - graduate from predefined demo channels to arbitrary RTSP camera configuration and continuous stream duration
-- make mixed 4K/1080p/720p viewing stable across multi-minute runs before treating it as production-ready
+- make mixed 4K/1080p viewing stable across multi-minute runs before treating it as production-ready
 
 Current decision:
 

@@ -32,11 +32,13 @@ button {
 .vms-shell {
   display: grid;
   grid-template-columns: 320px minmax(0, 1fr);
-  min-height: 100vh;
+  height: 100vh;
+  overflow: hidden;
 }
 
 .channel-rail {
   min-width: 0;
+  overflow: auto;
   padding: 18px;
   color: #eef3f8;
   background: var(--rail);
@@ -136,8 +138,12 @@ button {
 }
 
 .workspace {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
+  min-height: 0;
   padding: 18px;
+  overflow: hidden;
 }
 
 .workspace-bar {
@@ -186,6 +192,8 @@ button {
 
 .vms-grid-shell {
   position: relative;
+  flex: 1;
+  min-height: 0;
 }
 
 .vms-matrix-canvas {
@@ -206,12 +214,18 @@ button {
   position: relative;
   z-index: 1;
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(390px, 1fr));
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  grid-template-rows: repeat(2, minmax(0, 1fr));
   gap: 14px;
+  height: 100%;
+  min-height: 0;
 }
 
 .vms-tile {
+  display: flex;
+  flex-direction: column;
   min-width: 0;
+  min-height: 0;
   overflow: hidden;
   background: var(--panel);
   border: 1px solid var(--line);
@@ -255,14 +269,15 @@ button {
 }
 
 .video-surface {
+  flex: 1;
+  min-height: 0;
   background: #0f1720;
 }
 
 .video-surface canvas {
   display: block;
   width: 100%;
-  height: auto;
-  aspect-ratio: 16 / 9;
+  height: 100%;
   opacity: 0;
 }
 
@@ -284,11 +299,33 @@ button {
 }
 
 .tile-diagnostics summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
   padding: 7px 10px;
   color: #405069;
   cursor: pointer;
   font-size: 0.78rem;
   font-weight: 700;
+}
+
+.osd-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #223146;
+  cursor: pointer;
+  font-family: "IBM Plex Mono", "SFMono-Regular", monospace;
+  font-size: 0.72rem;
+  font-weight: 700;
+}
+
+.osd-toggle input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
 }
 
 .tile-diagnostics[open] summary {
@@ -352,10 +389,6 @@ button {
   .workspace-bar {
     align-items: flex-start;
     flex-direction: column;
-  }
-
-  .vms-grid {
-    grid-template-columns: 1fr;
   }
 
   .tile-quick-stats {

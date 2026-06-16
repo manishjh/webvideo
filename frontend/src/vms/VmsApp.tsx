@@ -7,6 +7,7 @@ import {
   loadWebTransportCertificateHash,
 } from "../testing/browserDemoApi";
 import {
+  createVideoPipeViewportSessionKey,
   VideoPipeViewport,
   type VideoPipeChannelGroup,
   type VideoPipeRenderClock,
@@ -21,6 +22,7 @@ declare global {
       channels: BrowserDemoChannelSummary[];
       activeChannels: string[];
       activeTiles: ActiveTileInstance[];
+      metadataEnabledByTile: Record<string, boolean>;
       tiles: Record<string, VideoPipeRuntimeState>;
       serverMetrics: Record<string, LiveFanoutMetric>;
     };
@@ -29,6 +31,7 @@ declare global {
 
 export interface RuntimeOptions {
   adaptiveRenderFrameRate: boolean;
+  adaptiveSourceFrameRate: boolean;
   batchFrameCount: number;
   matrixCompositor: boolean;
   maxHighFrameRateRenderFrameRate?: number;
@@ -40,6 +43,7 @@ export interface RuntimeOptions {
   chaosDisconnectAfterFrames?: number;
   chaosFrameDelayMs?: number;
   chaosDropEveryNFrames?: number;
+  offscreenCanvas: boolean;
   renderClock: VideoPipeRenderClock;
   targetBatches?: number;
 }
@@ -50,9 +54,12 @@ interface ActiveTileInstance {
   instanceNumber: number;
 }
 
+const MaxActiveTiles = 4;
+
 export function VmsApp(): ReactElement {
   const [channels, setChannels] = useState<BrowserDemoChannelSummary[]>([]);
   const [activeTiles, setActiveTiles] = useState<ActiveTileInstance[]>([]);
+  const [metadataEnabledByTile, setMetadataEnabledByTile] = useState<Record<string, boolean>>({});
   const [tiles, setTiles] = useState<Record<string, VideoPipeRuntimeState>>({});
   const [serverMetrics, setServerMetrics] = useState<Record<string, LiveFanoutMetric>>({});
   const [catalogStatus, setCatalogStatus] = useState("loading");
@@ -64,7 +71,19 @@ export function VmsApp(): ReactElement {
     () => createViewportOptions(runtimeOptions, activeTiles.length),
     [activeTiles.length, runtimeOptions],
   );
+  const viewportSessionKey = useMemo(
+    () => createVideoPipeViewportSessionKey(viewportOptions),
+    [viewportOptions],
+  );
+  const useDirectTileRender = useMemo(
+    () => shouldUseDirectTileRender(runtimeOptions, activeTiles, tiles),
+    [activeTiles, runtimeOptions, tiles],
+  );
   const activeChannels = useMemo(() => activeTiles.map((tile) => tile.channelId), [activeTiles]);
+  const tileCountsByChannel = useMemo(
+    () => countTilesByChannel(activeTiles),
+    [activeTiles],
+  );
   const diagnosticTiles = useMemo(
     () => createDiagnosticTileMap(activeTiles, tiles),
     [activeTiles, tiles],
@@ -107,10 +126,11 @@ export function VmsApp(): ReactElement {
       channels,
       activeTiles,
       activeChannels,
+      metadataEnabledByTile,
       tiles: diagnosticTiles,
       serverMetrics,
     };
-  }, [activeChannels, activeTiles, catalogStatus, channels, diagnosticTiles, serverMetrics]);
+  }, [activeChannels, activeTiles, catalogStatus, channels, diagnosticTiles, metadataEnabledByTile, serverMetrics]);
 
   useEffect(() => {
     if (activeTiles.length === 0) {
@@ -147,6 +167,10 @@ export function VmsApp(): ReactElement {
 
   function addChannel(channelId: string): void {
     setActiveTiles((current) => {
+      if (current.length >= MaxActiveTiles) {
+        return current;
+      }
+
       const existingForChannel = current.filter((tile) => tile.channelId === channelId);
       const tileId = existingForChannel.length > 0
         ? `${channelId}-${nextTileSerialRef.current++}`
@@ -167,8 +191,20 @@ export function VmsApp(): ReactElement {
     });
   }
 
+  function setTileMetadataEnabled(tileId: string, enabled: boolean): void {
+    setMetadataEnabledByTile((current) => ({
+      ...current,
+      [tileId]: enabled,
+    }));
+  }
+
   function closeTile(tileId: string): void {
     setActiveTiles((current) => current.filter((candidate) => candidate.tileId !== tileId));
+    setMetadataEnabledByTile((current) => {
+      const next = { ...current };
+      delete next[tileId];
+      return next;
+    });
     setTiles((current) => {
       const next = { ...current };
       delete next[tileId];
@@ -221,7 +257,7 @@ export function VmsApp(): ReactElement {
                 aria-label={`Add ${channel.displayName}`}
                 className="icon-button"
                 data-testid={`add-channel-${channel.channelId}`}
-                disabled={catalogStatus !== "ready"}
+                disabled={catalogStatus !== "ready" || activeTiles.length >= MaxActiveTiles}
                 title="Add channel"
                 type="button"
                 onClick={() => addChannel(channel.channelId)}
@@ -253,10 +289,11 @@ export function VmsApp(): ReactElement {
             <span>No active tiles</span>
           </div>
         ) : (
-          <div className={runtimeOptions.matrixCompositor ? "vms-grid-shell" : "vms-grid-shell direct-render"}>
+          <div className={useDirectTileRender ? "vms-grid-shell direct-render" : "vms-grid-shell"}>
             <VideoPipeViewport
               canvasIdForTile={canvasIdForTile}
               channelGroups={activeChannelGroups}
+              metadataEnabledByTile={metadataEnabledByTile}
               matrixCanvasClassName="vms-matrix-canvas"
               matrixCanvasId="vms-matrix-canvas"
               matrixCanvasTestId="vms-matrix-canvas"
@@ -267,6 +304,12 @@ export function VmsApp(): ReactElement {
               <div className="vms-grid" data-testid="vms-grid">
                 {activeTileModels.map(({ tile, channel }) => (
                   <VmsTile
+                    canvasResetKey={canvasResetKeyForTile(
+                      tile,
+                      tileCountsByChannel.get(tile.channelId) ?? 1,
+                      viewportOptions.offscreenCanvas,
+                      viewportSessionKey,
+                    )}
                     channel={channel}
                     instanceNumber={tile.instanceNumber}
                     key={tile.tileId}
@@ -277,6 +320,8 @@ export function VmsApp(): ReactElement {
                     )}
                     state={tiles[tile.tileId]}
                     tileId={tile.tileId}
+                    metadataEnabled={metadataEnabledByTile[tile.tileId] !== false}
+                    onMetadataEnabledChange={(enabled) => setTileMetadataEnabled(tile.tileId, enabled)}
                     onClose={() => closeTile(tile.tileId)}
                   />
                 ))}
@@ -287,6 +332,25 @@ export function VmsApp(): ReactElement {
       </section>
     </main>
   );
+}
+
+function countTilesByChannel(activeTiles: ActiveTileInstance[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const tile of activeTiles) {
+    counts.set(tile.channelId, (counts.get(tile.channelId) ?? 0) + 1);
+  }
+
+  return counts;
+}
+
+function canvasResetKeyForTile(
+  tile: ActiveTileInstance,
+  channelTileCount: number,
+  offscreenCanvasEnabled: boolean,
+  viewportSessionKey: string,
+): string {
+  const renderMode = offscreenCanvasEnabled && channelTileCount === 1 ? "offscreen" : "shared";
+  return `${tile.tileId}:${renderMode}:${channelTileCount}:${viewportSessionKey}`;
 }
 
 function createDiagnosticTileMap(
@@ -373,6 +437,7 @@ function compareLiveFanoutMetrics(left: LiveFanoutMetric, right: LiveFanoutMetri
 function readRuntimeOptions(): RuntimeOptions {
   const params = new URLSearchParams(window.location.search);
   const adaptiveRenderFrameRate = !["0", "false"].includes((params.get("adaptiveRender") ?? "1").toLowerCase());
+  const adaptiveSourceFrameRate = ["1", "true", "yes", "on"].includes((params.get("adaptiveSource") ?? "0").toLowerCase());
   const batchFrameCount = readPositiveInt(params.get("batchFrames"), 4);
   const targetBatches = readOptionalPositiveInt(params.get("targetBatches"));
   const matrixCompositor = !["0", "false"].includes((params.get("matrix") ?? "1").toLowerCase());
@@ -385,10 +450,12 @@ function readRuntimeOptions(): RuntimeOptions {
   const chaosDisconnectAfterFrames = readOptionalPositiveInt(params.get("chaosDisconnectAfterFrames"));
   const chaosFrameDelayMs = readOptionalPositiveInt(params.get("chaosFrameDelayMs"));
   const chaosDropEveryNFrames = readOptionalPositiveInt(params.get("chaosDropEveryNFrames"));
+  const offscreenCanvas = ["1", "true", "yes", "on"].includes((params.get("offscreen") ?? "0").toLowerCase());
   const renderClock = readRenderClock(params.get("renderClock"));
   return {
     batchFrameCount,
     adaptiveRenderFrameRate,
+    adaptiveSourceFrameRate,
     matrixCompositor,
     maxHighFrameRateRenderFrameRate,
     maxHighSourceFrameRate,
@@ -399,6 +466,7 @@ function readRuntimeOptions(): RuntimeOptions {
     chaosDisconnectAfterFrames,
     chaosFrameDelayMs,
     chaosDropEveryNFrames,
+    offscreenCanvas,
     renderClock,
     targetBatches,
   };
@@ -446,6 +514,7 @@ export function createViewportOptions(
   ) {
     return {
       ...options,
+      offscreenCanvas: tileCount <= 1 && options.offscreenCanvas,
       maxHighFrameRateRenderFrameRate: normalizeRenderFrameRate(options.maxHighFrameRateRenderFrameRate),
       maxHighSourceFrameRate: normalizeRenderFrameRate(options.maxHighSourceFrameRate),
       maxRenderFrameRate: normalizeRenderFrameRate(options.maxRenderFrameRate),
@@ -455,25 +524,14 @@ export function createViewportOptions(
     };
   }
 
-  if (tileCount >= 5) {
-    return {
-      ...options,
-      maxHighFrameRateRenderFrameRate: 15,
-      maxHighSourceFrameRate: 15,
-      maxRenderFrameRate: 15,
-      maxSourceCodedWidth: 1280,
-      maxSourceCodedHeight: 720,
-      maxSourceFrameRate: 15,
-    };
-  }
-
   return {
     ...options,
-    maxHighFrameRateRenderFrameRate: tileCount >= 3 ? 24 : undefined,
-    maxHighSourceFrameRate: tileCount >= 3 ? 24 : undefined,
-    maxRenderFrameRate: tileCount >= 4 ? 30 : undefined,
-    maxSourceCodedWidth: tileCount >= 1 ? 1920 : undefined,
-    maxSourceCodedHeight: tileCount >= 1 ? 1080 : undefined,
+    offscreenCanvas: tileCount <= 1 && options.offscreenCanvas,
+    maxHighFrameRateRenderFrameRate: undefined,
+    maxHighSourceFrameRate: undefined,
+    maxRenderFrameRate: undefined,
+    maxSourceCodedWidth: undefined,
+    maxSourceCodedHeight: undefined,
     maxSourceFrameRate: undefined,
   };
 }
@@ -484,4 +542,22 @@ function normalizeRenderFrameRate(value: number | undefined): number | undefined
 
 function normalizePositiveInteger(value: number | undefined): number | undefined {
   return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : undefined;
+}
+
+export function shouldUseDirectTileRender(
+  options: Pick<RuntimeOptions, "matrixCompositor" | "offscreenCanvas">,
+  activeTiles: readonly Pick<ActiveTileInstance, "tileId">[],
+  tiles: Record<string, Pick<VideoPipeRuntimeState, "gpuPresentation" | "matrixFallbackReason" | "renderBackend" | "webGpuDisabledReason"> | undefined>,
+): boolean {
+  if (!options.matrixCompositor || options.offscreenCanvas) {
+    return true;
+  }
+
+  return activeTiles.some((tile) => {
+    const state = tiles[tile.tileId];
+    return state?.renderBackend === "canvas2d-fallback"
+      || state?.gpuPresentation === "canvas2d-fallback"
+      || Boolean(state?.matrixFallbackReason)
+      || Boolean(state?.webGpuDisabledReason);
+  });
 }

@@ -21,7 +21,14 @@ type WorkerResponse =
 type PendingRequest = {
   resolve: (value?: DecodedFramePlan[]) => void;
   reject: (error: Error) => void;
+  timeoutId: ReturnType<typeof setTimeout>;
 };
+
+export interface WorkerVideoDecodeCoordinatorOptions {
+  requestTimeoutMs?: number;
+}
+
+const DefaultWorkerRequestTimeoutMs = 3_000;
 
 export interface LiveVideoDecoder {
   decodePipeline: "main-thread" | "worker";
@@ -53,9 +60,14 @@ export class WorkerVideoDecodeCoordinator implements LiveVideoDecoder {
   private locallyQueuedChunks = 0;
   private failure?: Error;
   private readonly onDecodedFramesAvailable?: () => void;
+  private readonly requestTimeoutMs: number;
 
-  public constructor(onDecodedFramesAvailable?: () => void) {
+  public constructor(
+    onDecodedFramesAvailable?: () => void,
+    options: WorkerVideoDecodeCoordinatorOptions = {},
+  ) {
     this.onDecodedFramesAvailable = onDecodedFramesAvailable;
+    this.requestTimeoutMs = normalizeTimeoutMs(options.requestTimeoutMs);
     this.worker = new Worker(new URL("./videoDecodeWorker.ts", import.meta.url), {
       type: "module",
     });
@@ -118,7 +130,7 @@ export class WorkerVideoDecodeCoordinator implements LiveVideoDecoder {
 
     this.disposed = true;
     closeDecodedFrames(this.decodedFrames.splice(0));
-    this.pendingRequests.clear();
+    this.rejectPending(new Error("Worker VideoDecoder has been disposed."));
     try {
       this.worker.postMessage({
         type: "dispose",
@@ -138,7 +150,11 @@ export class WorkerVideoDecodeCoordinator implements LiveVideoDecoder {
       id,
     } as WorkerRequest;
     return await new Promise<DecodedFramePlan[] | undefined>((resolve, reject) => {
-      this.pendingRequests.set(id, { resolve, reject });
+      const timeoutId = setTimeout(() => {
+        const error = new Error(`Worker VideoDecoder request '${request.type}' timed out after ${this.requestTimeoutMs} ms.`);
+        this.fail(error, id);
+      }, this.requestTimeoutMs);
+      this.pendingRequests.set(id, { resolve, reject, timeoutId });
       this.worker.postMessage(nextRequest);
     });
   }
@@ -185,6 +201,9 @@ export class WorkerVideoDecodeCoordinator implements LiveVideoDecoder {
   private resolvePending(id: number, frames?: DecodedFramePlan[]): void {
     const pending = this.pendingRequests.get(id);
     this.pendingRequests.delete(id);
+    if (pending) {
+      clearTimeout(pending.timeoutId);
+    }
     pending?.resolve(frames);
   }
 
@@ -193,12 +212,20 @@ export class WorkerVideoDecodeCoordinator implements LiveVideoDecoder {
     if (requestId !== undefined) {
       const pending = this.pendingRequests.get(requestId);
       this.pendingRequests.delete(requestId);
+      if (pending) {
+        clearTimeout(pending.timeoutId);
+      }
       pending?.reject(error);
       return;
     }
 
+    this.rejectPending(error);
+  }
+
+  private rejectPending(error: Error): void {
     for (const [id, pending] of this.pendingRequests) {
       this.pendingRequests.delete(id);
+      clearTimeout(pending.timeoutId);
       pending.reject(error);
     }
   }
@@ -223,6 +250,12 @@ function copyBytes(bytes: Uint8Array): Uint8Array {
   const copy = new Uint8Array(bytes.byteLength);
   copy.set(bytes);
   return copy;
+}
+
+function normalizeTimeoutMs(value: number | undefined): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? value
+    : DefaultWorkerRequestTimeoutMs;
 }
 
 function closeDecodedFrames(frames: DecodedFramePlan[]): void {

@@ -56,7 +56,7 @@ declare global {
 
 function getChannels(): string[] {
   const params = new URLSearchParams(window.location.search);
-  return (params.get("channels") ?? "channel-001,channel-002,channel-003")
+  return (params.get("channels") ?? "channel-4k-crowd,channel-13535786,channel-15116604")
     .split(",")
     .map((channel) => channel.trim())
     .filter(Boolean);

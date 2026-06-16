@@ -1,5 +1,6 @@
 using System.Collections.Concurrent;
 using System.Diagnostics;
+using System.Globalization;
 using System.IO.Pipelines;
 using System.Text;
 using Microsoft.AspNetCore.Connections;
@@ -95,6 +96,7 @@ public static class BrowserDemoWebTransportEndpoint
                     request.DesiredEgressFrameRate,
                     request.DesiredMaxCodedWidth,
                     request.DesiredMaxCodedHeight,
+                    request.EnableMetadata.GetValueOrDefault(true),
                     request.ChaosDisconnectAfterFrames,
                     request.ChaosFrameDelayMs,
                     request.ChaosDropEveryNFrames,
@@ -127,6 +129,7 @@ public static class BrowserDemoWebTransportEndpoint
         double? desiredEgressFrameRate,
         int? desiredMaxCodedWidth,
         int? desiredMaxCodedHeight,
+        bool enableMetadata,
         int? chaosDisconnectAfterFrames,
         int? chaosFrameDelayMs,
         int? chaosDropEveryNFrames,
@@ -156,6 +159,11 @@ public static class BrowserDemoWebTransportEndpoint
         var chaosDisconnectFrameBudget = NormalizePositive(chaosDisconnectAfterFrames);
         var chaosFrameDelay = NormalizePositive(chaosFrameDelayMs);
         var chaosDropCadence = NormalizePositive(chaosDropEveryNFrames);
+        var metadataCadenceFrames = Math.Max(1, (int)Math.Round(channel.Codec.FrameRate / 4.0));
+        var frameDurationUs = (long)Math.Round(1_000_000.0 / Math.Max(1.0, channel.Codec.FrameRate));
+        var metadataDurationUs = Math.Max(250_000L, frameDurationUs * metadataCadenceFrames);
+        var frameWriteTimeout = ResolveFrameWriteTimeout(targetLatencyMs);
+        using var writeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         await foreach (var frame in subscription.Frames.ReadAllAsync(cancellationToken))
         {
             try
@@ -203,12 +211,34 @@ public static class BrowserDemoWebTransportEndpoint
                 var objectIdentity = objectTimeline.Advance(frame);
                 var writeStartTimestamp = Stopwatch.GetTimestamp();
 
+                if (enableMetadata && framesSentInSession % metadataCadenceFrames == 0)
+                {
+                    var metadataMessage = CreateContinuousMetadataMessage(channel, frame, metadataDurationUs);
+                    ArmFrameWriteTimeout(writeTimeout, frameWriteTimeout);
+                    try
+                    {
+                        var flush = await BrowserDemoWebTransportFrameCodec.WriteMetadataFrameAsync(
+                            writer,
+                            metadataMessage,
+                            writeTimeout.Token);
+                        ThrowIfFrameWriteCanceled(flush, cancellationToken);
+                    }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        throw CreateFrameWriteTimeoutException();
+                    }
+                    finally
+                    {
+                        DisarmFrameWriteTimeout(writeTimeout);
+                    }
+                }
+
                 if (moqFrames)
                 {
-                    await WriteFrameWithTimeoutAsync(
-                        targetLatencyMs,
-                        cancellationToken,
-                        writeCancellationToken => BrowserDemoWebTransportFrameCodec.WriteMoqVideoObjectFrameAsync(
+                    ArmFrameWriteTimeout(writeTimeout, frameWriteTimeout);
+                    try
+                    {
+                        var flush = await BrowserDemoWebTransportFrameCodec.WriteMoqVideoObjectFrameAsync(
                             writer,
                             streamIdBytes,
                             frame.SequenceNumber,
@@ -221,7 +251,18 @@ public static class BrowserDemoWebTransportEndpoint
                             frame.Payload,
                             objectIdentity.GroupId,
                             objectIdentity.ObjectId,
-                            writeCancellationToken));
+                            writeTimeout.Token);
+                        ThrowIfFrameWriteCanceled(flush, cancellationToken);
+                    }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        throw CreateFrameWriteTimeoutException();
+                    }
+                    finally
+                    {
+                        DisarmFrameWriteTimeout(writeTimeout);
+                    }
+
                     profiler.RecordFrameSent(
                         Stopwatch.GetElapsedTime(writeStartTimestamp).TotalMilliseconds,
                         BrowserDemoWebTransportFrameCodec.ComputeMoqVideoObjectFrameLength(
@@ -242,13 +283,24 @@ public static class BrowserDemoWebTransportEndpoint
                         CodecConfigVersion: codecConfigVersion,
                         Payload: frame.Payload);
 
-                    await WriteFrameWithTimeoutAsync(
-                        targetLatencyMs,
-                        cancellationToken,
-                        writeCancellationToken => BrowserDemoWebTransportFrameCodec.WriteVideoFrameAsync(
+                    ArmFrameWriteTimeout(writeTimeout, frameWriteTimeout);
+                    try
+                    {
+                        var flush = await BrowserDemoWebTransportFrameCodec.WriteVideoFrameAsync(
                             writer,
                             message,
-                            writeCancellationToken));
+                            writeTimeout.Token);
+                        ThrowIfFrameWriteCanceled(flush, cancellationToken);
+                    }
+                    catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
+                    {
+                        throw CreateFrameWriteTimeoutException();
+                    }
+                    finally
+                    {
+                        DisarmFrameWriteTimeout(writeTimeout);
+                    }
+
                     profiler.RecordFrameSent(Stopwatch.GetElapsedTime(writeStartTimestamp).TotalMilliseconds, frame.Payload.Length);
                 }
 
@@ -277,26 +329,78 @@ public static class BrowserDemoWebTransportEndpoint
         }
     }
 
+    internal static BrowserDemoMetadataMessage CreateContinuousMetadataMessage(
+        BrowserDemoChannelSummary channel,
+        ContinuousRtspFrame frame,
+        long durationUs)
+    {
+        var phase = (frame.SequenceNumber % 97) / 97.0;
+        var x = Math.Min(0.74, 0.04 + phase * 0.62);
+        var y = Math.Min(0.72, 0.10 + ((frame.SequenceNumber / 17) % 5) * 0.10);
+        var width = 0.22;
+        var height = 0.16;
+        var resolution = $"{channel.Codec.CodedWidth}x{channel.Codec.CodedHeight}";
+        var ptsMs = Math.Max(0, frame.PresentationTimestampUs / 1000);
+        var endTimestampUs = frame.PresentationTimestampUs + Math.Max(1, durationUs);
+        var tags = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["label"] = "OSD",
+            ["text"] = $"OSD {resolution.ToUpperInvariant()} T{ptsMs}",
+            ["resolution"] = resolution,
+            ["sourceResolution"] = resolution,
+            ["x"] = FormatCoordinate(x),
+            ["y"] = FormatCoordinate(y),
+            ["w"] = FormatCoordinate(width),
+            ["h"] = FormatCoordinate(height),
+            ["sequence"] = frame.SequenceNumber.ToString(CultureInfo.InvariantCulture),
+            ["ptsUs"] = frame.PresentationTimestampUs.ToString(CultureInfo.InvariantCulture),
+            ["ptsMs"] = ptsMs.ToString(CultureInfo.InvariantCulture),
+            ["sourceUnixMs"] = frame.SourceTimestampUnixTimeMs.ToString(CultureInfo.InvariantCulture),
+            ["serverUnixMs"] = frame.ServerTimestampUnixTimeMs.ToString(CultureInfo.InvariantCulture)
+        };
+
+        var record = new BrowserDemoOverlayRecord(
+            EventId: $"osd-{channel.ChannelId}-{frame.SequenceNumber}",
+            EventType: "osd",
+            StartTimestampUs: frame.PresentationTimestampUs,
+            EndTimestampUs: endTimestampUs,
+            CoordinateSpace: "normalized-video",
+            Tags: tags);
+
+        return new BrowserDemoMetadataMessage(
+            channel.StreamId,
+            frame.PresentationTimestampUs,
+            endTimestampUs,
+            [record]);
+    }
+
+    private static string FormatCoordinate(double value)
+        => value.ToString("0.###", CultureInfo.InvariantCulture);
+
     private static int? NormalizePositive(int? value)
         => value is > 0 ? value.Value : null;
 
-    private static async Task WriteFrameWithTimeoutAsync(
-        int? targetLatencyMs,
-        CancellationToken cancellationToken,
-        Func<CancellationToken, Task> writeFrame)
-    {
-        using var writeTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
-        writeTimeout.CancelAfter(ResolveFrameWriteTimeout(targetLatencyMs));
+    private static void ArmFrameWriteTimeout(CancellationTokenSource writeTimeout, TimeSpan timeout)
+        => writeTimeout.CancelAfter(timeout);
 
-        try
+    private static void DisarmFrameWriteTimeout(CancellationTokenSource writeTimeout)
+    {
+        if (!writeTimeout.IsCancellationRequested)
         {
-            await writeFrame(writeTimeout.Token);
-        }
-        catch (OperationCanceledException) when (!cancellationToken.IsCancellationRequested)
-        {
-            throw new TimeoutException("WebTransport client did not accept a video frame within the low-latency write budget.");
+            writeTimeout.CancelAfter(Timeout.InfiniteTimeSpan);
         }
     }
+
+    private static void ThrowIfFrameWriteCanceled(FlushResult flush, CancellationToken cancellationToken)
+    {
+        if (flush.IsCanceled && !cancellationToken.IsCancellationRequested)
+        {
+            throw CreateFrameWriteTimeoutException();
+        }
+    }
+
+    private static TimeoutException CreateFrameWriteTimeoutException()
+        => new("WebTransport client did not accept a video frame within the low-latency write budget.");
 
     private static TimeSpan ResolveFrameWriteTimeout(int? targetLatencyMs)
     {

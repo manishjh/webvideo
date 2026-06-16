@@ -218,15 +218,28 @@ type WebGpuSharedAdapterState = {
 };
 
 type WebGpuCanvasPresentation = "webgpu-canvas" | "canvas2d-visible-copy";
+type MatrixFlushMode = "microtask" | "timer" | "raf";
 type MatrixVideoFrameUploadMode = "auto" | "external" | "copy";
 type MatrixFrameUploadSource = "external-texture" | "videoframe-copy";
+type MatrixPresentMode = "auto" | "immediate" | "raf";
+type MatrixPresentPath = "immediate" | "coalesced";
+
+type MatrixRuntimeOptions = {
+  flushMode: MatrixFlushMode;
+  presentMode: MatrixPresentMode;
+  uploadMode: MatrixVideoFrameUploadMode;
+};
 
 const MoqVideoObjectFrameHeaderLength = 88;
 const MoqVideoObjectFrameMagic = 0x4c514f4d;
 const MoqVideoObjectFrameVersion = 1;
 const MoqVideoObjectFrameKindVideo = 1;
+const OverlayTextMaxChars = 32;
+const OverlayUniformFloatCount = 8 + OverlayTextMaxChars;
+const OverlayUniformByteLength = OverlayUniformFloatCount * Float32Array.BYTES_PER_ELEMENT;
 const MaxMoqFramesPerParseTurn = 16;
 const WebGpuInitTimeoutMs = 3_000;
+const MatrixAutoPresentFallbackMs = 16;
 
 type WebGpuNavigatorLike = {
   getPreferredCanvasFormat?: () => string;
@@ -390,6 +403,30 @@ function isNativeVideoFrame(candidate: unknown): boolean {
   const videoFrameConstructor = (globalThis as { VideoFrame?: unknown }).VideoFrame;
   return typeof videoFrameConstructor === "function"
     && candidate instanceof (videoFrameConstructor as new (...args: never[]) => object);
+}
+
+function firstPositiveNumber(...values: Array<number | undefined>): number | undefined {
+  return values.find((value) => typeof value === "number" && Number.isFinite(value) && value > 0);
+}
+
+function resolveVideoFrameDimensions(
+  frame: unknown,
+  fallbackWidth: number,
+  fallbackHeight: number,
+): { width: number; height: number } {
+  const typedFrame = frame as {
+    codedWidth?: number;
+    codedHeight?: number;
+    displayWidth?: number;
+    displayHeight?: number;
+    width?: number;
+    height?: number;
+  };
+
+  return {
+    width: firstPositiveNumber(typedFrame.displayWidth, typedFrame.codedWidth, typedFrame.width, fallbackWidth) ?? 0,
+    height: firstPositiveNumber(typedFrame.displayHeight, typedFrame.codedHeight, typedFrame.height, fallbackHeight) ?? 0,
+  };
 }
 
 function isHardwareWebGpuAdapter(adapterInfo: WebGpuAdapterInfoLike | undefined): boolean {
@@ -929,36 +966,6 @@ function lookupCanvas(canvasId: string): HTMLCanvasElement | null {
   return isCanvasLike(candidate) ? candidate : null;
 }
 
-function drawMetadataOverlay(
-  context: CanvasRenderingContext2D,
-  batch: TimedMetadataBatch,
-  frameWidth: number,
-  frameHeight: number,
-  overlayColor: string,
-): void {
-  for (const [index, record] of batch.records.entries()) {
-    const x = parseNormalizedCoordinate(record.tags.x, 0.08 + index * 0.1);
-    const y = parseNormalizedCoordinate(record.tags.y, 0.12 + index * 0.08);
-    const w = parseNormalizedCoordinate(record.tags.w, 0.18);
-    const h = parseNormalizedCoordinate(record.tags.h, 0.14);
-    const left = x * frameWidth;
-    const top = y * frameHeight;
-    const width = Math.max(24, w * frameWidth);
-    const height = Math.max(20, h * frameHeight);
-
-    context.strokeStyle = overlayColor;
-    context.lineWidth = 4;
-    context.strokeRect(left, top, width, height);
-
-    const label = record.tags.label ?? record.eventType;
-    context.fillStyle = "rgba(0, 0, 0, 0.68)";
-    context.fillRect(left, Math.max(0, top - 26), Math.max(84, label.length * 10), 24);
-    context.fillStyle = "#ffffff";
-    context.font = "16px IBM Plex Sans, sans-serif";
-    context.fillText(label, left + 8, Math.max(16, top - 10));
-  }
-}
-
 function paintFrameOnCanvas(
   canvas: HTMLCanvasElement,
   configuration: SurfaceConfigurationPlan,
@@ -983,6 +990,7 @@ function paintFrameOnCanvas(
   const palette = computeFramePalette(frame.sequenceNumber);
   const width = configuration.canvasWidth;
   const height = configuration.canvasHeight;
+  const renderedOverlayCount = renderBackend === "webgpu" ? countOverlayPrimitives(request.activeMetadata) : 0;
 
   context.clearRect(0, 0, width, height);
 
@@ -1008,19 +1016,6 @@ function paintFrameOnCanvas(
     context.fillRect((motionOffset - 200), height * 0.22, 220, height * 0.56);
   }
 
-  context.fillStyle = "rgba(5, 10, 20, 0.62)";
-  context.fillRect(24, 24, 420, 92);
-  context.fillStyle = "#ffffff";
-  context.font = "600 30px IBM Plex Sans, sans-serif";
-  context.fillText(`Camera ${frame.streamId}`, 40, 60);
-  context.font = "18px IBM Plex Sans, sans-serif";
-  context.fillText(`Sequence ${frame.sequenceNumber}`, 40, 88);
-  context.fillText(`PTS ${frame.presentationTimestampUs}`, 190, 88);
-
-  for (const batch of request.activeMetadata) {
-    drawMetadataOverlay(context, batch, width, height, palette.overlay);
-  }
-
   if (request.debugOverlayEnabled) {
     context.fillStyle = "rgba(0, 0, 0, 0.72)";
     context.fillRect(width - 256, height - 58, 224, 34);
@@ -1030,7 +1025,7 @@ function paintFrameOnCanvas(
   }
 
   canvas.dataset.lastSequence = String(frame.sequenceNumber);
-  canvas.dataset.overlayCount = String(countOverlayPrimitives(request.activeMetadata));
+  canvas.dataset.overlayCount = String(renderedOverlayCount);
   canvas.dataset.decodeBackend = frame.decodeBackend;
   canvas.dataset.renderBackend = renderBackend;
   if (renderBackend === "webgpu") {
@@ -1041,15 +1036,171 @@ function paintFrameOnCanvas(
   }
 }
 
-const webGpuVideoShader = `
+const webGpuOverlayUniformShader = `
 struct Overlay {
   rect: vec4f,
+  info: vec4f,
+  chars0: vec4f,
+  chars1: vec4f,
+  chars2: vec4f,
+  chars3: vec4f,
+  chars4: vec4f,
+  chars5: vec4f,
+  chars6: vec4f,
+  chars7: vec4f,
 };
+`;
 
-@group(0) @binding(0) var videoTexture: texture_2d<f32>;
-@group(0) @binding(1) var videoSampler: sampler;
-@group(0) @binding(2) var<uniform> overlay: Overlay;
+const webGpuOverlayFunctionsShader = `
+fn overlayChar(index: u32) -> u32 {
+  if (index < 4u) {
+    return u32(overlay.chars0[index] + 0.5);
+  }
+  if (index < 8u) {
+    return u32(overlay.chars1[index - 4u] + 0.5);
+  }
+  if (index < 12u) {
+    return u32(overlay.chars2[index - 8u] + 0.5);
+  }
+  if (index < 16u) {
+    return u32(overlay.chars3[index - 12u] + 0.5);
+  }
+  if (index < 20u) {
+    return u32(overlay.chars4[index - 16u] + 0.5);
+  }
+  if (index < 24u) {
+    return u32(overlay.chars5[index - 20u] + 0.5);
+  }
+  if (index < 28u) {
+    return u32(overlay.chars6[index - 24u] + 0.5);
+  }
+  if (index < 32u) {
+    return u32(overlay.chars7[index - 28u] + 0.5);
+  }
+  return 32u;
+}
 
+fn glyphRow(code: u32, row: u32) -> u32 {
+  if (code == 48u || code == 79u) {
+    let rows = array<u32, 7>(14u, 17u, 19u, 21u, 25u, 17u, 14u);
+    return rows[row];
+  }
+  if (code == 49u) {
+    let rows = array<u32, 7>(4u, 12u, 4u, 4u, 4u, 4u, 14u);
+    return rows[row];
+  }
+  if (code == 50u) {
+    let rows = array<u32, 7>(14u, 17u, 1u, 2u, 4u, 8u, 31u);
+    return rows[row];
+  }
+  if (code == 51u) {
+    let rows = array<u32, 7>(30u, 1u, 1u, 14u, 1u, 1u, 30u);
+    return rows[row];
+  }
+  if (code == 52u) {
+    let rows = array<u32, 7>(18u, 18u, 18u, 31u, 2u, 2u, 2u);
+    return rows[row];
+  }
+  if (code == 53u || code == 83u) {
+    let rows = array<u32, 7>(31u, 16u, 30u, 1u, 1u, 17u, 14u);
+    return rows[row];
+  }
+  if (code == 54u) {
+    let rows = array<u32, 7>(6u, 8u, 16u, 30u, 17u, 17u, 14u);
+    return rows[row];
+  }
+  if (code == 55u) {
+    let rows = array<u32, 7>(31u, 1u, 2u, 4u, 8u, 8u, 8u);
+    return rows[row];
+  }
+  if (code == 56u) {
+    let rows = array<u32, 7>(14u, 17u, 17u, 14u, 17u, 17u, 14u);
+    return rows[row];
+  }
+  if (code == 57u) {
+    let rows = array<u32, 7>(14u, 17u, 17u, 15u, 1u, 2u, 28u);
+    return rows[row];
+  }
+  if (code == 68u) {
+    let rows = array<u32, 7>(30u, 17u, 17u, 17u, 17u, 17u, 30u);
+    return rows[row];
+  }
+  if (code == 84u) {
+    let rows = array<u32, 7>(31u, 4u, 4u, 4u, 4u, 4u, 4u);
+    return rows[row];
+  }
+  if (code == 88u) {
+    let rows = array<u32, 7>(17u, 17u, 10u, 4u, 10u, 17u, 17u);
+    return rows[row];
+  }
+  if (code == 45u) {
+    let rows = array<u32, 7>(0u, 0u, 0u, 31u, 0u, 0u, 0u);
+    return rows[row];
+  }
+  return 0u;
+}
+
+fn drawMetadataOsd(uv: vec2f, sampledColor: vec4f) -> vec4f {
+  if (overlay.info.x < 0.5) {
+    return sampledColor;
+  }
+
+  let rect = overlay.rect;
+  let right = rect.x + rect.z;
+  let bottom = rect.y + rect.w;
+  let inside = uv.x >= rect.x && uv.x <= right && uv.y >= rect.y && uv.y <= bottom;
+  let borderWidth = 0.006;
+  let border = inside && (
+    abs(uv.x - rect.x) < borderWidth ||
+    abs(uv.x - right) < borderWidth ||
+    abs(uv.y - rect.y) < borderWidth ||
+    abs(uv.y - bottom) < borderWidth
+  );
+
+  var labelY = rect.y - 0.075;
+  if (labelY < 0.01) {
+    labelY = min(0.91, bottom + 0.018);
+  }
+  let textLength = min(u32(overlay.info.y + 0.5), 32u);
+  let cellSize = vec2f(0.013, 0.027);
+  let labelOrigin = vec2f(clamp(rect.x, 0.01, 0.58), labelY);
+  let labelPadding = vec2f(0.006, 0.006);
+  let labelSize = vec2f(cellSize.x * f32(max(textLength, 1u)) + labelPadding.x * 2.0, cellSize.y + labelPadding.y * 2.0);
+  let inLabel = uv.x >= labelOrigin.x
+    && uv.x <= labelOrigin.x + labelSize.x
+    && uv.y >= labelOrigin.y
+    && uv.y <= labelOrigin.y + labelSize.y;
+
+  if (inLabel) {
+    let textOrigin = labelOrigin + labelPadding;
+    let local = uv - textOrigin;
+    if (local.x >= 0.0 && local.y >= 0.0 && local.y < cellSize.y) {
+      let charIndex = u32(floor(local.x / cellSize.x));
+      if (charIndex < textLength) {
+        let charLocalX = local.x - f32(charIndex) * cellSize.x;
+        let glyphColumn = u32(floor(charLocalX / (cellSize.x / 6.0)));
+        let glyphRowIndex = u32(floor(local.y / (cellSize.y / 8.0)));
+        if (glyphColumn < 5u && glyphRowIndex < 7u) {
+          let rowBits = glyphRow(overlayChar(charIndex), glyphRowIndex);
+          let bitIndex = 4u - glyphColumn;
+          if (((rowBits >> bitIndex) & 1u) == 1u) {
+            return vec4f(1.0, 0.92, 0.24, 1.0);
+          }
+        }
+      }
+    }
+    return vec4f(0.02, 0.05, 0.09, 0.86);
+  }
+
+  if (border) {
+    return vec4f(1.0, 0.84, 0.12, 1.0);
+  }
+
+  return sampledColor;
+}
+`;
+
+const webGpuVertexShader = `
 struct VertexOut {
   @builtin(position) position: vec4f,
   @location(0) uv: vec2f,
@@ -1079,93 +1230,40 @@ fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
   output.uv = uvs[vertexIndex];
   return output;
 }
+`;
+
+const webGpuVideoShader = `
+${webGpuOverlayUniformShader}
+@group(0) @binding(0) var videoTexture: texture_2d<f32>;
+@group(0) @binding(1) var videoSampler: sampler;
+@group(0) @binding(2) var<uniform> overlay: Overlay;
+${webGpuVertexShader}
+${webGpuOverlayFunctionsShader}
 
 @fragment
 fn fragmentMain(input: VertexOut) -> @location(0) vec4f {
   var color = textureSample(videoTexture, videoSampler, input.uv);
-  let rect = overlay.rect;
-  let right = rect.x + rect.z;
-  let bottom = rect.y + rect.w;
-  let inside = input.uv.x >= rect.x && input.uv.x <= right && input.uv.y >= rect.y && input.uv.y <= bottom;
-  let borderWidth = 0.008;
-  let border = inside && (
-    abs(input.uv.x - rect.x) < borderWidth ||
-    abs(input.uv.x - right) < borderWidth ||
-    abs(input.uv.y - rect.y) < borderWidth ||
-    abs(input.uv.y - bottom) < borderWidth
-  );
-
-  if (border) {
-    return vec4f(1.0, 0.84, 0.12, 1.0);
-  }
-
-  return vec4f(color.rgb, 1.0);
+  return drawMetadataOsd(input.uv, vec4f(color.rgb, 1.0));
 }
 `;
 
 const webGpuExternalVideoShader = `
-struct Overlay {
-  rect: vec4f,
-};
-
+${webGpuOverlayUniformShader}
 @group(0) @binding(0) var videoTexture: texture_external;
 @group(0) @binding(1) var videoSampler: sampler;
 @group(0) @binding(2) var<uniform> overlay: Overlay;
-
-struct VertexOut {
-  @builtin(position) position: vec4f,
-  @location(0) uv: vec2f,
-};
-
-@vertex
-fn vertexMain(@builtin(vertex_index) vertexIndex: u32) -> VertexOut {
-  var positions = array<vec2f, 6>(
-    vec2f(-1.0, -1.0),
-    vec2f(1.0, -1.0),
-    vec2f(-1.0, 1.0),
-    vec2f(-1.0, 1.0),
-    vec2f(1.0, -1.0),
-    vec2f(1.0, 1.0)
-  );
-  var uvs = array<vec2f, 6>(
-    vec2f(0.0, 1.0),
-    vec2f(1.0, 1.0),
-    vec2f(0.0, 0.0),
-    vec2f(0.0, 0.0),
-    vec2f(1.0, 1.0),
-    vec2f(1.0, 0.0)
-  );
-
-  var output: VertexOut;
-  output.position = vec4f(positions[vertexIndex], 0.0, 1.0);
-  output.uv = uvs[vertexIndex];
-  return output;
-}
+${webGpuVertexShader}
+${webGpuOverlayFunctionsShader}
 
 @fragment
 fn fragmentMain(input: VertexOut) -> @location(0) vec4f {
   var color = textureSampleBaseClampToEdge(videoTexture, videoSampler, input.uv);
-  let rect = overlay.rect;
-  let right = rect.x + rect.z;
-  let bottom = rect.y + rect.w;
-  let inside = input.uv.x >= rect.x && input.uv.x <= right && input.uv.y >= rect.y && input.uv.y <= bottom;
-  let borderWidth = 0.008;
-  let border = inside && (
-    abs(input.uv.x - rect.x) < borderWidth ||
-    abs(input.uv.x - right) < borderWidth ||
-    abs(input.uv.y - rect.y) < borderWidth ||
-    abs(input.uv.y - bottom) < borderWidth
-  );
-
-  if (border) {
-    return vec4f(1.0, 0.84, 0.12, 1.0);
-  }
-
-  return vec4f(color.rgb, 1.0);
+  return drawMetadataOsd(input.uv, vec4f(color.rgb, 1.0));
 }
 `;
 
-function writeFirstOverlayRect(activeMetadata: TimedMetadataBatch[], target: Float32Array): void {
+function writeOverlayUniform(activeMetadata: TimedMetadataBatch[], target: Float32Array): void {
+  target.fill(0);
   let record: TimedMetadataRecord | undefined;
   for (const batch of activeMetadata) {
     record = batch.records[0];
@@ -1179,6 +1277,7 @@ function writeFirstOverlayRect(activeMetadata: TimedMetadataBatch[], target: Flo
     target[1] = -1;
     target[2] = 0;
     target[3] = 0;
+    target[4] = 0;
     return;
   }
 
@@ -1186,6 +1285,26 @@ function writeFirstOverlayRect(activeMetadata: TimedMetadataBatch[], target: Flo
   target[1] = parseNormalizedCoordinate(record.tags.y, 0.12);
   target[2] = parseNormalizedCoordinate(record.tags.w, 0.18);
   target[3] = parseNormalizedCoordinate(record.tags.h, 0.14);
+  const text = formatWebGpuOverlayText(record);
+  target[4] = 1;
+  target[5] = text.length;
+  for (let index = 0; index < text.length && index < OverlayTextMaxChars; index += 1) {
+    target[8 + index] = text.charCodeAt(index);
+  }
+}
+
+function formatWebGpuOverlayText(record: TimedMetadataRecord): string {
+  const resolution = record.tags.resolution ?? record.tags.sourceResolution ?? "";
+  const timestamp = record.tags.ptsMs
+    ?? record.tags.presentationTimestampMs
+    ?? (record.startTimestampUs > 0 ? String(Math.floor(record.startTimestampUs / 1000)) : "");
+  const normalizedResolution = resolution.replace(/[^\dXx]/g, "").toUpperCase();
+  const normalizedTimestamp = timestamp.replace(/[^\d-]/g, "");
+  const text = `OSD ${normalizedResolution || "0000X0000"} T${normalizedTimestamp || "0"}`;
+  return text
+    .toUpperCase()
+    .replace(/[^0-9A-Z -]/g, " ")
+    .slice(0, OverlayTextMaxChars);
 }
 
 function setCanvasDatasetValue(canvas: HTMLCanvasElement, name: string, value: string): void {
@@ -1200,31 +1319,81 @@ function deleteCanvasDatasetValue(canvas: HTMLCanvasElement, name: string): void
   }
 }
 
-function matrixFlushMode(): "microtask" | "timer" | "raf" {
+function readCanvasDatasetNumber(canvas: HTMLCanvasElement, name: string): number | undefined {
+  const value = canvas.dataset[name];
+  if (value === undefined) {
+    return undefined;
+  }
+
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+let cachedMatrixOptionsSearch: string | undefined;
+let cachedMatrixOptions: MatrixRuntimeOptions | undefined;
+
+function matrixRuntimeOptions(): MatrixRuntimeOptions {
   if (typeof window === "undefined") {
-    return "microtask";
+    return {
+      flushMode: "microtask",
+      presentMode: "immediate",
+      uploadMode: "auto",
+    };
   }
 
-  const mode = new URLSearchParams(window.location.search).get("matrixFlush")?.toLowerCase();
-  if (mode === "microtask" || mode === "raf" || mode === "timer") {
-    return mode;
+  const search = window.location.search;
+  if (cachedMatrixOptions && cachedMatrixOptionsSearch === search) {
+    return cachedMatrixOptions;
   }
 
-  return "microtask";
+  const params = new URLSearchParams(search);
+  cachedMatrixOptionsSearch = search;
+  cachedMatrixOptions = {
+    flushMode: normalizeMatrixFlushMode(params.get("matrixFlush")),
+    presentMode: normalizeMatrixPresentMode(params.get("matrixPresent")),
+    uploadMode: normalizeMatrixUploadMode(params.get("matrixTexture")),
+  };
+  return cachedMatrixOptions;
+}
+
+function matrixFlushMode(): MatrixFlushMode {
+  return matrixRuntimeOptions().flushMode;
 }
 
 function matrixVideoFrameUploadMode(): MatrixVideoFrameUploadMode {
-  if (typeof window === "undefined") {
-    return "auto";
-  }
+  return matrixRuntimeOptions().uploadMode;
+}
 
-  const mode = new URLSearchParams(window.location.search).get("matrixTexture")?.toLowerCase();
+function matrixPresentMode(): MatrixPresentMode {
+  return matrixRuntimeOptions().presentMode;
+}
+
+function normalizeMatrixFlushMode(value: string | null): MatrixFlushMode {
+  const mode = value?.toLowerCase();
+  return mode === "microtask" || mode === "raf" || mode === "timer" ? mode : "microtask";
+}
+
+function normalizeMatrixUploadMode(value: string | null): MatrixVideoFrameUploadMode {
+  const mode = value?.toLowerCase();
   if (mode === "copy" || mode === "retained" || mode === "videoframe-copy") {
     return "copy";
   }
 
   if (mode === "external" || mode === "direct" || mode === "zero-copy") {
     return "external";
+  }
+
+  return "auto";
+}
+
+function normalizeMatrixPresentMode(value: string | null): MatrixPresentMode {
+  const mode = value?.toLowerCase();
+  if (mode === "immediate" || mode === "direct") {
+    return "immediate";
+  }
+
+  if (mode === "raf" || mode === "animation-frame" || mode === "vsync") {
+    return "raf";
   }
 
   return "auto";
@@ -1410,7 +1579,7 @@ async function createWebGpuRenderState(
 
   const bufferUsage = getGpuBufferUsage();
   const overlayBuffer = runtime.device.createBuffer({
-    size: 16,
+    size: OverlayUniformByteLength,
     usage: bufferUsage.uniform | bufferUsage.copyDst,
   });
   const textureUsage = getGpuTextureUsage();
@@ -1439,7 +1608,7 @@ async function createWebGpuRenderState(
     format: runtime.format,
     outputTexture,
     overlayBuffer,
-    overlayUniform: new Float32Array(new ArrayBuffer(16)),
+    overlayUniform: new Float32Array(new ArrayBuffer(OverlayUniformByteLength)),
     adapterInfo,
   };
 }
@@ -1457,12 +1626,9 @@ async function renderFrameWithWebGpu(
     state.lastStep = step;
   };
 
-  const sourceWidth = (frame as { width?: number; displayWidth?: number }).width
-    ?? (frame as { displayWidth?: number }).displayWidth
-    ?? request.frame.width;
-  const sourceHeight = (frame as { height?: number; displayHeight?: number }).height
-    ?? (frame as { displayHeight?: number }).displayHeight
-    ?? request.frame.height;
+  const sourceDimensions = resolveVideoFrameDimensions(frame, request.frame.width, request.frame.height);
+  const sourceWidth = sourceDimensions.width;
+  const sourceHeight = sourceDimensions.height;
   const textureUsage = getGpuTextureUsage();
   const bufferUsage = getGpuBufferUsage();
   const nowMs = performance.now();
@@ -1522,7 +1688,7 @@ async function renderFrameWithWebGpu(
     sourceResource = sourceTexture.createView();
   }
 
-  writeFirstOverlayRect(request.activeMetadata, state.overlayUniform);
+  writeOverlayUniform(request.activeMetadata, state.overlayUniform);
   markStep("write-overlay-buffer");
   device.queue.writeBuffer(state.overlayBuffer, 0, state.overlayUniform);
 
@@ -2100,6 +2266,8 @@ function createWebCodecsConfiguration(
 }
 
 export class VideoDecodeCoordinator {
+  public constructor(private readonly onDecodedFramesAvailable?: () => void) {}
+
   private configuration?: VideoCodecConfiguration;
   private readonly queuedFrames: DecodedFramePlan[] = [];
   private readonly decodedFrames: DecodedFramePlan[] = [];
@@ -2204,6 +2372,7 @@ export class VideoDecodeCoordinator {
       height: this.configuration.codedHeight,
       decodeBackend: "synthetic-frame-plan",
     });
+    this.onDecodedFramesAvailable?.();
 
     return;
   }
@@ -2321,6 +2490,7 @@ export class VideoDecodeCoordinator {
       decodeBackend: "webcodecs",
       videoFrame: frame,
     });
+    this.onDecodedFramesAvailable?.();
   }
 
   private closeDecoder(): void {
@@ -2336,6 +2506,8 @@ export class VideoDecodeCoordinator {
 
 export class OverlayTimelineStore {
   private readonly batchesByStream = new Map<string, TimedMetadataBatch[]>();
+  private readonly retentionUs = 5_000_000;
+  private readonly maxBatchesPerStream = 512;
 
   /**
    * Planned flow: store metadata batches in a bounded timeline keyed by presentation time.
@@ -2344,8 +2516,25 @@ export class OverlayTimelineStore {
     batch: TimedMetadataBatch,
   ): Promise<void> {
     const existing = this.batchesByStream.get(batch.streamId) ?? [];
-    existing.push(batch);
-    existing.sort((left, right) => left.batchStartTimestampUs - right.batchStartTimestampUs);
+    const lastBatch = existing[existing.length - 1];
+    if (!lastBatch || lastBatch.batchStartTimestampUs <= batch.batchStartTimestampUs) {
+      existing.push(batch);
+    } else {
+      const insertIndex = existing.findIndex((candidate) => candidate.batchStartTimestampUs > batch.batchStartTimestampUs);
+      existing.splice(insertIndex < 0 ? existing.length : insertIndex, 0, batch);
+    }
+
+    const oldestAllowedTimestampUs = batch.batchEndTimestampUs - this.retentionUs;
+    while (
+      existing.length > 0
+      && (
+        (existing[0]?.batchEndTimestampUs ?? 0) < oldestAllowedTimestampUs
+        || existing.length > this.maxBatchesPerStream
+      )
+    ) {
+      existing.shift();
+    }
+
     this.batchesByStream.set(batch.streamId, existing);
     return Promise.resolve();
   }
@@ -2505,9 +2694,14 @@ type MatrixSlotFrameInfo = {
   height: number;
   gpuUploadSource: MatrixFrameUploadSource;
   videoFrame?: BrowserVideoFrameLike;
+  externalTexture?: unknown;
+  externalBindGroup?: unknown;
 };
 
-type MatrixExternalTextureCache = WeakMap<object, unknown>;
+type MatrixSlotDrawResult = {
+  drawnSlots: MatrixTileSlot[];
+  failedSlots: Array<{ slot: MatrixTileSlot; error: Error }>;
+};
 
 type WebGpuMatrixState = {
   canvas: HTMLCanvasElement;
@@ -2518,6 +2712,15 @@ type WebGpuMatrixState = {
   height: number;
   backingTexture?: MatrixSlotTexture;
   needsClear: boolean;
+  flushCount: number;
+  presentCount: number;
+  drawCount: number;
+  externalImportCount: number;
+  bindGroupCount: number;
+  videoFrameCopyCount: number;
+  lastDirtySlotCount: number;
+  lastPresentMode: MatrixPresentMode;
+  lastPresentPath: MatrixPresentPath;
 };
 
 const matrixCompositors = new Map<string, WebGpuMatrixCompositor>();
@@ -2536,12 +2739,15 @@ class WebGpuMatrixCompositor {
   private readonly slots = new Map<string, MatrixTileSlot>();
   private state?: WebGpuMatrixState;
   private configurePromise?: Promise<WebGpuMatrixState | undefined>;
+  private disabledReason?: string;
   private flushScheduled = false;
+  private presentScheduled = false;
   private layoutDirty = true;
   private resizeObserver?: ResizeObserver;
   private viewportListenersInstalled = false;
   private readonly closedFrames = new WeakSet<object>();
   private readonly retainedFrameRefs = new WeakMap<object, number>();
+  private readonly retainedExternalTextures = new WeakMap<object, unknown>();
 
   public constructor(private readonly matrixCanvasId: string) {
   }
@@ -2549,6 +2755,14 @@ class WebGpuMatrixCompositor {
   public async registerSurface(configuration: SurfaceConfigurationPlan): Promise<boolean> {
     const anchorCanvas = lookupCanvas(configuration.canvasId);
     if (!anchorCanvas) {
+      return false;
+    }
+
+    if (this.disabledReason) {
+      this.applyDisabledCanvasState(this.disabledReason);
+      anchorCanvas.dataset.gpuPresentation = "direct-webgpu-fallback";
+      anchorCanvas.dataset.webGpuDisabledReason = this.disabledReason;
+      anchorCanvas.dataset.matrixFallbackReason = this.disabledReason;
       return false;
     }
 
@@ -2604,7 +2818,53 @@ class WebGpuMatrixCompositor {
     this.scheduleFlush();
   }
 
+  public disable(error: unknown): void {
+    const reason = this.disabledReason ?? `matrix-disabled: ${this.formatError(error)}`;
+    this.disabledReason = reason;
+    this.applyDisabledCanvasState(reason);
+    if (this.slots.size === 0) {
+      return;
+    }
+
+    const pendingFrames = new WeakSet<object>();
+    for (const slot of this.slots.values()) {
+      const pendingFrame = slot.latestRequest?.frame.videoFrame;
+      if (pendingFrame && typeof pendingFrame === "object") {
+        pendingFrames.add(pendingFrame);
+      }
+    }
+
+    for (const slot of this.slots.values()) {
+      const currentFrame = slot.currentFrame?.videoFrame;
+      if (currentFrame && typeof currentFrame === "object" && !pendingFrames.has(currentFrame)) {
+        this.closeFrame(currentFrame);
+      }
+
+      slot.latestRequest = undefined;
+      slot.currentFrame = undefined;
+      slot.sourceTexture?.texture.destroy?.();
+      slot.sourceTexture = undefined;
+      slot.bindGroup = undefined;
+      slot.redrawNeeded = false;
+      setCanvasDatasetValue(slot.anchorCanvas, "gpuPresentation", "direct-webgpu-fallback");
+      setCanvasDatasetValue(slot.anchorCanvas, "webGpuDisabledReason", reason);
+      setCanvasDatasetValue(slot.anchorCanvas, "matrixFallbackReason", reason);
+      this.rejectPending(slot, new Error(reason));
+    }
+
+    this.state?.backingTexture?.texture.destroy?.();
+    if (this.state) {
+      this.state.backingTexture = undefined;
+      this.state.needsClear = true;
+    }
+  }
+
   public renderFrame(configuration: SurfaceConfigurationPlan, request: RenderFrameRequest): Promise<RenderFrameResult> {
+    if (this.disabledReason) {
+      this.applyDisabledCanvasState(this.disabledReason);
+      return Promise.reject(new Error(this.disabledReason));
+    }
+
     const slot = this.slots.get(configuration.canvasId);
     if (!slot) {
       return Promise.reject(new Error(`Matrix tile '${configuration.canvasId}' is not configured.`));
@@ -2623,6 +2883,11 @@ class WebGpuMatrixCompositor {
   }
 
   private scheduleFlush(): void {
+    if (this.disabledReason) {
+      this.applyDisabledCanvasState(this.disabledReason);
+      return;
+    }
+
     if (this.flushScheduled) {
       return;
     }
@@ -2704,16 +2969,32 @@ class WebGpuMatrixCompositor {
       height: 0,
       backingTexture: undefined,
       needsClear: true,
+      flushCount: 0,
+      presentCount: 0,
+      drawCount: 0,
+      externalImportCount: 0,
+      bindGroupCount: 0,
+      videoFrameCopyCount: 0,
+      lastDirtySlotCount: 0,
+      lastPresentMode: matrixPresentMode(),
+      lastPresentPath: "immediate",
     };
     this.installViewportListeners();
     this.observeLayout(canvas);
     this.resizeMatrixSurface(state, true);
+    this.writeMatrixGpuDataset(state);
     this.state = state;
     return state;
   }
 
   private async flush(): Promise<void> {
     this.flushScheduled = false;
+    if (this.disabledReason) {
+      this.applyDisabledCanvasState(this.disabledReason);
+      this.rejectAllPending(new Error(this.disabledReason));
+      return;
+    }
+
     const slots = [...this.slots.values()];
     const pendingSlots = slots.filter((slot) => slot.latestRequest);
     const hasRetainedFrames = slots.some((slot) => slot.currentFrame);
@@ -2732,7 +3013,11 @@ class WebGpuMatrixCompositor {
 
     this.resizeMatrixSurface(state);
     const device = state.runtime.device;
-    const updatedSlots: Array<{ slot: MatrixTileSlot; request: RenderFrameRequest }> = [];
+    const presentMode = matrixPresentMode();
+    const redrawAllSlots = state.needsClear || this.layoutDirty;
+    const presentImmediately = redrawAllSlots || this.shouldPresentImmediately(slots.length, presentMode);
+    state.flushCount += 1;
+    state.lastPresentMode = presentMode;
     const failedSlots: Array<{ slot: MatrixTileSlot; error: Error }> = [];
     const textureUsage = getGpuTextureUsage();
     const uploadMode = matrixVideoFrameUploadMode();
@@ -2750,12 +3035,9 @@ class WebGpuMatrixCompositor {
         continue;
       }
 
-      const sourceWidth = (frame as { width?: number; displayWidth?: number }).width
-        ?? (frame as { displayWidth?: number }).displayWidth
-        ?? request.frame.width;
-      const sourceHeight = (frame as { height?: number; displayHeight?: number }).height
-        ?? (frame as { displayHeight?: number }).displayHeight
-        ?? request.frame.height;
+      const sourceDimensions = resolveVideoFrameDimensions(frame, request.frame.width, request.frame.height);
+      const sourceWidth = sourceDimensions.width;
+      const sourceHeight = sourceDimensions.height;
       if (sourceWidth <= 0 || sourceHeight <= 0) {
         failedSlots.push({ slot, error: new Error("Matrix WebGPU compositor received an empty VideoFrame.") });
         continue;
@@ -2763,17 +3045,15 @@ class WebGpuMatrixCompositor {
 
       try {
         if (this.shouldUseExternalTexture(state, frame, uploadMode)) {
-          this.installExternalFrame(slot, request, frame, sourceWidth, sourceHeight);
+          this.installExternalFrame(slot, state, request, frame, sourceWidth, sourceHeight);
         } else {
           this.copyFrameToRetainedTexture(slot, state, textureUsage, request, frame, sourceWidth, sourceHeight);
         }
-        updatedSlots.push({ slot, request });
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        if (uploadMode !== "copy") {
+        if (uploadMode === "auto") {
           try {
             this.copyFrameToRetainedTexture(slot, state, textureUsage, request, frame, sourceWidth, sourceHeight);
-            updatedSlots.push({ slot, request });
             setCanvasDatasetValue(slot.anchorCanvas, "gpuExternalTextureError", message);
             continue;
           } catch (fallbackError) {
@@ -2787,80 +3067,148 @@ class WebGpuMatrixCompositor {
       }
     }
 
-    const redrawAllSlots = state.needsClear || this.layoutDirty;
-    const drawableSlots = slots.filter((slot) => slot.currentFrame && (redrawAllSlots || slot.redrawNeeded));
-    const externalTextureCache: MatrixExternalTextureCache = new WeakMap();
-    const commandEncoder = device.createCommandEncoder();
-    const backingTexture = this.ensureMatrixBackingTexture(state);
-    if (state.needsClear || drawableSlots.length > 0) {
-      const pass = commandEncoder.beginRenderPass({
-        colorAttachments: [
-          {
-            view: this.ensureTextureView(backingTexture),
-            clearValue: { r: 0, g: 0, b: 0, a: 0 },
-            loadOp: redrawAllSlots ? "clear" : "load",
-            storeOp: "store",
-          },
-        ],
-      });
-      for (const slot of drawableSlots) {
-        const frameInfo = slot.currentFrame;
-        if (!frameInfo) {
-          continue;
-        }
-
-        const viewport = this.resolveViewport(state, slot);
-        if (viewport.width <= 0 || viewport.height <= 0) {
-          failedSlots.push({ slot, error: new Error("Matrix WebGPU compositor tile viewport is empty.") });
-          continue;
-        }
-
-        this.ensureSlotGpuResources(slot, state);
-        if (!slot.overlayBuffer || !slot.overlayUniform) {
-          failedSlots.push({ slot, error: new Error("Matrix WebGPU tile overlay resources are unavailable.") });
-          continue;
-        }
-
-        writeFirstOverlayRect(frameInfo.activeMetadata, slot.overlayUniform);
-        device.queue.writeBuffer(slot.overlayBuffer, 0, slot.overlayUniform);
-        const drawResources = this.resolveSlotDrawResources(slot, state, frameInfo, externalTextureCache);
-        if (!drawResources) {
-          failedSlots.push({ slot, error: new Error("Matrix WebGPU tile draw resources are unavailable.") });
-          continue;
-        }
-
-        pass.setPipeline(drawResources.pipeline);
-        pass.setViewport?.(viewport.x, viewport.y, viewport.width, viewport.height, 0, 1);
-        pass.setScissorRect?.(
-          Math.max(0, Math.floor(viewport.x)),
-          Math.max(0, Math.floor(viewport.y)),
-          Math.max(1, Math.floor(viewport.width)),
-          Math.max(1, Math.floor(viewport.height)),
-        );
-        pass.setBindGroup(0, drawResources.bindGroup);
-        pass.draw(6);
-        slot.redrawNeeded = false;
-        this.writeAnchorGpuDataset(slot.anchorCanvas, state, frameInfo);
-
-        if (!slot.diagnosticSampleAttempted) {
-          slot.anchorCanvas.dataset.gpuSampleRgba = "1,1,1,255";
-          slot.diagnosticSampleAttempted = true;
-        }
+    if (!presentImmediately) {
+      state.lastPresentPath = "coalesced";
+      state.lastDirtySlotCount = this.countDrawableSlots(state, slots, redrawAllSlots);
+      this.writeMatrixGpuDataset(state);
+      this.writeAllAnchorMatrixCounters(state);
+      this.rejectFailedSlots(failedSlots);
+      this.resolveStagedSlots(state, pendingSlots);
+      if (state.needsClear || this.layoutDirty || slots.some((slot) => slot.redrawNeeded)) {
+        this.schedulePresent(state, presentMode);
       }
-
-      pass.end();
+      return;
     }
 
-    commandEncoder.copyTextureToTexture(
-      { texture: backingTexture.texture },
-      { texture: state.context.getCurrentTexture() },
-      { width: state.width, height: state.height, depthOrArrayLayers: 1 },
-    );
+    const commandEncoder = device.createCommandEncoder();
+    const backingTexture = this.ensureMatrixBackingTexture(state);
+    const drawResult = this.encodeDirtySlots(commandEncoder, state, slots, redrawAllSlots, backingTexture);
+    failedSlots.push(...drawResult.failedSlots);
+    if (presentImmediately) {
+      state.lastPresentPath = "immediate";
+      this.encodeMatrixPresent(commandEncoder, state, backingTexture);
+    }
     device.queue.submit([commandEncoder.finish()]);
     state.needsClear = false;
     this.layoutDirty = false;
+    this.writeMatrixGpuDataset(state);
+    this.writeAllAnchorMatrixCounters(state);
+    this.resolveDrawnSlots(drawResult.drawnSlots);
+    this.rejectFailedSlots(failedSlots);
+  }
 
-    for (const { slot, request } of updatedSlots) {
+  private countDrawableSlots(
+    state: WebGpuMatrixState,
+    slots: MatrixTileSlot[],
+    redrawAllSlots = state.needsClear || this.layoutDirty,
+  ): number {
+    return slots.filter((slot) => slot.currentFrame && (redrawAllSlots || slot.redrawNeeded)).length;
+  }
+
+  private encodeDirtySlots(
+    commandEncoder: WebGpuCommandEncoderLike,
+    state: WebGpuMatrixState,
+    slots: MatrixTileSlot[],
+    redrawAllSlots: boolean,
+    backingTexture: MatrixSlotTexture,
+  ): MatrixSlotDrawResult {
+    const drawableSlots = slots.filter((slot) => slot.currentFrame && (redrawAllSlots || slot.redrawNeeded));
+    state.lastDirtySlotCount = drawableSlots.length;
+    const drawnSlots: MatrixTileSlot[] = [];
+    const failedSlots: Array<{ slot: MatrixTileSlot; error: Error }> = [];
+    const uploadMode = matrixVideoFrameUploadMode();
+    const textureUsage = getGpuTextureUsage();
+    if (!state.needsClear && drawableSlots.length === 0) {
+      return { drawnSlots, failedSlots };
+    }
+
+    const pass = commandEncoder.beginRenderPass({
+      colorAttachments: [
+        {
+          view: this.ensureTextureView(backingTexture),
+          clearValue: { r: 0, g: 0, b: 0, a: 0 },
+          loadOp: redrawAllSlots ? "clear" : "load",
+          storeOp: "store",
+        },
+      ],
+    });
+    for (const slot of drawableSlots) {
+      const frameInfo = slot.currentFrame;
+      if (!frameInfo) {
+        continue;
+      }
+
+      const viewport = this.resolveViewport(state, slot);
+      if (viewport.width <= 0 || viewport.height <= 0) {
+        failedSlots.push({ slot, error: new Error("Matrix WebGPU compositor tile viewport is empty.") });
+        continue;
+      }
+
+      this.ensureSlotGpuResources(slot, state);
+      if (!slot.overlayBuffer || !slot.overlayUniform) {
+        failedSlots.push({ slot, error: new Error("Matrix WebGPU tile overlay resources are unavailable.") });
+        continue;
+      }
+
+      writeOverlayUniform(frameInfo.activeMetadata, slot.overlayUniform);
+      state.runtime.device.queue.writeBuffer(slot.overlayBuffer, 0, slot.overlayUniform);
+      let drawResources: { pipeline: unknown; bindGroup: unknown } | undefined;
+      try {
+        drawResources = this.resolveSlotDrawResources(slot, state, frameInfo);
+      } catch (error) {
+        if (uploadMode === "auto" && frameInfo.gpuUploadSource === "external-texture") {
+          const message = error instanceof Error ? error.message : String(error);
+          try {
+            this.copyCurrentExternalFrameToRetainedTexture(slot, state, textureUsage, frameInfo);
+            setCanvasDatasetValue(slot.anchorCanvas, "gpuExternalTextureError", message);
+            drawResources = this.resolveSlotDrawResources(slot, state, slot.currentFrame ?? frameInfo);
+          } catch (fallbackError) {
+            const fallbackMessage = fallbackError instanceof Error ? fallbackError.message : String(fallbackError);
+            failedSlots.push({ slot, error: new Error(`Matrix VideoFrame upload failed: ${message}; fallback failed: ${fallbackMessage}`) });
+            continue;
+          }
+        } else {
+          failedSlots.push({ slot, error: error instanceof Error ? error : new Error(String(error)) });
+          continue;
+        }
+      }
+      if (!drawResources) {
+        failedSlots.push({ slot, error: new Error("Matrix WebGPU tile draw resources are unavailable.") });
+        continue;
+      }
+
+      pass.setPipeline(drawResources.pipeline);
+      pass.setViewport?.(viewport.x, viewport.y, viewport.width, viewport.height, 0, 1);
+      pass.setScissorRect?.(
+        Math.max(0, Math.floor(viewport.x)),
+        Math.max(0, Math.floor(viewport.y)),
+        Math.max(1, Math.floor(viewport.width)),
+        Math.max(1, Math.floor(viewport.height)),
+      );
+      pass.setBindGroup(0, drawResources.bindGroup);
+      pass.draw(6);
+      state.drawCount += 1;
+      slot.redrawNeeded = false;
+      drawnSlots.push(slot);
+      this.writeAnchorGpuDataset(slot.anchorCanvas, state, frameInfo);
+
+      if (!slot.diagnosticSampleAttempted) {
+        slot.anchorCanvas.dataset.gpuSampleRgba = "1,1,1,255";
+        slot.diagnosticSampleAttempted = true;
+      }
+    }
+
+    pass.end();
+    return { drawnSlots, failedSlots };
+  }
+
+  private resolveDrawnSlots(slots: MatrixTileSlot[]): void {
+    for (const slot of slots) {
+      const request = slot.latestRequest;
+      if (!request) {
+        continue;
+      }
+
       this.resolvePending(slot, this.createResult(slot, request));
       if (slot.currentFrame?.videoFrame === request.frame.videoFrame) {
         slot.latestRequest = undefined;
@@ -2868,9 +3216,30 @@ class WebGpuMatrixCompositor {
         this.closeSlotFrame(slot);
       }
     }
+  }
 
+  private resolveStagedSlots(state: WebGpuMatrixState, slots: MatrixTileSlot[]): void {
+    for (const slot of slots) {
+      const request = slot.latestRequest;
+      const frameInfo = slot.currentFrame;
+      if (!request || !frameInfo) {
+        continue;
+      }
+
+      this.writeAnchorGpuDataset(slot.anchorCanvas, state, frameInfo);
+      this.resolvePending(slot, this.createResult(slot, request));
+      if (frameInfo.gpuUploadSource === "videoframe-copy") {
+        this.closeSlotFrame(slot);
+      } else if (frameInfo.videoFrame === request.frame.videoFrame) {
+        slot.latestRequest = undefined;
+      } else {
+        this.closeSlotFrame(slot);
+      }
+    }
+  }
+
+  private rejectFailedSlots(failedSlots: Array<{ slot: MatrixTileSlot; error: Error }>): void {
     for (const { slot, error } of failedSlots) {
-      this.closeSlotFrame(slot);
       this.rejectPending(slot, error);
     }
   }
@@ -2894,11 +3263,17 @@ class WebGpuMatrixCompositor {
 
   private installExternalFrame(
     slot: MatrixTileSlot,
+    state: WebGpuMatrixState,
     request: RenderFrameRequest,
     frame: BrowserVideoFrameLike,
     width: number,
     height: number,
   ): void {
+    const externalTexture = this.resolveExternalTexture(state, frame);
+    if (!externalTexture) {
+      throw new Error("Matrix WebGPU external texture is unavailable.");
+    }
+
     this.closeSlotCurrentFrame(slot);
     slot.sourceTexture?.texture.destroy?.();
     slot.sourceTexture = undefined;
@@ -2912,10 +3287,44 @@ class WebGpuMatrixCompositor {
       height,
       gpuUploadSource: "external-texture",
       videoFrame: frame,
+      externalTexture,
     };
     slot.redrawNeeded = true;
     this.retainFrame(frame);
     deleteCanvasDatasetValue(slot.anchorCanvas, "gpuExternalTextureError");
+  }
+
+  private copyCurrentExternalFrameToRetainedTexture(
+    slot: MatrixTileSlot,
+    state: WebGpuMatrixState,
+    textureUsage: { textureBinding: number; copyDst: number; renderAttachment: number },
+    frameInfo: MatrixSlotFrameInfo,
+  ): void {
+    const frame = frameInfo.videoFrame;
+    if (!frame) {
+      throw new Error("Matrix WebGPU external fallback requires a VideoFrame.");
+    }
+
+    this.ensureSlotSourceTexture(slot, state, textureUsage, frameInfo.width, frameInfo.height);
+    if (!slot.sourceTexture) {
+      throw new Error("Matrix WebGPU fallback source texture is unavailable.");
+    }
+
+    state.runtime.device.queue.copyExternalImageToTexture(
+      { source: frame },
+      { texture: slot.sourceTexture.texture },
+      { width: frameInfo.width, height: frameInfo.height },
+    );
+    state.videoFrameCopyCount += 1;
+    this.releaseFrame(frame);
+    slot.currentFrame = {
+      ...frameInfo,
+      gpuUploadSource: "videoframe-copy",
+      videoFrame: undefined,
+      externalTexture: undefined,
+      externalBindGroup: undefined,
+    };
+    slot.bindGroup = undefined;
   }
 
   private copyFrameToRetainedTexture(
@@ -2938,6 +3347,7 @@ class WebGpuMatrixCompositor {
       { texture: slot.sourceTexture.texture },
       { width, height },
     );
+    state.videoFrameCopyCount += 1;
     slot.currentFrame = {
       sessionId: request.sessionId,
       sequenceNumber: request.frame.sequenceNumber,
@@ -2954,7 +3364,6 @@ class WebGpuMatrixCompositor {
     slot: MatrixTileSlot,
     state: WebGpuMatrixState,
     frameInfo: MatrixSlotFrameInfo,
-    externalTextureCache: MatrixExternalTextureCache,
   ): { pipeline: unknown; bindGroup: unknown } | undefined {
     if (frameInfo.gpuUploadSource === "external-texture") {
       const frame = frameInfo.videoFrame;
@@ -2963,32 +3372,15 @@ class WebGpuMatrixCompositor {
         return undefined;
       }
 
-      const externalTexture = this.resolveExternalTexture(state, frame, externalTextureCache);
+      const externalTexture = frameInfo.externalTexture ?? this.resolveExternalTexture(state, frame);
       if (!externalTexture) {
         return undefined;
       }
 
+      frameInfo.externalBindGroup ??= this.createSlotBindGroup(state, pipeline, externalTexture, slot.overlayBuffer);
       return {
         pipeline,
-        bindGroup: state.runtime.device.createBindGroup({
-          layout: (pipeline as { getBindGroupLayout?: (index: number) => unknown }).getBindGroupLayout?.(0),
-          entries: [
-            {
-              binding: 0,
-              resource: externalTexture,
-            },
-            {
-              binding: 1,
-              resource: state.runtime.sampler,
-            },
-            {
-              binding: 2,
-              resource: {
-                buffer: slot.overlayBuffer,
-              },
-            },
-          ],
-        }),
+        bindGroup: frameInfo.externalBindGroup,
       };
     }
 
@@ -3002,19 +3394,47 @@ class WebGpuMatrixCompositor {
     };
   }
 
+  private createSlotBindGroup(
+    state: WebGpuMatrixState,
+    pipeline: unknown,
+    textureResource: unknown,
+    overlayBuffer: WebGpuBufferLike | undefined,
+  ): unknown {
+    state.bindGroupCount += 1;
+    return state.runtime.device.createBindGroup({
+      layout: (pipeline as { getBindGroupLayout?: (index: number) => unknown }).getBindGroupLayout?.(0),
+      entries: [
+        {
+          binding: 0,
+          resource: textureResource,
+        },
+        {
+          binding: 1,
+          resource: state.runtime.sampler,
+        },
+        {
+          binding: 2,
+          resource: {
+            buffer: overlayBuffer,
+          },
+        },
+      ],
+    });
+  }
+
   private resolveExternalTexture(
     state: WebGpuMatrixState,
     frame: BrowserVideoFrameLike,
-    externalTextureCache: MatrixExternalTextureCache,
   ): unknown {
-    const cachedTexture = externalTextureCache.get(frame);
+    const cachedTexture = this.retainedExternalTextures.get(frame);
     if (cachedTexture) {
       return cachedTexture;
     }
 
     const externalTexture = state.runtime.device.importExternalTexture?.({ source: frame });
     if (externalTexture) {
-      externalTextureCache.set(frame, externalTexture);
+      state.externalImportCount += 1;
+      this.retainedExternalTextures.set(frame, externalTexture);
     }
 
     return externalTexture;
@@ -3028,14 +3448,14 @@ class WebGpuMatrixCompositor {
     if (!slot.overlayBuffer) {
       const bufferUsage = getGpuBufferUsage();
       slot.overlayBuffer = state.runtime.device.createBuffer({
-        size: 16,
+        size: OverlayUniformByteLength,
         usage: bufferUsage.uniform | bufferUsage.copyDst,
       });
       slot.bindGroup = undefined;
     }
 
     if (!slot.overlayUniform) {
-      slot.overlayUniform = new Float32Array(new ArrayBuffer(16));
+      slot.overlayUniform = new Float32Array(new ArrayBuffer(OverlayUniformByteLength));
     }
   }
 
@@ -3087,6 +3507,92 @@ class WebGpuMatrixCompositor {
     return state.backingTexture;
   }
 
+  private shouldPresentImmediately(slotCount: number, mode = matrixPresentMode()): boolean {
+    if (mode === "immediate") {
+      return true;
+    }
+
+    if (mode === "raf") {
+      return false;
+    }
+
+    return slotCount <= 1 || typeof globalThis.requestAnimationFrame !== "function";
+  }
+
+  private schedulePresent(state: WebGpuMatrixState, mode: MatrixPresentMode): void {
+    if (this.disabledReason) {
+      this.applyDisabledCanvasState(this.disabledReason);
+      return;
+    }
+
+    if (this.presentScheduled) {
+      return;
+    }
+
+    this.presentScheduled = true;
+    let presented = false;
+    let fallbackHandle: ReturnType<typeof setTimeout> | undefined;
+    const present = (): void => {
+      if (presented) {
+        return;
+      }
+
+      presented = true;
+      if (fallbackHandle !== undefined) {
+        clearTimeout(fallbackHandle);
+      }
+
+      this.presentScheduled = false;
+      try {
+        this.presentMatrix(state);
+      } catch (error) {
+        setCanvasDatasetValue(state.canvas, "webGpuError", "matrix-present-failed");
+        this.disable(error);
+      }
+    };
+
+    if (typeof globalThis.requestAnimationFrame === "function") {
+      globalThis.requestAnimationFrame(present);
+      if (mode === "auto") {
+        fallbackHandle = globalThis.setTimeout(present, MatrixAutoPresentFallbackMs);
+      }
+      return;
+    }
+
+    globalThis.setTimeout(present, 0);
+  }
+
+  private presentMatrix(state: WebGpuMatrixState): void {
+    this.resizeMatrixSurface(state);
+    const slots = [...this.slots.values()];
+    const redrawAllSlots = state.needsClear || this.layoutDirty;
+    const backingTexture = this.ensureMatrixBackingTexture(state);
+    const commandEncoder = state.runtime.device.createCommandEncoder();
+    state.lastPresentPath = "coalesced";
+    const drawResult = this.encodeDirtySlots(commandEncoder, state, slots, redrawAllSlots, backingTexture);
+    this.encodeMatrixPresent(commandEncoder, state, backingTexture);
+    state.runtime.device.queue.submit([commandEncoder.finish()]);
+    state.needsClear = false;
+    this.layoutDirty = false;
+    this.writeMatrixGpuDataset(state);
+    this.writeAllAnchorMatrixCounters(state);
+    this.resolveDrawnSlots(drawResult.drawnSlots);
+    this.rejectFailedSlots(drawResult.failedSlots);
+  }
+
+  private encodeMatrixPresent(
+    commandEncoder: WebGpuCommandEncoderLike,
+    state: WebGpuMatrixState,
+    backingTexture: MatrixSlotTexture,
+  ): void {
+    state.presentCount += 1;
+    commandEncoder.copyTextureToTexture(
+      { texture: backingTexture.texture },
+      { texture: state.context.getCurrentTexture() },
+      { width: state.width, height: state.height, depthOrArrayLayers: 1 },
+    );
+  }
+
   private ensureTextureView(texture: MatrixSlotTexture): unknown {
     texture.view ??= texture.texture.createView();
     return texture.view;
@@ -3102,29 +3608,16 @@ class WebGpuMatrixCompositor {
     }
 
     sourceTexture.view ??= sourceTexture.texture.createView();
-    slot.bindGroup = state.runtime.device.createBindGroup({
-      layout: (state.runtime.pipeline as { getBindGroupLayout?: (index: number) => unknown }).getBindGroupLayout?.(0),
-      entries: [
-        {
-          binding: 0,
-          resource: sourceTexture.view,
-        },
-        {
-          binding: 1,
-          resource: state.runtime.sampler,
-        },
-        {
-          binding: 2,
-          resource: {
-            buffer: slot.overlayBuffer,
-          },
-        },
-      ],
-    });
+    slot.bindGroup = this.createSlotBindGroup(state, state.runtime.pipeline, sourceTexture.view, slot.overlayBuffer);
     return slot.bindGroup;
   }
 
   private resizeMatrixSurface(state: WebGpuMatrixState, forceConfigure = false): void {
+    if (this.disabledReason) {
+      this.applyDisabledCanvasState(this.disabledReason);
+      return;
+    }
+
     const rect = state.canvas.getBoundingClientRect();
     const pixelRatio = Math.max(1, Math.min(2, globalThis.devicePixelRatio || 1));
     const width = Math.max(1, Math.round(rect.width * pixelRatio));
@@ -3224,6 +3717,7 @@ class WebGpuMatrixCompositor {
     }
 
     setCanvasDatasetValue(canvas, "renderBackend", "webgpu");
+    this.writeAnchorMatrixCounters(canvas, state);
     setCanvasDatasetValue(canvas, "gpuPresentation", "webgpu-canvas");
     setCanvasDatasetValue(canvas, "gpuUploadSource", frame?.gpuUploadSource ?? "pending");
     setCanvasDatasetValue(canvas, "gpuAdapterVendor", state.adapterInfo?.vendor ?? "");
@@ -3233,12 +3727,58 @@ class WebGpuMatrixCompositor {
     deleteCanvasDatasetValue(canvas, "webGpuDisabledReason");
   }
 
+  private writeAllAnchorMatrixCounters(state: WebGpuMatrixState): void {
+    for (const slot of this.slots.values()) {
+      this.writeAnchorMatrixCounters(slot.anchorCanvas, state);
+    }
+  }
+
+  private writeAnchorMatrixCounters(canvas: HTMLCanvasElement, state: WebGpuMatrixState): void {
+    setCanvasDatasetValue(canvas, "matrixPresentMode", state.lastPresentMode);
+    setCanvasDatasetValue(canvas, "matrixPresentPath", state.lastPresentPath);
+    setCanvasDatasetValue(canvas, "matrixFlushCount", String(state.flushCount));
+    setCanvasDatasetValue(canvas, "matrixPresentCount", String(state.presentCount));
+    setCanvasDatasetValue(canvas, "matrixDrawCount", String(state.drawCount));
+    setCanvasDatasetValue(canvas, "matrixExternalImportCount", String(state.externalImportCount));
+    setCanvasDatasetValue(canvas, "matrixBindGroupCount", String(state.bindGroupCount));
+    setCanvasDatasetValue(canvas, "matrixVideoFrameCopyCount", String(state.videoFrameCopyCount));
+    setCanvasDatasetValue(canvas, "matrixLastDirtySlotCount", String(state.lastDirtySlotCount));
+  }
+
+  private writeMatrixGpuDataset(state: WebGpuMatrixState): void {
+    const canvas = state.canvas;
+    setCanvasDatasetValue(canvas, "renderBackend", "webgpu");
+    setCanvasDatasetValue(canvas, "matrixPresentMode", state.lastPresentMode);
+    setCanvasDatasetValue(canvas, "matrixPresentPath", state.lastPresentPath);
+    setCanvasDatasetValue(canvas, "matrixFlushCount", String(state.flushCount));
+    setCanvasDatasetValue(canvas, "matrixPresentCount", String(state.presentCount));
+    setCanvasDatasetValue(canvas, "matrixDrawCount", String(state.drawCount));
+    setCanvasDatasetValue(canvas, "matrixExternalImportCount", String(state.externalImportCount));
+    setCanvasDatasetValue(canvas, "matrixBindGroupCount", String(state.bindGroupCount));
+    setCanvasDatasetValue(canvas, "matrixVideoFrameCopyCount", String(state.videoFrameCopyCount));
+    setCanvasDatasetValue(canvas, "matrixLastDirtySlotCount", String(state.lastDirtySlotCount));
+    setCanvasDatasetValue(canvas, "matrixSlotCount", String(this.slots.size));
+    setCanvasDatasetValue(canvas, "gpuPresentation", "webgpu-canvas");
+    setCanvasDatasetValue(canvas, "gpuAdapterVendor", state.adapterInfo?.vendor ?? "");
+    setCanvasDatasetValue(canvas, "gpuAdapterArchitecture", state.adapterInfo?.architecture ?? "");
+    deleteCanvasDatasetValue(canvas, "webGpuDisabledReason");
+  }
+
   private createResult(slot: MatrixTileSlot, request: RenderFrameRequest): RenderFrameResult {
     const result: RenderFrameResult = {
       sessionId: request.sessionId,
       renderedSequenceNumber: request.frame.sequenceNumber,
       overlayPrimitiveCount: countOverlayPrimitives(request.activeMetadata),
       renderBackend: "webgpu",
+      matrixPresentMode: slot.anchorCanvas.dataset.matrixPresentMode,
+      matrixPresentPath: slot.anchorCanvas.dataset.matrixPresentPath,
+      matrixFlushCount: readCanvasDatasetNumber(slot.anchorCanvas, "matrixFlushCount"),
+      matrixPresentCount: readCanvasDatasetNumber(slot.anchorCanvas, "matrixPresentCount"),
+      matrixDrawCount: readCanvasDatasetNumber(slot.anchorCanvas, "matrixDrawCount"),
+      matrixExternalImportCount: readCanvasDatasetNumber(slot.anchorCanvas, "matrixExternalImportCount"),
+      matrixBindGroupCount: readCanvasDatasetNumber(slot.anchorCanvas, "matrixBindGroupCount"),
+      matrixVideoFrameCopyCount: readCanvasDatasetNumber(slot.anchorCanvas, "matrixVideoFrameCopyCount"),
+      matrixLastDirtySlotCount: readCanvasDatasetNumber(slot.anchorCanvas, "matrixLastDirtySlotCount"),
       gpuPresentation: slot.anchorCanvas.dataset.gpuPresentation,
       gpuUploadSource: slot.anchorCanvas.dataset.gpuUploadSource,
       gpuAdapterVendor: slot.anchorCanvas.dataset.gpuAdapterVendor,
@@ -3251,6 +3791,9 @@ class WebGpuMatrixCompositor {
 
     if (slot.anchorCanvas.dataset.webGpuDisabledReason) {
       result.webGpuDisabledReason = slot.anchorCanvas.dataset.webGpuDisabledReason;
+    }
+    if (slot.anchorCanvas.dataset.matrixFallbackReason) {
+      result.matrixFallbackReason = slot.anchorCanvas.dataset.matrixFallbackReason;
     }
 
     return result;
@@ -3317,6 +3860,23 @@ class WebGpuMatrixCompositor {
     this.closedFrames.add(frame);
     (frame as BrowserVideoFrameLike).close?.();
   }
+
+  private applyDisabledCanvasState(reason: string): void {
+    const matrixCanvas = this.state?.canvas ?? lookupCanvas(this.matrixCanvasId);
+    if (!matrixCanvas) {
+      return;
+    }
+
+    matrixCanvas.hidden = true;
+    matrixCanvas.style.display = "none";
+    setCanvasDatasetValue(matrixCanvas, "webGpuDisabledReason", reason);
+    setCanvasDatasetValue(matrixCanvas, "webGpuError", reason);
+    setCanvasDatasetValue(matrixCanvas, "matrixFallbackReason", reason);
+  }
+
+  private formatError(error: unknown): string {
+    return error instanceof Error ? error.message : String(error);
+  }
 }
 
 export class WebGpuMatrixTileRenderer {
@@ -3347,8 +3907,16 @@ export class WebGpuMatrixTileRenderer {
     if (this.matrixEnabled) {
       try {
         return await this.compositor.renderFrame(this.configuredSurface, request);
-      } catch {
+      } catch (error) {
         this.matrixEnabled = false;
+        this.compositor.disable(error);
+        const canvas = lookupCanvas(this.configuredSurface.canvasId);
+        if (canvas) {
+          const message = error instanceof Error ? error.message : String(error);
+          setCanvasDatasetValue(canvas, "matrixFallbackReason", message);
+          setCanvasDatasetValue(canvas, "webGpuError", `matrix-fallback: ${message}`);
+        }
+
         await this.fallbackRenderer.configureSurface(this.configuredSurface);
       }
     }
@@ -3429,7 +3997,7 @@ export class WebGpuRenderer {
     const result: RenderFrameResult = {
       sessionId: request.sessionId,
       renderedSequenceNumber: request.frame.sequenceNumber,
-      overlayPrimitiveCount: countOverlayPrimitives(request.activeMetadata),
+      overlayPrimitiveCount: renderBackend === "webgpu" ? countOverlayPrimitives(request.activeMetadata) : 0,
       renderBackend,
     };
     if (canvas) {
@@ -3450,6 +4018,9 @@ export class WebGpuRenderer {
       }
       if (canvas.dataset.webGpuDisabledReason) {
         result.webGpuDisabledReason = canvas.dataset.webGpuDisabledReason;
+      }
+      if (canvas.dataset.matrixFallbackReason) {
+        result.matrixFallbackReason = canvas.dataset.matrixFallbackReason;
       }
     }
 

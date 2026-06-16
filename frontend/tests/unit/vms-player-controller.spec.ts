@@ -4,6 +4,11 @@ import {
   AdaptiveRenderCadence,
   AdaptiveRenderFrameGovernor,
   LiveDecodedFrameQueue,
+  resolveAdaptiveRenderDurationPressureSeverity,
+  resolveLiveDecodeBacklogBudgetFrames,
+  resolveLiveHardDecodeBacklogFrames,
+  resolveLiveRenderQueueBudgetFrames,
+  resolveLiveStaleFrameDropThresholdMs,
   resolveEffectiveRenderFrameRate,
   resolveEffectiveSourceEgressFrameRate,
   resolveEffectiveSourceFrameRate,
@@ -14,7 +19,10 @@ import {
   shouldUseWorkerVideoDecoder,
   WorkerVideoDecodeCoordinator,
 } from "../../src/video-pipe/workerVideoDecodeCoordinator";
-import { shouldUseWorkerMediaPipeline } from "../../src/video-pipe/workerMediaPipelineClient";
+import {
+  shouldUseWorkerMediaPipeline,
+  WorkerMediaPipelineClient,
+} from "../../src/video-pipe/workerMediaPipelineClient";
 
 describe("VMS player controller", () => {
   it("keeps decoded burst frames for the render pump instead of dropping them immediately", () => {
@@ -170,6 +178,50 @@ describe("VMS player controller", () => {
     })).toBe(24);
   });
 
+  it("does not treat normal offscreen WebGPU render completion latency as adaptive pressure", () => {
+    const sixtyFpsIntervalMs = 1000 / 60;
+
+    expect(resolveAdaptiveRenderDurationPressureSeverity(27, sixtyFpsIntervalMs)).toBe(0);
+    expect(resolveAdaptiveRenderDurationPressureSeverity(51, sixtyFpsIntervalMs)).toBe(1);
+    expect(resolveAdaptiveRenderDurationPressureSeverity(101, sixtyFpsIntervalMs)).toBe(2);
+  });
+
+  it("keeps live decode admission tied to latency instead of building a hidden DVR buffer", () => {
+    expect(resolveLiveStaleFrameDropThresholdMs(150)).toBe(900);
+    expect(resolveLiveDecodeBacklogBudgetFrames({
+      frameRate: 60,
+      maxFrames: 12,
+      targetLatencyMs: 150,
+    })).toBe(9);
+    expect(resolveLiveHardDecodeBacklogFrames({
+      frameRate: 60,
+      maxFrames: 12,
+      targetLatencyMs: 150,
+    })).toBe(12);
+    expect(resolveLiveHardDecodeBacklogFrames({
+      frameRate: 30,
+      maxFrames: 12,
+      targetLatencyMs: 150,
+    })).toBe(9);
+    expect(resolveLiveHardDecodeBacklogFrames({
+      maxFrames: 12,
+      targetLatencyMs: 150,
+    })).toBeLessThanOrEqual(9);
+  });
+
+  it("keeps the render queue budget inside the live latency target", () => {
+    expect(resolveLiveRenderQueueBudgetFrames({
+      frameRate: 60,
+      maxFrames: 8,
+      targetLatencyMs: 150,
+    })).toBe(8);
+    expect(resolveLiveRenderQueueBudgetFrames({
+      frameRate: 30,
+      maxFrames: 8,
+      targetLatencyMs: 150,
+    })).toBe(5);
+  });
+
   it("keeps worker decode opt-in until browser transfer is proven stable", () => {
     const workerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
     const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
@@ -207,7 +259,7 @@ describe("VMS player controller", () => {
     }
   });
 
-  it("keeps full media-pipeline worker opt-in until benchmarks prove it wins", () => {
+  it("uses the full media-pipeline worker by default and keeps an escape hatch", () => {
     const workerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
     const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
     Object.defineProperty(globalThis, "Worker", {
@@ -224,6 +276,8 @@ describe("VMS player controller", () => {
     });
 
     try {
+      expect(shouldUseWorkerMediaPipeline()).toBe(true);
+      (globalThis.window as unknown as { location: { search: string } }).location.search = "?mediaWorker=0";
       expect(shouldUseWorkerMediaPipeline()).toBe(false);
       (globalThis.window as unknown as { location: { search: string } }).location.search = "?mediaWorker=1";
       expect(shouldUseWorkerMediaPipeline()).toBe(true);
@@ -329,6 +383,157 @@ describe("VMS player controller", () => {
     }
   });
 
+  it("times out a hung worker decoder request so the player can fall back", async () => {
+    vi.useFakeTimers();
+    const workerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+    const postedMessages: unknown[] = [];
+
+    class HungWorker {
+      public onmessage?: (event: MessageEvent) => void;
+      public onerror?: (event: ErrorEvent) => void;
+      public onmessageerror?: (event: MessageEvent) => void;
+
+      public postMessage(message: unknown): void {
+        postedMessages.push(message);
+      }
+
+      public terminate(): void {
+        postedMessages.push({ type: "terminated" });
+      }
+    }
+
+    Object.defineProperty(globalThis, "Worker", {
+      configurable: true,
+      value: HungWorker,
+    });
+
+    try {
+      const decoder = new WorkerVideoDecodeCoordinator(undefined, { requestTimeoutMs: 25 });
+      const configure = decoder.configureDecoder({
+        codec: "avc1.42C01F",
+        codedWidth: 1280,
+        codedHeight: 720,
+      });
+      const rejected = expect(configure).rejects.toThrow("timed out");
+
+      await vi.advanceTimersByTimeAsync(25);
+      await rejected;
+      expect(postedMessages).toHaveLength(1);
+      decoder.dispose();
+    } finally {
+      vi.useRealTimers();
+      if (workerDescriptor) {
+        Object.defineProperty(globalThis, "Worker", workerDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "Worker");
+      }
+    }
+  });
+
+  it("rejects media-worker startup when no decoded frame arrives", async () => {
+    vi.useFakeTimers();
+    const workerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+    const postedMessages: unknown[] = [];
+
+    class HungWorker {
+      public onmessage?: (event: MessageEvent) => void;
+      public onerror?: (event: ErrorEvent) => void;
+      public onmessageerror?: (event: MessageEvent) => void;
+
+      public postMessage(message: unknown): void {
+        postedMessages.push(message);
+      }
+
+      public terminate(): void {
+        postedMessages.push({ type: "terminated" });
+      }
+    }
+
+    Object.defineProperty(globalThis, "Worker", {
+      configurable: true,
+      value: HungWorker,
+    });
+
+    try {
+      const client = new WorkerMediaPipelineClient(() => undefined, { startupTimeoutMs: 50 });
+      const abortController = new AbortController();
+      const started = client.start(
+        {
+          channelId: "channel-001",
+          streamId: "camera-001",
+          webTransportUrl: "https://127.0.0.1:9443/live/channel-001",
+          authToken: "test-token",
+          metadataChannelRequired: true,
+          requestedTransport: "webtransport-quic",
+          allowHttpFallback: false,
+        },
+        {
+          codec: "avc1.42C01F",
+          codedWidth: 1280,
+          codedHeight: 720,
+        },
+        250,
+        abortController.signal,
+      );
+      const rejected = expect(started).rejects.toThrow("did not decode a frame");
+
+      await vi.advanceTimersByTimeAsync(50);
+      await rejected;
+      expect(postedMessages.some((message) => {
+        return typeof message === "object"
+          && message !== null
+          && (message as { type?: string }).type === "terminated";
+      })).toBe(true);
+    } finally {
+      vi.useRealTimers();
+      if (workerDescriptor) {
+        Object.defineProperty(globalThis, "Worker", workerDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "Worker");
+      }
+    }
+  });
+
+  it("sends metadata toggle changes to the media worker", () => {
+    const workerDescriptor = Object.getOwnPropertyDescriptor(globalThis, "Worker");
+    const postedMessages: unknown[] = [];
+
+    class ToggleWorker {
+      public onmessage?: (event: MessageEvent) => void;
+      public onerror?: (event: ErrorEvent) => void;
+      public onmessageerror?: (event: MessageEvent) => void;
+
+      public postMessage(message: unknown): void {
+        postedMessages.push(message);
+      }
+
+      public terminate(): void {
+        postedMessages.push({ type: "terminated" });
+      }
+    }
+
+    Object.defineProperty(globalThis, "Worker", {
+      configurable: true,
+      value: ToggleWorker,
+    });
+
+    try {
+      const client = new WorkerMediaPipelineClient(() => undefined);
+      client.setMetadataEnabled(false);
+      client.setMetadataEnabled(true);
+      client.dispose();
+
+      expect(postedMessages).toContainEqual({ type: "set-metadata-enabled", enabled: false });
+      expect(postedMessages).toContainEqual({ type: "set-metadata-enabled", enabled: true });
+    } finally {
+      if (workerDescriptor) {
+        Object.defineProperty(globalThis, "Worker", workerDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "Worker");
+      }
+    }
+  });
+
   it("does not cap high-fps sources unless a render cap is configured", () => {
     expect(resolveEffectiveRenderFrameRate(60, {})).toBeUndefined();
   });
@@ -363,30 +568,30 @@ describe("VMS player controller", () => {
 
     governor.recordPressure(1, 100);
     expect(governor.resolveFrameRateLimit(60, undefined, 200)).toEqual({
-      frameRateLimit: 50,
+      frameRateLimit: 60,
       pressureLevel: 1,
     });
 
-    governor.recordPressure(2, 900);
-    expect(governor.resolveFrameRateLimit(60, undefined, 1_000)).toEqual({
-      frameRateLimit: 30,
+    governor.recordPressure(2, 1_400);
+    expect(governor.resolveFrameRateLimit(60, undefined, 1_500)).toEqual({
+      frameRateLimit: 45,
       pressureLevel: 3,
     });
 
     expect(governor.resolveFrameRateLimit(60, undefined, 3_800)).toEqual({
-      frameRateLimit: 30,
+      frameRateLimit: 45,
       pressureLevel: 3,
     });
     expect(governor.resolveFrameRateLimit(60, undefined, 4_100)).toEqual({
-      frameRateLimit: 30,
-      pressureLevel: 3,
-    });
-    expect(governor.resolveFrameRateLimit(60, undefined, 15_800)).toEqual({
-      frameRateLimit: 30,
-      pressureLevel: 3,
-    });
-    expect(governor.resolveFrameRateLimit(60, undefined, 15_950)).toEqual({
       frameRateLimit: 45,
+      pressureLevel: 3,
+    });
+    expect(governor.resolveFrameRateLimit(60, undefined, 7_300)).toEqual({
+      frameRateLimit: 45,
+      pressureLevel: 3,
+    });
+    expect(governor.resolveFrameRateLimit(60, undefined, 7_500)).toEqual({
+      frameRateLimit: 50,
       pressureLevel: 2,
     });
   });
@@ -398,7 +603,7 @@ describe("VMS player controller", () => {
     governor.recordPressure(1, 1_400);
     expect(governor.resolveFrameRateLimit(15, undefined, 1_500)).toEqual({
       frameRateLimit: 15,
-      pressureLevel: 2,
+      pressureLevel: 1,
     });
   });
 

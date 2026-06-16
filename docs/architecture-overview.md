@@ -84,12 +84,12 @@ Current baseline:
 - the React VMS client fetches the channel catalog, lets users add and close channel tiles, and keeps active tiles playing through one long-lived WebTransport/WebCodecs session per unique channel, with duplicate views mirrored into separate tile viewports.
 - the frontend live media path is isolated in `frontend/src/video-pipe`: the app supplies channel groups, tile IDs, and the WebTransport-backed channel catalog, while the pipe owns transport receive, WebCodecs decode, bounded live queues, shared WebGPU viewport rendering, and timing metrics.
 - WebCodecs decode currently defaults to the stable main-thread media pipeline. A Dedicated Worker decoder path exists behind `?decodeWorker=1`, and a fuller worker-owned WebTransport/parse/decode path exists behind `?mediaWorker=1`. Both have opt-in coverage, but neither is the production default until benchmarks beat the main-thread path on latency, smoothness, drops, and task load.
-- the local launcher publishes 720p, 1080p, 4K, and 4K60 stress RTSP sources by default for browser stress testing.
+- the local launcher publishes 1080p, 4K, and 4K60 stress RTSP sources by default for browser stress testing.
 - headed Chrome with Linux Vulkan/ANGLE WebGPU flags uses the hardware adapter path: WebCodecs `VideoFrame` -> WebGPU external texture -> WebGPU canvas presentation.
 - VMS tiles share one page-level WebGPU adapter/device/pipeline runtime and size each tile surface to its visible display area instead of blindly rendering every tile at native camera resolution.
 - the VMS matrix compositor now defaults to direct `GPUExternalTexture` imports from WebCodecs `VideoFrame` objects, with ref-counted retained frames so unchanged tiles and duplicate views can be redrawn without an intermediate GPU texture copy. `?matrixTexture=copy` forces the older retained texture copy path for comparison or fallback.
 - the VMS page exposes source FPS, render FPS, source-to-render latency, receive-to-render latency, backend queue depth, backend stale-frame drops, client dependency drops, skipped sequence frames, frame hitches, and frame interval p95.
-- the mixed `4K@15 + 1080p@30 + 720p@30` local stress path is currently diagnostic: it exposes main-thread/decode/backpressure limits and is not yet the tuned steady-state target.
+- the mixed `4K@15 + 1080p@30` local stress path is currently diagnostic: it exposes main-thread/decode/backpressure limits and is not yet the tuned steady-state target.
 - bounded requested-frame sessions remain for the live demo and tile wall pages. The VMS path now uses a long-lived stream with bounded queues and keyframe recovery; a dynamic arbitrary-camera registry remains future production work.
 
 ### Frontend

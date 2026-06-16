@@ -9,15 +9,21 @@ import type { VideoPipeFrameRenderer } from "./playerController";
 export class SharedVideoTileRenderer implements VideoPipeFrameRenderer {
   private readonly renderers = new Map<string, VideoPipeFrameRenderer>();
   private readonly getCanvasIds: () => string[];
+  private readonly isMetadataEnabledForCanvasId: (canvasId: string) => boolean;
   private readonly createRenderer: () => VideoPipeFrameRenderer;
   private configuration?: SurfaceConfigurationPlan;
   private activeCanvasIds: string[] = [];
   private activeCanvasKey = "";
   private disposed = false;
 
-  public constructor(getCanvasIds: () => string[], createRenderer: () => VideoPipeFrameRenderer) {
+  public constructor(
+    getCanvasIds: () => string[],
+    createRenderer: () => VideoPipeFrameRenderer,
+    isMetadataEnabledForCanvasId: (canvasId: string) => boolean = () => true,
+  ) {
     this.getCanvasIds = getCanvasIds;
     this.createRenderer = createRenderer;
+    this.isMetadataEnabledForCanvasId = isMetadataEnabledForCanvasId;
   }
 
   public async configureSurface(configuration: SurfaceConfigurationPlan): Promise<void> {
@@ -37,7 +43,7 @@ export class SharedVideoTileRenderer implements VideoPipeFrameRenderer {
       return {
         sessionId: request.sessionId,
         renderedSequenceNumber: request.frame.sequenceNumber,
-        overlayPrimitiveCount: request.activeMetadata.reduce((total, batch) => total + batch.records.length, 0),
+        overlayPrimitiveCount: 0,
         renderBackend: "canvas2d-fallback",
       };
     }
@@ -53,6 +59,7 @@ export class SharedVideoTileRenderer implements VideoPipeFrameRenderer {
       request: {
         ...request,
         sessionId: `${request.sessionId}:${canvasId}`,
+        activeMetadata: this.isMetadataEnabledForCanvasId(canvasId) ? request.activeMetadata : [],
         frame: canShareFrameReference || index === targetCanvasIds.length - 1
           ? request.frame
           : cloneDecodedFrame(request.frame),
@@ -101,7 +108,7 @@ export class SharedVideoTileRenderer implements VideoPipeFrameRenderer {
     return {
       sessionId: request.sessionId,
       renderedSequenceNumber: request.frame.sequenceNumber,
-      overlayPrimitiveCount: request.activeMetadata.reduce((total, batch) => total + batch.records.length, 0),
+      overlayPrimitiveCount: 0,
       renderBackend: "canvas2d-fallback",
     };
   }

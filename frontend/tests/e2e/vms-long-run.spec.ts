@@ -20,7 +20,7 @@ const severeHitchBudget = Number(process.env.WEBVIDEO_E2E_LONG_SEVERE_HITCH_BUDG
 const frameHitchRatioBudget = Number(process.env.WEBVIDEO_E2E_LONG_FRAME_HITCH_RATIO_BUDGET ?? "0.02");
 const freshnessBudgetMs = Number(process.env.WEBVIDEO_E2E_LONG_FRESHNESS_BUDGET_MS ?? "1500");
 const backendRestartBudget = Number(process.env.WEBVIDEO_E2E_LONG_BACKEND_RESTART_BUDGET ?? "0");
-const channels = (process.env.WEBVIDEO_E2E_LONG_CHANNELS ?? "channel-001,channel-002,channel-003")
+const channels = (process.env.WEBVIDEO_E2E_LONG_CHANNELS ?? "channel-4k-crowd,channel-15116604,channel-16147856")
   .split(",")
   .map((channel) => channel.trim())
   .filter((channel) => channel.length > 0);
@@ -132,6 +132,11 @@ interface BackendMetricSnapshot {
   subscriberFramesDropped: number;
   lastFrameIntervalMs?: number;
   maxFrameIntervalMs?: number;
+  lastFrameAgeMs?: number;
+  recentFrameIntervalP95Ms?: number;
+  recentFrameIntervalMaxMs?: number;
+  recentFrameHitches?: number;
+  recentSevereFrameHitches?: number;
   lastKeyFrameIntervalMs?: number;
   readerRestartCount?: number;
   readerErrorCount?: number;
@@ -334,7 +339,10 @@ function assertHealthySample(sample: LongRunSample, label: string): void {
     expect(tile.backend?.recentSubscriberReadFps ?? 0, `${label} ${channelId} backend recent subscriber fps`).toBeGreaterThan(0);
     expect(tile.backend?.readerRestartCount ?? 0, `${label} ${channelId} backend restarts`).toBeLessThanOrEqual(backendRestartBudget);
     expect(tile.backend?.readerErrorCount ?? 0, `${label} ${channelId} backend errors`).toBe(0);
-    expect(tile.backend?.maxFrameIntervalMs ?? 0, `${label} ${channelId} backend max frame interval`).toBeLessThan(backendFrameIntervalMaxBudgetMs);
+    expect(
+      tile.backend?.recentFrameIntervalMaxMs ?? tile.backend?.maxFrameIntervalMs ?? 0,
+      `${label} ${channelId} backend recent max frame interval`,
+    ).toBeLessThan(backendFrameIntervalMaxBudgetMs);
     expect(tile.backend?.subscribers[0]?.pendingFrames ?? 0, `${label} ${channelId} backend pending frames`).toBeLessThanOrEqual(6);
     if (tile.backend?.lastFrameUnixTimeMs) {
       expect(sample.capturedAtUnixTimeMs - tile.backend.lastFrameUnixTimeMs, `${label} ${channelId} backend freshness`).toBeLessThan(2_000);

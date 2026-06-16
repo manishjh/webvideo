@@ -20,12 +20,25 @@ export interface VmsCounterState {
   sequenceGapFrames: number;
   frameHitches: number;
   severeFrameHitches: number;
+  frameHitchTimestampsMs: number[];
+  severeFrameHitchTimestampsMs: number[];
   batchesCompleted: number;
   bytesReceived: number;
   messagesReceived: number;
   transportMs: number[];
   decodeMs: number[];
   renderMs: number[];
+  renderImportExternalTextureMs: number[];
+  renderBindGroupMs: number[];
+  renderUniformMs: number[];
+  renderEncodeMs: number[];
+  renderSubmitMs: number[];
+  renderBudgetOverrun120Fps: number;
+  renderBudgetOverrun100Fps: number;
+  renderBudgetOverrun60Fps: number;
+  renderImportBudgetOverrun120Fps: number;
+  renderImportBudgetOverrun100Fps: number;
+  renderImportBudgetOverrun60Fps: number;
   sourceToRenderMs: number[];
   serverToRenderMs: number[];
   receiveToRenderMs: number[];
@@ -46,6 +59,8 @@ export interface VmsMetricSnapshot {
   sequenceGapFrames: number;
   frameHitches: number;
   severeFrameHitches: number;
+  recentFrameHitches: number;
+  recentSevereFrameHitches: number;
   batchesCompleted: number;
   bytesReceived: number;
   messagesReceived: number;
@@ -54,6 +69,17 @@ export interface VmsMetricSnapshot {
   transport: VmsLatencySummary;
   decode: VmsLatencySummary;
   render: VmsLatencySummary;
+  renderImportExternalTexture: VmsLatencySummary;
+  renderBindGroup: VmsLatencySummary;
+  renderUniform: VmsLatencySummary;
+  renderEncode: VmsLatencySummary;
+  renderSubmit: VmsLatencySummary;
+  renderBudgetOverrun120Fps: number;
+  renderBudgetOverrun100Fps: number;
+  renderBudgetOverrun60Fps: number;
+  renderImportBudgetOverrun120Fps: number;
+  renderImportBudgetOverrun100Fps: number;
+  renderImportBudgetOverrun60Fps: number;
   frameInterval: VmsLatencySummary;
   sourceToRender: VmsLatencySummary;
   serverToRender: VmsLatencySummary;
@@ -76,12 +102,25 @@ export function createVmsCounterState(nowMs: number): VmsCounterState {
     sequenceGapFrames: 0,
     frameHitches: 0,
     severeFrameHitches: 0,
+    frameHitchTimestampsMs: [],
+    severeFrameHitchTimestampsMs: [],
     batchesCompleted: 0,
     bytesReceived: 0,
     messagesReceived: 0,
     transportMs: [],
     decodeMs: [],
     renderMs: [],
+    renderImportExternalTextureMs: [],
+    renderBindGroupMs: [],
+    renderUniformMs: [],
+    renderEncodeMs: [],
+    renderSubmitMs: [],
+    renderBudgetOverrun120Fps: 0,
+    renderBudgetOverrun100Fps: 0,
+    renderBudgetOverrun60Fps: 0,
+    renderImportBudgetOverrun120Fps: 0,
+    renderImportBudgetOverrun100Fps: 0,
+    renderImportBudgetOverrun60Fps: 0,
     sourceToRenderMs: [],
     serverToRenderMs: [],
     receiveToRenderMs: [],
@@ -101,6 +140,44 @@ export function addSample(samples: number[], valueMs: number, maxSamples = 240):
   samples.push(valueMs);
   if (samples.length > maxSamples) {
     samples.splice(0, samples.length - maxSamples);
+  }
+}
+
+export const FrameServiceBudgetMs = {
+  fps120: 1000 / 120,
+  fps100: 10,
+  fps60: 1000 / 60,
+} as const;
+
+export function recordRenderBudgetSample(
+  state: VmsCounterState,
+  renderMs: number,
+  importExternalTextureMs?: number,
+): void {
+  if (Number.isFinite(renderMs)) {
+    if (renderMs > FrameServiceBudgetMs.fps120) {
+      state.renderBudgetOverrun120Fps += 1;
+    }
+    if (renderMs > FrameServiceBudgetMs.fps100) {
+      state.renderBudgetOverrun100Fps += 1;
+    }
+    if (renderMs > FrameServiceBudgetMs.fps60) {
+      state.renderBudgetOverrun60Fps += 1;
+    }
+  }
+
+  if (importExternalTextureMs === undefined || !Number.isFinite(importExternalTextureMs)) {
+    return;
+  }
+
+  if (importExternalTextureMs > FrameServiceBudgetMs.fps120) {
+    state.renderImportBudgetOverrun120Fps += 1;
+  }
+  if (importExternalTextureMs > FrameServiceBudgetMs.fps100) {
+    state.renderImportBudgetOverrun100Fps += 1;
+  }
+  if (importExternalTextureMs > FrameServiceBudgetMs.fps60) {
+    state.renderImportBudgetOverrun60Fps += 1;
   }
 }
 
@@ -126,10 +203,12 @@ export function recordRenderedFrame(
       const severeHitchThresholdMs = Math.max(expectedFrameIntervalMs * 4, 120);
       if (intervalMs > hitchThresholdMs) {
         state.frameHitches += 1;
+        addTimestamp(state.frameHitchTimestampsMs, nowMs);
       }
 
       if (intervalMs > severeHitchThresholdMs) {
         state.severeFrameHitches += 1;
+        addTimestamp(state.severeFrameHitchTimestampsMs, nowMs);
       }
     }
   }
@@ -168,6 +247,8 @@ export function createMetricSnapshot(state: VmsCounterState, nowMs: number): Vms
   const elapsedSeconds = Math.max((nowMs - state.startedAtMs) / 1000, 0.001);
   const frameInterval = summarizeLatency(state.frameIntervalMs);
   const recentFrameIntervalMs = averageRecent(state.frameIntervalMs, 30);
+  const recentFrameHitches = countRecentTimestamps(state.frameHitchTimestampsMs, nowMs);
+  const recentSevereFrameHitches = countRecentTimestamps(state.severeFrameHitchTimestampsMs, nowMs);
   return {
     framesRendered: state.framesRendered,
     framesDecoded: state.framesDecoded,
@@ -178,6 +259,8 @@ export function createMetricSnapshot(state: VmsCounterState, nowMs: number): Vms
     sequenceGapFrames: state.sequenceGapFrames,
     frameHitches: state.frameHitches,
     severeFrameHitches: state.severeFrameHitches,
+    recentFrameHitches,
+    recentSevereFrameHitches,
     batchesCompleted: state.batchesCompleted,
     bytesReceived: state.bytesReceived,
     messagesReceived: state.messagesReceived,
@@ -186,6 +269,17 @@ export function createMetricSnapshot(state: VmsCounterState, nowMs: number): Vms
     transport: summarizeLatency(state.transportMs),
     decode: summarizeLatency(state.decodeMs),
     render: summarizeLatency(state.renderMs),
+    renderImportExternalTexture: summarizeLatency(state.renderImportExternalTextureMs),
+    renderBindGroup: summarizeLatency(state.renderBindGroupMs),
+    renderUniform: summarizeLatency(state.renderUniformMs),
+    renderEncode: summarizeLatency(state.renderEncodeMs),
+    renderSubmit: summarizeLatency(state.renderSubmitMs),
+    renderBudgetOverrun120Fps: state.renderBudgetOverrun120Fps,
+    renderBudgetOverrun100Fps: state.renderBudgetOverrun100Fps,
+    renderBudgetOverrun60Fps: state.renderBudgetOverrun60Fps,
+    renderImportBudgetOverrun120Fps: state.renderImportBudgetOverrun120Fps,
+    renderImportBudgetOverrun100Fps: state.renderImportBudgetOverrun100Fps,
+    renderImportBudgetOverrun60Fps: state.renderImportBudgetOverrun60Fps,
     frameInterval,
     sourceToRender: summarizeLatency(state.sourceToRenderMs),
     serverToRender: summarizeLatency(state.serverToRenderMs),
@@ -195,6 +289,43 @@ export function createMetricSnapshot(state: VmsCounterState, nowMs: number): Vms
     decodeBacklog: summarizeLatency(state.decodeBacklogFrames),
     renderQueue: summarizeLatency(state.renderQueueFrames),
   };
+}
+
+const RecentHitchWindowMs = 60_000;
+const MaxRecentHitchTimestamps = 2048;
+
+function addTimestamp(timestampsMs: number[], nowMs: number): void {
+  if (!Number.isFinite(nowMs) || nowMs < 0) {
+    return;
+  }
+
+  timestampsMs.push(nowMs);
+  pruneTimestamps(timestampsMs, nowMs);
+}
+
+function countRecentTimestamps(timestampsMs: number[], nowMs: number): number {
+  pruneTimestamps(timestampsMs, nowMs);
+  return timestampsMs.length;
+}
+
+function pruneTimestamps(timestampsMs: number[], nowMs: number): void {
+  const oldestAllowedMs = nowMs - RecentHitchWindowMs;
+  let firstRetainedIndex = 0;
+
+  while (
+    firstRetainedIndex < timestampsMs.length &&
+    (timestampsMs[firstRetainedIndex] ?? 0) < oldestAllowedMs
+  ) {
+    firstRetainedIndex += 1;
+  }
+
+  if (firstRetainedIndex > 0) {
+    timestampsMs.splice(0, firstRetainedIndex);
+  }
+
+  if (timestampsMs.length > MaxRecentHitchTimestamps) {
+    timestampsMs.splice(0, timestampsMs.length - MaxRecentHitchTimestamps);
+  }
 }
 
 function averageRecent(samples: readonly number[], maxSamples: number): number {

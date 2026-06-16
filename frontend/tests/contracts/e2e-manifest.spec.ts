@@ -35,11 +35,10 @@ describe("frontend e2e manifest coverage", () => {
   it("documents the synthetic RTSP scenarios needed by browser validation", () => {
     const referencedScenarios = new Set(e2eScenarioCatalog.map((scenario) => scenario.syntheticRtspScenarioId));
     expect(referencedScenarios).toEqual(new Set([
-      "cctv-entrance-720p",
-      "cctv-floor-1080p",
-      "cctv-lobby-720p",
-      "cctv-parking-4k",
       "cctv-road-crowd-4k60",
+      "download-13535786-4k60",
+      "download-15116604-4k30",
+      "download-15139494-4k60",
     ]));
   });
 });

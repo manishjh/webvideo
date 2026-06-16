@@ -9,6 +9,12 @@ import type {
 
 export type WorkerMediaPipelineMode = "main-thread" | "media-worker";
 
+export interface WorkerMediaPipelineClientOptions {
+  startupTimeoutMs?: number;
+}
+
+const DefaultWorkerStartupTimeoutMs = 45_000;
+
 export type WorkerFrameMetadata = {
   sequenceNumber: number;
   sourceTimestampUnixTimeMs?: number;
@@ -25,6 +31,12 @@ export type WorkerDecodedFrameEnvelope = {
   metadata?: WorkerFrameMetadata;
   receivedAtUnixTimeMs?: number;
 };
+
+export interface WorkerOffscreenRenderTarget {
+  canvas: OffscreenCanvas;
+  canvasWidth: number;
+  canvasHeight: number;
+}
 
 export type WorkerMediaPipelineEvent =
   | {
@@ -50,6 +62,34 @@ export type WorkerMediaPipelineEvent =
     backlogFrameCount: number;
   }
   | {
+    type: "rendered";
+    metadata?: WorkerFrameMetadata;
+    receivedAtUnixTimeMs?: number;
+    bytesReceived: number;
+    messagesReceived: number;
+    decodeMs: number;
+    renderMs: number;
+    renderStageMs?: {
+      importExternalTexture: number;
+      bindGroup: number;
+      uniform: number;
+      encode: number;
+      submit: number;
+    };
+    backlogFrameCount: number;
+    droppedBeforeRender: number;
+    decodeBackend: string;
+    renderBackend: "webgpu" | "canvas2d-fallback";
+    renderedSequenceNumber: number;
+    overlayPrimitiveCount: number;
+    width: number;
+    height: number;
+    gpuPresentation?: string;
+    gpuUploadSource?: string;
+    gpuAdapterVendor?: string;
+    gpuAdapterArchitecture?: string;
+  }
+  | {
     type: "drop";
     count: number;
     reason: string;
@@ -71,7 +111,14 @@ type WorkerRequest =
     endpoint: TransportEndpointDescriptor;
     initialCodec: VideoCodecConfiguration & { profile?: string; frameRate?: number };
     targetLatencyMs: number;
+    metadataEnabled?: boolean;
+    offscreenRenderTarget?: {
+      canvas: OffscreenCanvas;
+      canvasWidth: number;
+      canvasHeight: number;
+    };
   }
+  | { type: "set-metadata-enabled"; enabled: boolean }
   | { type: "stop" };
 
 type WorkerResponse = WorkerMediaPipelineEvent | { type: "error"; message: string };
@@ -82,19 +129,27 @@ export function shouldUseWorkerMediaPipeline(): boolean {
   }
 
   const mode = new URLSearchParams(window.location.search).get("mediaWorker")?.toLowerCase();
-  return ["1", "true", "on", "worker"].includes(mode ?? "");
+  if (["0", "false", "off", "main", "main-thread"].includes(mode ?? "")) {
+    return false;
+  }
+
+  return true;
 }
 
 export class WorkerMediaPipelineClient {
   public readonly pipelineMode = "media-worker" as const;
   private readonly worker: Worker;
   private disposed = false;
+  private startupTimeoutId?: ReturnType<typeof setTimeout>;
   private complete?: {
     resolve: () => void;
     reject: (error: Error) => void;
   };
 
-  public constructor(private readonly onEvent: (event: WorkerMediaPipelineEvent) => void) {
+  public constructor(
+    private readonly onEvent: (event: WorkerMediaPipelineEvent) => void,
+    private readonly options: WorkerMediaPipelineClientOptions = {},
+  ) {
     this.worker = new Worker(new URL("./mediaPipelineWorker.ts", import.meta.url), {
       type: "module",
     });
@@ -114,6 +169,8 @@ export class WorkerMediaPipelineClient {
     initialCodec: VideoCodecConfiguration & { profile?: string; frameRate?: number },
     targetLatencyMs: number,
     abortSignal: AbortSignal,
+    offscreenRenderTarget?: WorkerOffscreenRenderTarget,
+    metadataEnabled = true,
   ): Promise<void> {
     if (this.disposed) {
       return Promise.reject(new Error("Media pipeline worker has been disposed."));
@@ -124,23 +181,44 @@ export class WorkerMediaPipelineClient {
     };
     abortSignal.addEventListener("abort", abort, { once: true });
     return new Promise<void>((resolve, reject) => {
+      this.startupTimeoutId = setTimeout(() => {
+        this.fail(new Error(`Media pipeline worker did not decode a frame within ${this.startupTimeoutMs()} ms.`));
+        this.dispose();
+      }, this.startupTimeoutMs());
       this.complete = {
         resolve: () => {
           abortSignal.removeEventListener("abort", abort);
+          this.clearStartupTimeout();
           resolve();
         },
         reject: (error) => {
           abortSignal.removeEventListener("abort", abort);
+          this.clearStartupTimeout();
           reject(error);
         },
       };
-      this.worker.postMessage({
+      const request = {
         type: "start",
         endpoint,
         initialCodec,
         targetLatencyMs,
-      } satisfies WorkerRequest);
+        metadataEnabled,
+        offscreenRenderTarget,
+      } satisfies WorkerRequest;
+      const transfer = offscreenRenderTarget ? [offscreenRenderTarget.canvas] : [];
+      this.worker.postMessage(request, transfer);
     });
+  }
+
+  public setMetadataEnabled(enabled: boolean): void {
+    if (this.disposed) {
+      return;
+    }
+
+    this.worker.postMessage({
+      type: "set-metadata-enabled",
+      enabled,
+    } satisfies WorkerRequest);
   }
 
   public dispose(): void {
@@ -155,6 +233,7 @@ export class WorkerMediaPipelineClient {
       // The worker can already be gone after a decode or transport failure.
     }
     this.worker.terminate();
+    this.clearStartupTimeout();
     this.complete?.resolve();
     this.complete = undefined;
   }
@@ -166,6 +245,9 @@ export class WorkerMediaPipelineClient {
     }
 
     this.onEvent(message);
+    if ((message.type === "decoded" && message.frames.length > 0) || message.type === "rendered") {
+      this.clearStartupTimeout();
+    }
     if (message.type === "end") {
       this.complete?.resolve();
       this.complete = undefined;
@@ -173,7 +255,24 @@ export class WorkerMediaPipelineClient {
   }
 
   private fail(error: Error): void {
+    this.clearStartupTimeout();
     this.complete?.reject(error);
     this.complete = undefined;
+  }
+
+  private startupTimeoutMs(): number {
+    const value = this.options.startupTimeoutMs;
+    return typeof value === "number" && Number.isFinite(value) && value > 0
+      ? value
+      : DefaultWorkerStartupTimeoutMs;
+  }
+
+  private clearStartupTimeout(): void {
+    if (this.startupTimeoutId === undefined) {
+      return;
+    }
+
+    clearTimeout(this.startupTimeoutId);
+    this.startupTimeoutId = undefined;
   }
 }

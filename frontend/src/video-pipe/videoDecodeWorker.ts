@@ -19,12 +19,15 @@ type WorkerResponse =
   | { type: "disposed"; id: number }
   | { type: "error"; id?: number; message: string };
 
-let decoder = new VideoDecodeCoordinator();
+let decoder = createDecoder();
 let drainScheduled = false;
-let drainTimer: ReturnType<typeof setTimeout> | undefined;
-let drainPollAttemptsRemaining = 0;
+let drainGeneration = 0;
 
-const DrainPollAttemptsAfterEnqueue = 16;
+function createDecoder(): VideoDecodeCoordinator {
+  return new VideoDecodeCoordinator(() => {
+    scheduleDrain();
+  });
+}
 
 function post(response: WorkerResponse, transfer: Transferable[] = []): void {
   (globalThis as unknown as Worker).postMessage(response, transfer);
@@ -57,24 +60,23 @@ function postDecodedFrames(frames: DecodedFramePlan[], backlogFrameCount: number
 }
 
 function scheduleDrain(extraPollAttempts = 0): void {
-  drainPollAttemptsRemaining = Math.max(drainPollAttemptsRemaining, extraPollAttempts);
   if (drainScheduled) {
     return;
   }
 
   drainScheduled = true;
-  drainTimer = setTimeout(() => {
-    drainScheduled = false;
-    drainTimer = undefined;
-    const drainedFrameCount = drainDecodedFrames();
-    if (decoder.liveBacklogFrameCount() === 0 && drainPollAttemptsRemaining > 0) {
-      drainPollAttemptsRemaining -= 1;
+  const generation = drainGeneration;
+  scheduleMicrotask(() => {
+    if (generation !== drainGeneration) {
+      return;
     }
 
-    if (decoder.liveBacklogFrameCount() > 0 || drainPollAttemptsRemaining > 0 || drainedFrameCount > 0) {
+    drainScheduled = false;
+    const drainedFrameCount = drainDecodedFrames();
+    if (decoder.liveBacklogFrameCount() > 0 || drainedFrameCount > 0) {
       scheduleDrain();
     }
-  }, 0);
+  });
 }
 
 function drainDecodedFrames(): number {
@@ -84,15 +86,19 @@ function drainDecodedFrames(): number {
 }
 
 function resetDecoder(): void {
-  if (drainTimer !== undefined) {
-    clearTimeout(drainTimer);
-    drainTimer = undefined;
+  drainGeneration += 1;
+  drainScheduled = false;
+  decoder.dispose();
+  decoder = createDecoder();
+}
+
+function scheduleMicrotask(task: () => void): void {
+  if (typeof globalThis.queueMicrotask === "function") {
+    globalThis.queueMicrotask(task);
+    return;
   }
 
-  drainScheduled = false;
-  drainPollAttemptsRemaining = 0;
-  decoder.dispose();
-  decoder = new VideoDecodeCoordinator();
+  void Promise.resolve().then(task);
 }
 
 async function handleRequest(request: WorkerRequest): Promise<void> {
@@ -114,7 +120,7 @@ async function handleRequest(request: WorkerRequest): Promise<void> {
       id: request.id,
       backlogFrameCount: decoder.liveBacklogFrameCount(),
     });
-    scheduleDrain(DrainPollAttemptsAfterEnqueue);
+    scheduleDrain();
     return;
   }
 

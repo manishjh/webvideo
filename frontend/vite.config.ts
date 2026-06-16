@@ -1,7 +1,8 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-const backendTarget = "http://127.0.0.1:8080";
+const frontendPort = Number(process.env.FRONTEND_PORT ?? "4173");
+const backendTarget = `http://127.0.0.1:${process.env.BACKEND_PORT ?? "8080"}`;
 const apiProxy = {
   "/api": {
     target: backendTarget,
@@ -23,12 +24,12 @@ export default defineConfig({
   },
   server: {
     host: "127.0.0.1",
-    port: 4173,
+    port: frontendPort,
     proxy: apiProxy,
   },
   preview: {
     host: "127.0.0.1",
-    port: 4173,
+    port: frontendPort,
     proxy: apiProxy,
   },
 });

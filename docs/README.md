@@ -25,7 +25,9 @@ System goals:
 
 Current validation entry points:
 
-- `./start.sh` for manual local RTSP, WebTransport, WebCodecs, and render validation
+- `./start.sh` for manual product-like local RTSP, WebTransport, WebCodecs, and render validation with primary sources only by default
+- `./test-start.sh` for Playwright/profiling startup with sample footage enabled and 4K/source variants opt-in
+- `scripts/benchmark-rtsp-source.sh` for source-only go2rtc versus mediaMTX CPU/RAM A/B checks
 - `scripts/test-all.sh` for the central automated suite
 - `WEBVIDEO_TEST_PROFILE=hardware-long scripts/test-all.sh` for headed hardware WebGPU VMS soak coverage
-- `WEBVIDEO_TEST_PROFILE=hardware-mixed-4k-long scripts/test-all.sh` for the current mixed 4K/1080p/720p stress diagnostic
+- `WEBVIDEO_TEST_PROFILE=hardware-mixed-4k-long scripts/test-all.sh` for the current mixed 4K/1080p stress diagnostic

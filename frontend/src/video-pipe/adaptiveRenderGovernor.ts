@@ -1,8 +1,8 @@
-const FrameRateLadder = [undefined, 50, 45, 30, 24, 20, 15, 10, 5, 2] as const;
-const PressureCooldownMs = 1_200;
-const SeverePressureCooldownMs = 700;
-const RecoveryQuietMs = 15_000;
-const RecoveryStepMs = 5_000;
+const FrameRateLadder = [undefined, 60, 50, 45, 40, 30, 24, 20, 15] as const;
+const PressureCooldownMs = 1_800;
+const SeverePressureCooldownMs = 1_200;
+const RecoveryQuietMs = 6_000;
+const RecoveryStepMs = 2_000;
 
 export interface AdaptiveRenderGovernorSnapshot {
   frameRateLimit?: number;

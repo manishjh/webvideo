@@ -125,19 +125,17 @@ public static class BrowserDemoWebTransportFrameCodec
         await writer.CompleteAsync();
     }
 
-    public static async Task WriteVideoFrameAsync(
+    public static ValueTask<FlushResult> WriteVideoFrameAsync(
         PipeWriter writer,
         BrowserDemoVideoMessage message,
         CancellationToken cancellationToken)
-    {
-        await WriteFrameAsync(writer, new
+        => WriteFrameAsync(writer, new
         {
             kind = "video",
             message
         }, cancellationToken);
-    }
 
-    public static async Task WriteMoqVideoObjectFrameAsync(
+    public static ValueTask<FlushResult> WriteMoqVideoObjectFrameAsync(
         PipeWriter writer,
         BrowserDemoVideoMessage message,
         long groupId,
@@ -146,7 +144,7 @@ public static class BrowserDemoWebTransportFrameCodec
     {
         var streamIdBytes = Encoding.UTF8.GetBytes(message.StreamId);
         var codecConfigVersionBytes = Encoding.UTF8.GetBytes(message.CodecConfigVersion);
-        await WriteMoqVideoObjectFrameAsync(
+        return WriteMoqVideoObjectFrameAsync(
             writer,
             streamIdBytes,
             message.SequenceNumber,
@@ -162,7 +160,7 @@ public static class BrowserDemoWebTransportFrameCodec
             cancellationToken);
     }
 
-    public static async Task WriteMoqVideoObjectFrameAsync(
+    public static ValueTask<FlushResult> WriteMoqVideoObjectFrameAsync(
         PipeWriter writer,
         ReadOnlyMemory<byte> streamIdBytes,
         long sequenceNumber,
@@ -229,12 +227,10 @@ public static class BrowserDemoWebTransportFrameCodec
         writer.Advance(offset);
         if (payload.Length > 0)
         {
-            await writer.WriteAsync(payload, cancellationToken);
+            return writer.WriteAsync(payload, cancellationToken);
         }
-        else
-        {
-            await writer.FlushAsync(cancellationToken);
-        }
+
+        return writer.FlushAsync(cancellationToken);
     }
 
     public static long ComputeMoqVideoObjectFrameLength(
@@ -246,24 +242,21 @@ public static class BrowserDemoWebTransportFrameCodec
             + codecConfigVersionBytesLength
             + payloadBytesLength);
 
-    public static async Task WriteMetadataFrameAsync(
+    public static ValueTask<FlushResult> WriteMetadataFrameAsync(
         PipeWriter writer,
         BrowserDemoMetadataMessage message,
         CancellationToken cancellationToken)
-    {
-        await WriteFrameAsync(writer, new
+        => WriteFrameAsync(writer, new
         {
             kind = "metadata",
             message
         }, cancellationToken);
-    }
 
-    public static async Task WriteSelectedSourceFrameAsync(
+    public static ValueTask<FlushResult> WriteSelectedSourceFrameAsync(
         PipeWriter writer,
         BrowserDemoChannelSummary channel,
         CancellationToken cancellationToken)
-    {
-        await WriteFrameAsync(writer, new
+        => WriteFrameAsync(writer, new
         {
             kind = "source",
             message = new
@@ -274,32 +267,34 @@ public static class BrowserDemoWebTransportFrameCodec
                 channel.Codec
             }
         }, cancellationToken);
-    }
 
-    public static async Task WriteEndFrameAsync(
+    public static ValueTask<FlushResult> WriteEndFrameAsync(
         PipeWriter writer,
         string channelId,
         string streamId,
         string reason,
         CancellationToken cancellationToken)
-    {
-        await WriteFrameAsync(writer, new
+        => WriteFrameAsync(writer, new
         {
             kind = "end",
             channelId,
             streamId,
             reason
         }, cancellationToken);
-    }
 
-    private static async Task WriteFrameAsync(
+    private static ValueTask<FlushResult> WriteFrameAsync(
         PipeWriter writer,
         object frame,
         CancellationToken cancellationToken)
     {
-        var json = JsonSerializer.Serialize(frame, JsonOptions);
-        await writer.WriteAsync(Encoding.UTF8.GetBytes($"{json}\n"), cancellationToken);
-        await writer.FlushAsync(cancellationToken);
+        using var jsonWriter = new Utf8JsonWriter(writer);
+        JsonSerializer.Serialize(jsonWriter, frame, JsonOptions);
+        jsonWriter.Flush();
+
+        var newline = writer.GetSpan(1);
+        newline[0] = (byte)'\n';
+        writer.Advance(1);
+        return writer.FlushAsync(cancellationToken);
     }
 
     private static bool TryReadLine(ref ReadOnlySequence<byte> buffer, out byte[] line)

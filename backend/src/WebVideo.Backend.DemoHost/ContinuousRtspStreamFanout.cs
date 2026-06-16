@@ -35,6 +35,11 @@ public sealed record ContinuousRtspFanoutMetrics(
     long LastKeyFrameUnixTimeMs,
     long LastFrameIntervalMs,
     long MaxFrameIntervalMs,
+    long LastFrameAgeMs,
+    long RecentFrameIntervalP95Ms,
+    long RecentFrameIntervalMaxMs,
+    long RecentFrameHitches,
+    long RecentSevereFrameHitches,
     long LastKeyFrameIntervalMs,
     long ReaderRestartCount,
     long ReaderErrorCount,
@@ -56,31 +61,36 @@ public sealed record ContinuousRtspSubscriberMetrics(
 
 public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
 {
+    public const string DefaultRtspTransport = "tcp";
+
     private readonly string _ffmpegPath;
+    private readonly string _rtspTransport;
     private readonly ContinuousRtspFrameSourceFactory? _sourceFactory;
     private readonly TimeSpan _startupTimeout;
     private readonly ConcurrentDictionary<string, StreamWorker> _workers = new(StringComparer.Ordinal);
 
-    public ContinuousRtspStreamFanout(string ffmpegPath, TimeSpan? startupTimeout = null)
-        : this(ffmpegPath, sourceFactory: null, startupTimeout)
+    public ContinuousRtspStreamFanout(string ffmpegPath, TimeSpan? startupTimeout = null, string? rtspTransport = null)
+        : this(ffmpegPath, NormalizeRtspTransport(rtspTransport), sourceFactory: null, startupTimeout)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ffmpegPath);
     }
 
     internal ContinuousRtspStreamFanout(ContinuousRtspFrameSourceFactory sourceFactory, TimeSpan? startupTimeout = null)
-        : this("test-source", sourceFactory, startupTimeout)
+        : this("test-source", DefaultRtspTransport, sourceFactory, startupTimeout)
     {
         ArgumentNullException.ThrowIfNull(sourceFactory);
     }
 
     private ContinuousRtspStreamFanout(
         string ffmpegPath,
+        string rtspTransport,
         ContinuousRtspFrameSourceFactory? sourceFactory,
         TimeSpan? startupTimeout)
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(ffmpegPath);
 
         _ffmpegPath = ffmpegPath;
+        _rtspTransport = rtspTransport;
         _sourceFactory = sourceFactory;
         _startupTimeout = startupTimeout ?? TimeSpan.FromSeconds(8);
     }
@@ -98,7 +108,7 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
         var workerKey = $"{streamId}\n{rtspUrl}";
         var worker = _workers.GetOrAdd(
             workerKey,
-            _ => new StreamWorker(_ffmpegPath, _sourceFactory, streamId, rtspUrl, frameRate, _startupTimeout));
+            _ => new StreamWorker(_ffmpegPath, _rtspTransport, _sourceFactory, streamId, rtspUrl, frameRate, _startupTimeout));
         return await worker.SubscribeAsync(targetLatencyMs, cancellationToken);
     }
 
@@ -118,11 +128,32 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
         _workers.Clear();
     }
 
+    public static string NormalizeRtspTransport(string? rtspTransport)
+    {
+        if (string.IsNullOrWhiteSpace(rtspTransport))
+        {
+            return DefaultRtspTransport;
+        }
+
+        var normalized = rtspTransport.Trim().ToLowerInvariant();
+        return normalized switch
+        {
+            "udp" => "udp",
+            "tcp" => "tcp",
+            _ => throw new ArgumentException("RTSP transport must be 'udp' or 'tcp'.", nameof(rtspTransport))
+        };
+    }
+
+    internal static IReadOnlyList<string> CreateFfmpegArgumentsForTesting(string rtspTransport, string rtspUrl)
+        => StreamWorker.CreateFfmpegArguments(rtspTransport, rtspUrl);
+
     private sealed class StreamWorker : IAsyncDisposable
     {
         private const int MaxSubscriberQueue = 12;
+        private const int RecentSampleCapacity = 4096;
         private readonly object _gate = new();
         private readonly string _ffmpegPath;
+        private readonly string _rtspTransport;
         private readonly ContinuousRtspFrameSourceFactory? _sourceFactory;
         private readonly string _streamId;
         private readonly string _rtspUrl;
@@ -148,10 +179,11 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
         private long _readerRestartCount;
         private long _readerErrorCount;
         private long _startedUnixTimeMs;
-        private readonly long[] _recentFrameUnixTimeMs = new long[256];
+        private readonly long[] _recentFrameUnixTimeMs = new long[RecentSampleCapacity];
 
         public StreamWorker(
             string ffmpegPath,
+            string rtspTransport,
             ContinuousRtspFrameSourceFactory? sourceFactory,
             string streamId,
             string rtspUrl,
@@ -159,6 +191,7 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
             TimeSpan startupTimeout)
         {
             _ffmpegPath = ffmpegPath;
+            _rtspTransport = rtspTransport;
             _sourceFactory = sourceFactory;
             _streamId = streamId;
             _rtspUrl = rtspUrl;
@@ -236,6 +269,8 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
             var framesPublished = Interlocked.Read(ref _framesPublished);
             var subscriberFramesRead = subscriberMetrics.Sum(metrics => metrics.FramesRead);
             var recentFrameFps = ComputeRecentFps(_recentFrameUnixTimeMs, nowUnixTimeMs);
+            var recentFrameCadence = ComputeRecentFrameCadence(_recentFrameUnixTimeMs, nowUnixTimeMs, _frameRate);
+            var lastFrameUnixTimeMs = Interlocked.Read(ref _lastFrameUnixTimeMs);
 
             return new ContinuousRtspFanoutMetrics(
                 StreamId: _streamId,
@@ -249,10 +284,15 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
                 FramesPublished: framesPublished,
                 SubscriberFramesWritten: Interlocked.Read(ref _subscriberFramesWritten),
                 SubscriberFramesDropped: Interlocked.Read(ref _subscriberFramesDropped),
-                LastFrameUnixTimeMs: Interlocked.Read(ref _lastFrameUnixTimeMs),
+                LastFrameUnixTimeMs: lastFrameUnixTimeMs,
                 LastKeyFrameUnixTimeMs: Interlocked.Read(ref _lastKeyFrameUnixTimeMs),
                 LastFrameIntervalMs: Interlocked.Read(ref _lastFrameIntervalMs),
                 MaxFrameIntervalMs: Interlocked.Read(ref _maxFrameIntervalMs),
+                LastFrameAgeMs: lastFrameUnixTimeMs > 0 ? Math.Max(0, nowUnixTimeMs - lastFrameUnixTimeMs) : 0,
+                RecentFrameIntervalP95Ms: recentFrameCadence.P95Ms,
+                RecentFrameIntervalMaxMs: recentFrameCadence.MaxMs,
+                RecentFrameHitches: recentFrameCadence.Hitches,
+                RecentSevereFrameHitches: recentFrameCadence.SevereHitches,
                 LastKeyFrameIntervalMs: Interlocked.Read(ref _lastKeyFrameIntervalMs),
                 ReaderRestartCount: Interlocked.Read(ref _readerRestartCount),
                 ReaderErrorCount: Interlocked.Read(ref _readerErrorCount),
@@ -343,23 +383,7 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
                 UseShellExecute = false
             };
 
-            foreach (var argument in new[]
-            {
-                "-hide_banner",
-                "-loglevel", "error",
-                "-fflags", "nobuffer",
-                "-flags", "low_delay",
-                "-probesize", "32768",
-                "-analyzeduration", "0",
-                "-rtsp_transport", "tcp",
-                "-i", _rtspUrl,
-                "-map", "0:v:0",
-                "-an",
-                "-c:v", "copy",
-                "-bsf:v", "h264_metadata=aud=insert",
-                "-f", "h264",
-                "pipe:1"
-            })
+            foreach (var argument in CreateFfmpegArguments(_rtspTransport, _rtspUrl))
             {
                 processStart.ArgumentList.Add(argument);
             }
@@ -392,6 +416,21 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
                 }
             }
         }
+
+        internal static string[] CreateFfmpegArguments(string rtspTransport, string rtspUrl)
+            =>
+            [
+                "-hide_banner",
+                "-loglevel", "error",
+                "-rtsp_transport", rtspTransport,
+                "-i", rtspUrl,
+                "-map", "0:v:0",
+                "-an",
+                "-c:v", "copy",
+                "-bsf:v", RtspH264AccessUnitCapture.WebCodecsSafeH264AnnexBBitstreamFilter,
+                "-f", "h264",
+                "pipe:1"
+            ];
 
         private async Task RunSourceFactoryAsync(CancellationToken cancellationToken)
         {
@@ -575,6 +614,85 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
             return (count - 1) / ((max - min) / 1000.0);
         }
 
+        private static RecentFrameCadence ComputeRecentFrameCadence(
+            long[] samples,
+            long nowUnixTimeMs,
+            double frameRate)
+        {
+            const long WindowMs = 60_000;
+            var timestamps = new List<long>(samples.Length);
+
+            for (var index = 0; index < samples.Length; index++)
+            {
+                var timestamp = Interlocked.Read(ref samples[index]);
+                if (timestamp <= 0 || nowUnixTimeMs - timestamp > WindowMs)
+                {
+                    continue;
+                }
+
+                timestamps.Add(timestamp);
+            }
+
+            if (timestamps.Count < 2)
+            {
+                return default;
+            }
+
+            timestamps.Sort();
+            var intervals = new long[timestamps.Count - 1];
+            for (var index = 1; index < timestamps.Count; index++)
+            {
+                intervals[index - 1] = Math.Max(0, timestamps[index] - timestamps[index - 1]);
+            }
+
+            Array.Sort(intervals);
+
+            var expectedFrameIntervalMs = 1000.0 / Math.Max(frameRate, 1);
+            var hitchThresholdMs = Math.Max(expectedFrameIntervalMs * 2.25, 45);
+            var severeHitchThresholdMs = Math.Max(expectedFrameIntervalMs * 4, 120);
+            long hitches = 0;
+            long severeHitches = 0;
+            for (var index = 0; index < intervals.Length; index++)
+            {
+                var interval = intervals[index];
+                if (interval > hitchThresholdMs)
+                {
+                    hitches++;
+                }
+
+                if (interval > severeHitchThresholdMs)
+                {
+                    severeHitches++;
+                }
+            }
+
+            return new RecentFrameCadence(
+                P95Ms: Percentile(intervals, 0.95),
+                MaxMs: intervals[^1],
+                Hitches: hitches,
+                SevereHitches: severeHitches);
+        }
+
+        private static long Percentile(long[] sortedSamples, double fraction)
+        {
+            if (sortedSamples.Length == 0)
+            {
+                return 0;
+            }
+
+            var index = Math.Clamp(
+                (int)Math.Ceiling(sortedSamples.Length * fraction) - 1,
+                0,
+                sortedSamples.Length - 1);
+            return sortedSamples[index];
+        }
+
+        private readonly record struct RecentFrameCadence(
+            long P95Ms,
+            long MaxMs,
+            long Hitches,
+            long SevereHitches);
+
         private int ComputeSubscriberQueueDepth(int? targetLatencyMs)
         {
             if (targetLatencyMs is null or <= 0)
@@ -606,7 +724,7 @@ public sealed class ContinuousRtspStreamFanout : IAsyncDisposable
             private long _framesRead;
             private long _framesDropped;
             private int _pendingFrames;
-            private readonly long[] _recentReadUnixTimeMs = new long[256];
+            private readonly long[] _recentReadUnixTimeMs = new long[RecentSampleCapacity];
 
             public (bool Written, bool DroppedOldest) TryWrite(ContinuousRtspFrame frame)
             {

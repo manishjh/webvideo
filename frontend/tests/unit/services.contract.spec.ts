@@ -542,6 +542,7 @@ function installWebCodecsStub(options: {
 function installWebGpuStub(options: {
   adapterInfo?: { vendor?: string; architecture?: string };
   importExternalTexture?: boolean;
+  importExternalTextureError?: string;
   rejectReadback?: boolean;
   requestAdapterNeverResolves?: boolean;
 } = {}): {
@@ -551,8 +552,12 @@ function installWebGpuStub(options: {
   const descriptor = Object.getOwnPropertyDescriptor(globalThis, "navigator");
   const operations: string[] = [];
   const fakeDevice = {
-    createShaderModule(): unknown {
+    createShaderModule(descriptor?: Record<string, unknown>): unknown {
       operations.push("createShaderModule");
+      const code = typeof descriptor?.code === "string" ? descriptor.code : "";
+      if (/\bmeta\s*:/.test(code) || /\boverlay\.meta\b/.test(code)) {
+        throw new Error("WGSL reserved identifier 'meta'");
+      }
       return {};
     },
     createRenderPipeline(): unknown {
@@ -646,6 +651,10 @@ function installWebGpuStub(options: {
     importExternalTexture: options.importExternalTexture
       ? (): unknown => {
         operations.push("importExternalTexture");
+        if (options.importExternalTextureError) {
+          throw new Error(options.importExternalTextureError);
+        }
+
         return {};
       }
       : undefined,
@@ -1466,7 +1475,7 @@ describe("frontend service contracts", () => {
     ]);
   });
 
-  it("configures the renderer, paints a browser surface, and reports overlay primitive counts", async () => {
+  it("configures the renderer and keeps OSD counts at zero on the Canvas2D fallback", async () => {
     const renderer = new WebGpuRenderer();
     const { canvas, operations } = createCanvasStub();
     const restoreDocument = installDocumentStub({
@@ -1481,7 +1490,7 @@ describe("frontend service contracts", () => {
       expect(result).toEqual({
         sessionId: "session-001",
         renderedSequenceNumber: 101,
-        overlayPrimitiveCount: 1,
+        overlayPrimitiveCount: 0,
         renderBackend: "canvas2d-fallback",
         webGpuDisabledReason: "no-webgpu",
       });
@@ -1491,12 +1500,12 @@ describe("frontend service contracts", () => {
       expect(canvas.hidden).toBe(false);
       expect(canvas.style.display).toBe("block");
       expect(canvas.dataset.lastSequence).toBe("101");
-      expect(canvas.dataset.overlayCount).toBe("1");
+      expect(canvas.dataset.overlayCount).toBe("0");
       expect(operations).toContain("getContext:2d");
       expect(operations.some((operation) => operation.startsWith("createLinearGradient:"))).toBe(true);
-      expect(operations.some((operation) => operation.startsWith("fillText:Camera camera-001:"))).toBe(true);
-      expect(operations.some((operation) => operation.startsWith("fillText:Sequence 101:"))).toBe(true);
-      expect(operations.some((operation) => operation.startsWith("strokeRect:"))).toBe(true);
+      expect(operations.some((operation) => operation.startsWith("fillText:Camera camera-001:"))).toBe(false);
+      expect(operations.some((operation) => operation.startsWith("fillText:Sequence 101:"))).toBe(false);
+      expect(operations.some((operation) => operation.startsWith("strokeRect:"))).toBe(false);
 
       await renderer.dispose();
       await expect(renderer.renderFrame(createRenderRequest())).rejects.toThrow("must be configured");
@@ -1946,6 +1955,13 @@ describe("frontend service contracts", () => {
       expect(secondCanvas.dataset.gpuPresentation).toBe("webgpu-canvas");
       expect(firstCanvas.dataset.gpuUploadSource).toBe("external-texture");
       expect(secondCanvas.dataset.gpuUploadSource).toBe("external-texture");
+      expect(firstResult.matrixPresentMode).toBe("immediate");
+      expect(firstResult.matrixPresentPath).toBe("immediate");
+      expect(firstResult.matrixFlushCount).toBe(1);
+      expect(firstResult.matrixPresentCount).toBe(1);
+      expect(firstResult.matrixDrawCount).toBe(2);
+      expect(firstResult.matrixExternalImportCount).toBe(2);
+      expect(firstResult.matrixBindGroupCount).toBe(2);
       expect(firstCanvas.dataset.gpuSampleRgba).toBe("1,1,1,255");
       expect(secondCanvas.dataset.gpuSampleRgba).toBe("1,1,1,255");
       expect(gpuOperations.filter((operation) => operation === "matrix.getContext:webgpu")).toHaveLength(1);
@@ -1999,6 +2015,385 @@ describe("frontend service contracts", () => {
         Object.defineProperty(globalThis, "devicePixelRatio", pixelRatioDescriptor);
       } else {
         Reflect.deleteProperty(globalThis, "devicePixelRatio");
+      }
+    }
+  });
+
+  it("coalesces auto matrix presents and backs them up with a timer", async () => {
+    const matrixCanvasId = "matrix-canvas-raf-present-unit";
+    const firstRenderer = new WebGpuMatrixTileRenderer(matrixCanvasId);
+    const secondRenderer = new WebGpuMatrixTileRenderer(matrixCanvasId);
+    const videoFrameDescriptor = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+    const pixelRatioDescriptor = Object.getOwnPropertyDescriptor(globalThis, "devicePixelRatio");
+    const requestAnimationFrameDescriptor = Object.getOwnPropertyDescriptor(globalThis, "requestAnimationFrame");
+    const setTimeoutDescriptor = Object.getOwnPropertyDescriptor(globalThis, "setTimeout");
+    const clearTimeoutDescriptor = Object.getOwnPropertyDescriptor(globalThis, "clearTimeout");
+    const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const callbacks: FrameRequestCallback[] = [];
+    const fallbackCallbacks: Array<() => void> = [];
+    const { operations: gpuOperations, restore: restoreGpu } = installWebGpuStub({
+      adapterInfo: { vendor: "nvidia", architecture: "turing" },
+      importExternalTexture: true,
+    });
+    const matrixCanvas = createCanvasStub().canvas;
+    const firstCanvas = createCanvasStub().canvas;
+    const secondCanvas = createCanvasStub().canvas;
+    const webGpuContext = {
+      configure(): void {
+        gpuOperations.push("matrix.context.configure");
+      },
+      getCurrentTexture(): unknown {
+        gpuOperations.push("matrix.context.getCurrentTexture");
+        return {
+          createView(): unknown {
+            gpuOperations.push("matrix.swapchain.createView");
+            return {};
+          },
+        };
+      },
+    };
+
+    matrixCanvas.getContext = ((contextId: string): unknown => {
+      gpuOperations.push(`matrix.getContext:${contextId}`);
+      return contextId === "webgpu" ? webGpuContext : null;
+    }) as HTMLCanvasElement["getContext"];
+    Object.assign(matrixCanvas, {
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 800, height: 450 }),
+    });
+    Object.assign(firstCanvas, {
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 400, height: 225 }),
+    });
+    Object.assign(secondCanvas, {
+      getBoundingClientRect: () => ({ left: 400, top: 0, width: 400, height: 225 }),
+    });
+
+    class FakeVideoFrame {
+      public readonly displayWidth = 1920;
+      public readonly displayHeight = 1080;
+      public close(): void {
+        // The compositor owns frame lifetime through the matrix slot.
+      }
+    }
+
+    Object.defineProperty(globalThis, "VideoFrame", {
+      configurable: true,
+      writable: true,
+      value: FakeVideoFrame,
+    });
+    Object.defineProperty(globalThis, "devicePixelRatio", {
+      configurable: true,
+      value: 1,
+    });
+    Object.defineProperty(globalThis, "requestAnimationFrame", {
+      configurable: true,
+      value: (callback: FrameRequestCallback) => {
+        callbacks.push(callback);
+        return callbacks.length;
+      },
+    });
+    Object.defineProperty(globalThis, "setTimeout", {
+      configurable: true,
+      value: (callback: () => void) => {
+        fallbackCallbacks.push(callback);
+        return fallbackCallbacks.length;
+      },
+    });
+    Object.defineProperty(globalThis, "clearTimeout", {
+      configurable: true,
+      value: () => undefined,
+    });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+        value: {
+          location: {
+            search: "?matrixPresent=auto",
+          },
+          addEventListener: () => undefined,
+        },
+    });
+    const restoreDocument = installDocumentStub({
+      getElementById: (id: string) => {
+        if (id === matrixCanvasId) {
+          return matrixCanvas;
+        }
+
+        if (id === "raf-first-canvas") {
+          return firstCanvas;
+        }
+
+        if (id === "raf-second-canvas") {
+          return secondCanvas;
+        }
+
+        return null;
+      },
+    } as unknown as Document);
+
+    try {
+      await firstRenderer.configureSurface({ ...createSurfaceConfiguration(), canvasId: "raf-first-canvas" });
+      await secondRenderer.configureSurface({ ...createSurfaceConfiguration(), canvasId: "raf-second-canvas" });
+      callbacks.length = 0;
+      fallbackCallbacks.length = 0;
+
+      let firstRenderSettled = false;
+      const firstRenderPromise = Promise.all([
+        firstRenderer.renderFrame({
+          ...createRenderRequest(),
+          frame: {
+            ...createFrame(),
+            decodeBackend: "webcodecs",
+            videoFrame: new FakeVideoFrame(),
+          },
+        }),
+        secondRenderer.renderFrame({
+          ...createRenderRequest(),
+          frame: {
+            ...createFrame(),
+            sequenceNumber: 104,
+            presentationTimestampUs: 2_099_999,
+            decodeBackend: "webcodecs",
+            videoFrame: new FakeVideoFrame(),
+          },
+        }),
+      ]).then((results) => {
+        firstRenderSettled = true;
+        return results;
+      });
+
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      const [firstResult, secondResult] = await firstRenderPromise;
+
+      expect(firstRenderSettled).toBe(true);
+      expect(firstResult.matrixPresentMode).toBe("auto");
+      expect(firstResult.matrixPresentPath).toBe("immediate");
+      expect(secondResult.matrixPresentPath).toBe("immediate");
+      expect(firstResult.matrixFlushCount).toBe(1);
+      expect(firstResult.matrixPresentCount).toBe(1);
+      expect(firstResult.matrixDrawCount).toBe(2);
+      expect(matrixCanvas.dataset.matrixPresentCount).toBe("1");
+      expect(firstCanvas.dataset.matrixPresentCount).toBe("1");
+      expect(secondCanvas.dataset.matrixPresentCount).toBe("1");
+      expect(gpuOperations.filter((operation) => operation === "beginRenderPass")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "importExternalTexture")).toHaveLength(2);
+      expect(gpuOperations.filter((operation) => operation === "copyExternalImageToTexture")).toHaveLength(0);
+      expect(gpuOperations.filter((operation) => operation === "matrix.context.getCurrentTexture")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "copyTextureToTexture")).toHaveLength(1);
+      expect(callbacks).toHaveLength(0);
+      expect(fallbackCallbacks).toHaveLength(0);
+
+      fallbackCallbacks.splice(0).forEach((callback) => callback());
+      expect(matrixCanvas.dataset.matrixPresentCount).toBe("1");
+
+      let thirdRenderSettled = false;
+      const thirdRenderPromise = firstRenderer.renderFrame({
+        ...createRenderRequest(),
+        frame: {
+          ...createFrame(),
+          sequenceNumber: 105,
+          presentationTimestampUs: 2_133_333,
+          decodeBackend: "webcodecs",
+          videoFrame: new FakeVideoFrame(),
+        },
+      }).then((result) => {
+        thirdRenderSettled = true;
+        return result;
+      });
+
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(thirdRenderSettled).toBe(true);
+      const thirdResult = await thirdRenderPromise;
+      expect(matrixCanvas.dataset.matrixPresentCount).toBe("1");
+      expect(gpuOperations.filter((operation) => operation === "beginRenderPass")).toHaveLength(1);
+      expect(gpuOperations.filter((operation) => operation === "importExternalTexture")).toHaveLength(3);
+      expect(gpuOperations.filter((operation) => operation === "copyExternalImageToTexture")).toHaveLength(0);
+      expect(thirdResult.matrixPresentPath).toBe("coalesced");
+      expect(thirdResult.matrixPresentCount).toBe(1);
+      expect(thirdResult.gpuUploadSource).toBe("external-texture");
+      expect(thirdResult.matrixVideoFrameCopyCount).toBe(0);
+      expect(callbacks).toHaveLength(1);
+      expect(fallbackCallbacks.length).toBeGreaterThanOrEqual(1);
+
+      fallbackCallbacks.splice(0).forEach((callback) => callback());
+      expect(matrixCanvas.dataset.matrixPresentCount).toBe("2");
+      expect(gpuOperations.filter((operation) => operation === "importExternalTexture")).toHaveLength(3);
+      callbacks.shift()?.(performance.now());
+      expect(matrixCanvas.dataset.matrixPresentCount).toBe("2");
+    } finally {
+      await firstRenderer.dispose();
+      await secondRenderer.dispose();
+      restoreDocument();
+      restoreGpu();
+      if (videoFrameDescriptor) {
+        Object.defineProperty(globalThis, "VideoFrame", videoFrameDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "VideoFrame");
+      }
+
+      if (pixelRatioDescriptor) {
+        Object.defineProperty(globalThis, "devicePixelRatio", pixelRatioDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "devicePixelRatio");
+      }
+
+      if (requestAnimationFrameDescriptor) {
+        Object.defineProperty(globalThis, "requestAnimationFrame", requestAnimationFrameDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "requestAnimationFrame");
+      }
+
+      if (setTimeoutDescriptor) {
+        Object.defineProperty(globalThis, "setTimeout", setTimeoutDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "setTimeout");
+      }
+
+      if (clearTimeoutDescriptor) {
+        Object.defineProperty(globalThis, "clearTimeout", clearTimeoutDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "clearTimeout");
+      }
+
+      if (windowDescriptor) {
+        Object.defineProperty(globalThis, "window", windowDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "window");
+      }
+    }
+  });
+
+  it("hides the shared matrix canvas when external texture import fails", async () => {
+    const matrixCanvasId = "matrix-canvas-import-failure-unit";
+    const renderer = new WebGpuMatrixTileRenderer(matrixCanvasId);
+    const videoFrameDescriptor = Object.getOwnPropertyDescriptor(globalThis, "VideoFrame");
+    const pixelRatioDescriptor = Object.getOwnPropertyDescriptor(globalThis, "devicePixelRatio");
+    const windowDescriptor = Object.getOwnPropertyDescriptor(globalThis, "window");
+    const closedFrames: string[] = [];
+    const { operations: gpuOperations, restore: restoreGpu } = installWebGpuStub({
+      adapterInfo: { vendor: "nvidia", architecture: "turing" },
+      importExternalTexture: true,
+      importExternalTextureError: "Failed to import texture from video frame that doesn't have back resource",
+    });
+    const matrixCanvas = createCanvasStub().canvas;
+    const tileCanvas = createCanvasStub().canvas;
+    const webGpuContext = {
+      configure(): void {
+        gpuOperations.push("matrix.context.configure");
+      },
+      getCurrentTexture(): unknown {
+        gpuOperations.push("matrix.context.getCurrentTexture");
+        return {
+          createView(): unknown {
+            gpuOperations.push("matrix.swapchain.createView");
+            return {};
+          },
+        };
+      },
+    };
+
+    matrixCanvas.getContext = ((contextId: string): unknown => {
+      gpuOperations.push(`matrix.getContext:${contextId}`);
+      return contextId === "webgpu" ? webGpuContext : null;
+    }) as HTMLCanvasElement["getContext"];
+    Object.assign(matrixCanvas, {
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 360 }),
+    });
+    Object.assign(tileCanvas, {
+      getBoundingClientRect: () => ({ left: 0, top: 0, width: 640, height: 360 }),
+    });
+
+    class FakeVideoFrame {
+      public readonly displayWidth = 3840;
+      public readonly displayHeight = 2160;
+      public constructor(private readonly label: string) {
+      }
+
+      public close(): void {
+        closedFrames.push(this.label);
+      }
+    }
+
+    Object.defineProperty(globalThis, "VideoFrame", {
+      configurable: true,
+      writable: true,
+      value: FakeVideoFrame,
+    });
+    Object.defineProperty(globalThis, "devicePixelRatio", {
+      configurable: true,
+      value: 1,
+    });
+    Object.defineProperty(globalThis, "window", {
+      configurable: true,
+      value: {
+        location: {
+          search: "?matrixTexture=external",
+        },
+        addEventListener: () => undefined,
+      },
+    });
+    const restoreDocument = installDocumentStub({
+      getElementById: (id: string) => {
+        if (id === matrixCanvasId) {
+          return matrixCanvas;
+        }
+
+        if (id === "import-failure-canvas") {
+          return tileCanvas;
+        }
+
+        return null;
+      },
+    } as unknown as Document);
+
+    try {
+      await renderer.configureSurface({ ...createSurfaceConfiguration(), canvasId: "import-failure-canvas" });
+      const result = await renderer.renderFrame({
+        ...createRenderRequest(),
+        frame: {
+          ...createFrame(),
+          decodeBackend: "webcodecs",
+          videoFrame: new FakeVideoFrame("failed-import"),
+        },
+      });
+
+      expect(result.renderBackend).toBe("canvas2d-fallback");
+      expect(result.matrixFallbackReason).toContain("back resource");
+      expect(matrixCanvas.hidden).toBe(true);
+      expect(matrixCanvas.style.display).toBe("none");
+      expect(matrixCanvas.dataset.matrixFallbackReason).toContain("back resource");
+      expect(tileCanvas.dataset.matrixFallbackReason).toContain("back resource");
+      expect(tileCanvas.dataset.renderBackend).toBe("canvas2d-fallback");
+      expect(tileCanvas.hidden).toBe(false);
+      expect(tileCanvas.style.display).toBe("block");
+      expect(gpuOperations).toContain("importExternalTexture");
+      expect(gpuOperations.filter((operation) => operation === "matrix.context.getCurrentTexture")).toHaveLength(1);
+      expect(closedFrames).toEqual(["failed-import"]);
+    } finally {
+      await renderer.dispose();
+      restoreDocument();
+      restoreGpu();
+      if (videoFrameDescriptor) {
+        Object.defineProperty(globalThis, "VideoFrame", videoFrameDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "VideoFrame");
+      }
+
+      if (pixelRatioDescriptor) {
+        Object.defineProperty(globalThis, "devicePixelRatio", pixelRatioDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "devicePixelRatio");
+      }
+
+      if (windowDescriptor) {
+        Object.defineProperty(globalThis, "window", windowDescriptor);
+      } else {
+        Reflect.deleteProperty(globalThis, "window");
       }
     }
   });
@@ -2355,7 +2750,8 @@ describe("frontend service contracts", () => {
     });
 
     expect(decision.shouldRender).toBe(true);
-    expect(rendered.overlayPrimitiveCount).toBe(1);
+    expect(activeMetadata).toHaveLength(1);
+    expect(rendered.overlayPrimitiveCount).toBe(0);
     expect(rendered.renderedSequenceNumber).toBe(frame?.sequenceNumber);
   });
 });

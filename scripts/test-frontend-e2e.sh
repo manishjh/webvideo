@@ -72,13 +72,15 @@ if [[ "${WEBVIDEO_PLAYWRIGHT_START_SERVER:-1}" != "0" && "${WEBVIDEO_PLAYWRIGHT_
     cd "$ROOT_DIR"
       START_RTSP="${START_RTSP:-1}" \
       WEBVIDEO_SAMPLE_FOOTAGE="${WEBVIDEO_SAMPLE_FOOTAGE:-1}" \
-      START_4K_RTSP="${START_4K_RTSP:-1}" \
-      ./start.sh
+      START_4K_RTSP="${START_4K_RTSP:-0}" \
+      START_4K_STRESS_RTSP="${START_4K_STRESS_RTSP:-0}" \
+      WEBVIDEO_RTSP_SOURCE_VARIANTS="${WEBVIDEO_RTSP_SOURCE_VARIANTS:-0}" \
+      ./test-start.sh
   ) &
   SERVER_PID=$!
 
   wait_for_http "http://127.0.0.1:${BACKEND_PORT:-8080}/healthz" "backend"
-  wait_for_http "http://127.0.0.1:${FRONTEND_PORT:-4173}/live-demo.html?channel=channel-001" "frontend"
+  wait_for_http "http://127.0.0.1:${FRONTEND_PORT:-4173}/live-demo.html?channel=channel-4k-crowd" "frontend"
 else
   export WEBVIDEO_PLAYWRIGHT_EXTERNAL_SERVER=1
 fi
